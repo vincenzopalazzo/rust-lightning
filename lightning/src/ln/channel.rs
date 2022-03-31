@@ -3984,6 +3984,8 @@ impl<Signer: Sign> Channel<Signer> {
 		}), None))
 	}
 
+	/// FIXME(vincenzopalazzo): update the shutdown message handler, in according with BOLT2
+	/// issue related https://github.com/lightning/bolts/issues/964
 	pub fn shutdown<K: Deref>(
 		&mut self, keys_provider: &K, their_features: &InitFeatures, msg: &msgs::Shutdown
 	) -> Result<(Option<msgs::Shutdown>, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>), ChannelError>

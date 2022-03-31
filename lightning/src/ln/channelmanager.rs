@@ -4318,6 +4318,7 @@ impl<Signer: Sign, M: Deref, T: Deref, K: Deref, F: Deref, L: Deref> ChannelMana
 		}
 	}
 
+	/// FIXME(vincenzopalazzo): this is the part of the code where the shutdown is handled.
 	fn internal_shutdown(&self, counterparty_node_id: &PublicKey, their_features: &InitFeatures, msg: &msgs::Shutdown) -> Result<(), MsgHandleErrInternal> {
 		let mut dropped_htlcs: Vec<(HTLCSource, PaymentHash)>;
 		let result: Result<(), _> = loop {
