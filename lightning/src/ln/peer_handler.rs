@@ -1661,6 +1661,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, OM: Deref, L: Deref, CM
 			}
 
 			let our_features = self.init_features(&their_node_id);
+			log_debug!(self.logger, "{:?}", our_features);
 			if msg.features.requires_unknown_bits_from(&our_features) {
 				log_debug!(logger, "Peer {} requires features unknown to us: {:?}",
 					log_pubkey!(their_node_id), msg.features.required_unknown_bits_from(&our_features));
