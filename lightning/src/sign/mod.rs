@@ -1951,6 +1951,7 @@ impl KeysManager {
 
 	// FIXME: put this under a debug a feature flag like `unsafa_channel_keys`
 	#[cfg(debug_assertions)]
+	#[allow(missing_docs)]
 	pub fn set_channels_keys(&mut self, funding_key: String, revocation_base_secret: String, payment_base_secret: String, delayed_payment_base_secret: String, htlc_base_secret: String, _shachain_seed: String,){
 		use std::str::FromStr;
 
