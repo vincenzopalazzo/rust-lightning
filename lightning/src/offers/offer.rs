@@ -239,6 +239,8 @@ macro_rules! offer_explicit_metadata_builder_methods { (
 				chains: None, metadata: None, amount: None, description: None,
 				features: OfferFeatures::empty(), absolute_expiry: None, issuer: None, paths: None,
 				supported_quantity: Quantity::One, issuer_signing_pubkey: Some(signing_pubkey),
+				#[cfg(test)]
+				experimental_foo: None,
 			},
 			metadata_strategy: core::marker::PhantomData,
 			secp_ctx: None,
@@ -280,6 +282,8 @@ macro_rules! offer_derived_metadata_builder_methods { ($secp_context: ty) => {
 				chains: None, metadata: Some(metadata), amount: None, description: None,
 				features: OfferFeatures::empty(), absolute_expiry: None, issuer: None, paths: None,
 				supported_quantity: Quantity::One, issuer_signing_pubkey: Some(node_id),
+				#[cfg(test)]
+				experimental_foo: None,
 			},
 			metadata_strategy: core::marker::PhantomData,
 			secp_ctx: Some(secp_ctx),
@@ -479,6 +483,12 @@ macro_rules! offer_builder_test_methods { (
 	}
 
 	#[cfg_attr(c_bindings, allow(dead_code))]
+	pub(super) fn experimental_foo($($self_mut)* $self: $self_type, experimental_foo: u64) -> $return_type {
+		$self.offer.experimental_foo = Some(experimental_foo);
+		$return_value
+	}
+
+	#[cfg_attr(c_bindings, allow(dead_code))]
 	pub(super) fn build_unchecked($self: $self_type) -> Offer {
 		$self.build_without_checks()
 	}
@@ -585,6 +595,8 @@ pub(super) struct OfferContents {
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
 	issuer_signing_pubkey: Option<PublicKey>,
+	#[cfg(test)]
+	experimental_foo: Option<u64>,
 }
 
 macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
@@ -1024,7 +1036,10 @@ impl OfferContents {
 			issuer_id: self.issuer_signing_pubkey.as_ref(),
 		};
 
-		let experimental_offer = ExperimentalOfferTlvStreamRef {};
+		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			#[cfg(test)]
+			experimental_foo: self.experimental_foo,
+		};
 
 		(offer, experimental_offer)
 	}
@@ -1121,7 +1136,13 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 /// Valid type range for experimental offer TLV records.
 pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
 
+#[cfg(not(test))]
 tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+});
+
+#[cfg(test)]
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
 });
 
 type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
@@ -1171,7 +1192,10 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 				chains, metadata, currency, amount, description, features, absolute_expiry, paths,
 				issuer, quantity_max, issuer_id,
 			},
-			ExperimentalOfferTlvStream {},
+			ExperimentalOfferTlvStream {
+				#[cfg(test)]
+				experimental_foo,
+			},
 		) = tlv_stream;
 
 		let metadata = metadata.map(|metadata| Metadata::Bytes(metadata));
@@ -1210,6 +1234,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 		Ok(OfferContents {
 			chains, metadata, amount, description, features, absolute_expiry, issuer, paths,
 			supported_quantity, issuer_signing_pubkey,
+			#[cfg(test)]
+			experimental_foo,
 		})
 	}
 }
@@ -1288,7 +1314,9 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef {},
+				ExperimentalOfferTlvStreamRef {
+					experimental_foo: None,
+				},
 			),
 		);
 
@@ -1368,6 +1396,7 @@ mod tests {
 		use super::OfferWithDerivedMetadataBuilder as OfferBuilder;
 		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
 			.amount_msats(1000)
+			.experimental_foo(42)
 			.build().unwrap();
 		assert!(offer.metadata().is_some());
 		assert_eq!(offer.issuer_signing_pubkey(), Some(node_id));
@@ -1437,6 +1466,7 @@ mod tests {
 		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
 			.amount_msats(1000)
 			.path(blinded_path)
+			.experimental_foo(42)
 			.build().unwrap();
 		assert!(offer.metadata().is_none());
 		assert_ne!(offer.issuer_signing_pubkey(), Some(node_id));
