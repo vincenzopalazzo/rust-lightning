@@ -1890,7 +1890,7 @@ mod tests {
 			.sign(recipient_sign)
 		{
 			Ok(_) => panic!("expected error"),
-			Err(e) => assert_eq!(e, SignError::Verification(secp256k1::Error::InvalidSignature)),
+			Err(e) => assert_eq!(e, SignError::Verification(secp256k1::Error::IncorrectSignature)),
 		}
 	}
 
@@ -2277,7 +2277,7 @@ mod tests {
 		match InvoiceRequest::try_from(buffer) {
 			Ok(_) => panic!("expected error"),
 			Err(e) => {
-				assert_eq!(e, Bolt12ParseError::InvalidSignature(secp256k1::Error::InvalidSignature));
+				assert_eq!(e, Bolt12ParseError::InvalidSignature(secp256k1::Error::IncorrectSignature));
 			},
 		}
 	}
