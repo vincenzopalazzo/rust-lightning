@@ -26,7 +26,7 @@ use bitcoin::transaction::Version;
 
 use crate::ln::types::PaymentPreimage;
 use crate::ln::chan_utils::{self, TxCreationKeys, HTLCOutputInCommitment};
-use crate::ln::features::ChannelTypeFeatures;
+use crate::types::features::ChannelTypeFeatures;
 use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint};
 use crate::ln::channelmanager::MIN_CLTV_EXPIRY_DELTA;
 use crate::ln::msgs::DecodeError;
@@ -1279,7 +1279,7 @@ mod tests {
 
 	use bitcoin::secp256k1::{PublicKey,SecretKey};
 	use bitcoin::secp256k1::Secp256k1;
-	use crate::ln::features::ChannelTypeFeatures;
+	use crate::types::features::ChannelTypeFeatures;
 
 	use std::str::FromStr;
 
