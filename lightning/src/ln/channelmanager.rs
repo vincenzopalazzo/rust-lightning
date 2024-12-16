@@ -4527,14 +4527,14 @@ where
 		let _lck = self.total_consistency_lock.read().unwrap();
 		self.send_payment_along_path(SendAlongPathArgs {
 			path, payment_hash, recipient_onion: &recipient_onion, total_value,
-			cur_height, payment_id, keysend_preimage, invoice_request: None, session_priv_bytes
+			cur_height, payment_id, keysend_preimage, invoice_request: None, bolt12_invoice: None, session_priv_bytes
 		})
 	}
 
 	fn send_payment_along_path(&self, args: SendAlongPathArgs) -> Result<(), APIError> {
 		let SendAlongPathArgs {
 			path, payment_hash, recipient_onion, total_value, cur_height, payment_id, keysend_preimage,
-			invoice_request, session_priv_bytes
+			invoice_request, session_priv_bytes, bolt12_invoice,
 		} = args;
 		// The top-level caller should hold the total_consistency_lock read lock.
 		debug_assert!(self.total_consistency_lock.try_write().is_err());
