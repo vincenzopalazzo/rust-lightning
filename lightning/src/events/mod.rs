@@ -934,6 +934,14 @@ pub enum Event {
 		///
 		/// [`Route::get_total_fees`]: crate::routing::router::Route::get_total_fees
 		fee_paid_msat: Option<u64>,
+		/// When the payment is related to a bolt12 invoice the following fileds will contain the
+		/// bolt12 invoice from the LDK version 0.1.1 and above. Vice versa, when the payment is
+		/// related to a bolt11 invoice or a spontaneous payment, these fields will be `None`.
+		///
+		/// The user that it is maching on the [`Event::PaymentSent`] it is strongly encouraged to
+		/// store the invoice in order to be able to provide a proof of payment at any point in time.
+		// FIXME: if the the information of the payment is stored in the ldk persistance, we should allow also to restore it?
+		bolt12_invoice: Option<Bolt12Invoice>,
 	},
 	/// Indicates an outbound payment failed. Individual [`Event::PaymentPathFailed`] events
 	/// provide failure information for each path attempt in the payment, including retries.
@@ -1551,13 +1559,14 @@ impl Writeable for Event {
 					(13, payment_id, option),
 				});
 			},
-			&Event::PaymentSent { ref payment_id, ref payment_preimage, ref payment_hash, ref fee_paid_msat } => {
+			&Event::PaymentSent { ref payment_id, ref payment_preimage, ref payment_hash, ref fee_paid_msat, ref bolt12_invoice } => {
 				2u8.write(writer)?;
 				write_tlv_fields!(writer, {
 					(0, payment_preimage, required),
 					(1, payment_hash, required),
 					(3, payment_id, option),
 					(5, fee_paid_msat, option),
+					(7, bolt12_invoice, option),
 				});
 			},
 			&Event::PaymentPathFailed {
@@ -1890,11 +1899,13 @@ impl MaybeReadable for Event {
 					let mut payment_hash = None;
 					let mut payment_id = None;
 					let mut fee_paid_msat = None;
+					let mut bolt12_invoice = None;
 					read_tlv_fields!(reader, {
 						(0, payment_preimage, required),
 						(1, payment_hash, option),
 						(3, payment_id, option),
 						(5, fee_paid_msat, option),
+						(7, bolt12_invoice, option),
 					});
 					if payment_hash.is_none() {
 						payment_hash = Some(PaymentHash(Sha256::hash(&payment_preimage.0[..]).to_byte_array()));
@@ -1904,6 +1915,7 @@ impl MaybeReadable for Event {
 						payment_preimage,
 						payment_hash: payment_hash.unwrap(),
 						fee_paid_msat,
+						bolt12_invoice,
 					}))
 				};
 				f()
