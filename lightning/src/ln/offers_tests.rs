@@ -54,7 +54,7 @@ use crate::types::features::Bolt12InvoiceFeatures;
 use crate::ln::functional_test_utils::*;
 use crate::ln::msgs::{ChannelMessageHandler, Init, NodeAnnouncement, OnionMessage, OnionMessageHandler, RoutingMessageHandler, SocketAddress, UnsignedGossipMessage, UnsignedNodeAnnouncement};
 use crate::ln::outbound_payment::IDEMPOTENCY_TIMEOUT_TICKS;
-use crate::offers::invoice::Bolt12Invoice;
+use crate::offers::invoice::{self, Bolt12Invoice};
 use crate::offers::invoice_error::InvoiceError;
 use crate::offers::invoice_request::{InvoiceRequest, InvoiceRequestFields};
 use crate::offers::nonce::Nonce;
@@ -155,7 +155,7 @@ fn route_bolt12_payment<'a, 'b, 'c>(
 	check_added_monitors(node, 1);
 
 	let mut events = node.node.get_and_clear_pending_msg_events();
-	assert_eq!(events.len(), 1);
+	assert_eq!(events.len(), 1, "{:?}", events);
 	let ev = remove_first_msg_event_to_node(&path[0].node.get_our_node_id(), &mut events);
 
 	// Use a fake payment_hash and bypass checking for the PaymentClaimable event since the
@@ -857,60 +857,6 @@ fn pays_for_offer_without_blinded_paths() {
 	route_bolt12_payment(bob, &[alice], &invoice);
 	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
 
-	claim_bolt12_payment(bob, &[alice], payment_context);
-	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
-}
-
-/// Checks that an invoice for a refund without any blinded paths can be requested and that we have
-/// at the end all the information for make a Proof of Payment.
-#[test]
-fn pays_for_offer_without_blinded_paths_with_pop() {
-	let chanmon_cfgs = create_chanmon_cfgs(2);
-	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
-	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-
-	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
-
-	let alice = &nodes[0];
-	let alice_id = alice.node.get_our_node_id();
-	let bob = &nodes[1];
-	let bob_id = bob.node.get_our_node_id();
-
-	let offer = alice.node
-		.create_offer_builder(None).unwrap()
-		.clear_paths()
-		.amount_msats(10_000_000)
-		.build().unwrap();
-	assert_eq!(offer.issuer_signing_pubkey(), Some(alice_id));
-	assert!(offer.paths().is_empty());
-
-	let payment_id = PaymentId([1; 32]);
-	bob.node.pay_for_offer(&offer, None, None, None, payment_id, Retry::Attempts(0), None).unwrap();
-	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
-
-	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
-	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
-
-	let (invoice_request, _) = extract_invoice_request(alice, &onion_message);
-	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
-		offer_id: offer.id(),
-		invoice_request: InvoiceRequestFields {
-			payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
-			quantity: None,
-			payer_note_truncated: None,
-			human_readable_name: None,
-		},
-	});
-
-	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
-	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
-
-	let (invoice, _) = extract_invoice(bob, &onion_message);
-	route_bolt12_payment(bob, &[alice], &invoice);
-	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
-
-	// FIXME(vincenzopalazzo): We need to check if there is an invoice inside the `Event::PaymentReceived` event
 	claim_bolt12_payment(bob, &[alice], payment_context);
 	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
 }
@@ -2398,3 +2344,56 @@ fn no_double_pay_with_stale_channelmanager() {
 	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
 }
 
+/// Checks that an invoice for a refund without any blinded paths can be requested and that we have
+/// at the end all the information for make a Proof of Payment.
+#[test]
+fn pays_for_offer_without_blinded_paths_with_pop() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let offer = alice.node
+		.create_offer_builder(None).unwrap()
+		.clear_paths()
+		.amount_msats(10_000_000)
+		.build().unwrap();
+	assert_eq!(offer.issuer_signing_pubkey(), Some(alice_id));
+	assert!(offer.paths().is_empty());
+
+	let payment_id = PaymentId([1; 32]);
+	bob.node.pay_for_offer(&offer, None, None, None, payment_id, Retry::Attempts(0), None).unwrap();
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+
+	let (invoice_request, _) = extract_invoice_request(alice, &onion_message);
+	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
+		offer_id: offer.id(),
+		invoice_request: InvoiceRequestFields {
+			payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
+			quantity: None,
+			payer_note_truncated: None,
+			human_readable_name: None,
+		},
+	});
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	route_bolt12_payment(bob, &[alice], &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	// FIXME(vincenzopalazzo): We need to check if there is an invoice inside the `Event::PaymentReceived` event
+	claim_bolt12_payment(bob, &[alice], payment_context);
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
