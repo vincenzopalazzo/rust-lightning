@@ -834,7 +834,7 @@ macro_rules! get_event {
 	($node: expr, $event_type: path) => {
 		{
 			let mut events = $node.node.get_and_clear_pending_events();
-			assert_eq!(events.len(), 1);
+			assert_eq!(events.len(), 1, "events: {:?}", events);
 			let ev = events.pop().unwrap();
 			match ev {
 				$event_type { .. } => {
