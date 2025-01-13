@@ -1906,6 +1906,7 @@ impl OutboundPayments {
 					payment_preimage,
 					payment_hash,
 					fee_paid_msat,
+					bolt12_invoice: None,
 				}, Some(ev_completion_action.clone())));
 				payment.get_mut().mark_fulfilled();
 			}
