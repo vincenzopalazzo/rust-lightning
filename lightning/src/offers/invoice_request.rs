@@ -86,7 +86,7 @@ use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::types::features::InvoiceRequestFeatures;
 use crate::types::payment::PaymentHash;
 use crate::util::ser::{
-	CursorReadable, HighZeroBytesDroppedBigSize, LengthLimitedRead, LengthReadable, Readable,
+	CursorReadable, HighZeroBytesDroppedBigSize, LengthRead, LengthReadable, Readable,
 	WithoutLength, Writeable, Writer,
 };
 use crate::util::string::{PrintableString, UntrustedString};
@@ -1121,8 +1121,10 @@ impl Writeable for InvoiceRequestContents {
 }
 
 impl LengthReadable for InvoiceRequest {
-	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
-		let bytes: WithoutLength<Vec<u8>> = LengthReadable::read_from_fixed_length_buffer(r)?;
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(
+		reader: &mut R,
+	) -> Result<Self, DecodeError> {
+		let bytes: WithoutLength<Vec<u8>> = LengthReadable::read_from_fixed_length_buffer(reader)?;
 		Self::try_from(bytes.0).map_err(|_| DecodeError::InvalidValue)
 	}
 }
