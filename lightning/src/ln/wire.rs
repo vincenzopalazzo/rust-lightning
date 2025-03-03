@@ -383,6 +383,7 @@ where
 		msgs::NodeAnnouncement::TYPE => {
 			Ok(Message::NodeAnnouncement(LengthReadable::read_from_fixed_length_buffer(buffer)?))
 		},
+<<<<<<< HEAD
 		msgs::ChannelUpdate::TYPE => {
 			Ok(Message::ChannelUpdate(LengthReadable::read_from_fixed_length_buffer(buffer)?))
 		},
@@ -394,6 +395,15 @@ where
 		)),
 		msgs::QueryChannelRange::TYPE => {
 			Ok(Message::QueryChannelRange(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+=======
+		msgs::ReplyShortChannelIdsEnd::TYPE => {
+			Ok(Message::ReplyShortChannelIdsEnd(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+		},
+		msgs::QueryChannelRange::TYPE => Ok(Message::QueryChannelRange(LengthReadable::read_from_fixed_length_buffer(buffer)?)),
+		msgs::ReplyChannelRange::TYPE => Ok(Message::ReplyChannelRange(Readable::read(buffer)?)),
+		msgs::GossipTimestampFilter::TYPE => {
+			Ok(Message::GossipTimestampFilter(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+>>>>>>> 62dd5f596 (Require length limited reader in impl_writeable_msg)
 		},
 		msgs::ReplyChannelRange::TYPE => {
 			Ok(Message::ReplyChannelRange(LengthReadable::read_from_fixed_length_buffer(buffer)?))
