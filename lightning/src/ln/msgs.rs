@@ -3573,8 +3573,8 @@ impl Writeable for UnsignedChannelAnnouncement {
 	}
 }
 
-impl Readable for UnsignedChannelAnnouncement {
-	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+impl LengthReadable for UnsignedChannelAnnouncement {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(Self {
 			features: Readable::read(r)?,
 			chain_hash: Readable::read(r)?,
@@ -3588,13 +3588,28 @@ impl Readable for UnsignedChannelAnnouncement {
 	}
 }
 
-impl_writeable!(ChannelAnnouncement, {
-	node_signature_1,
-	node_signature_2,
-	bitcoin_signature_1,
-	bitcoin_signature_2,
-	contents
-});
+impl Writeable for ChannelAnnouncement {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.node_signature_1.write(w)?;
+		self.node_signature_2.write(w)?;
+		self.bitcoin_signature_1.write(w)?;
+		self.bitcoin_signature_2.write(w)?;
+		self.contents.write(w)?;
+		Ok(())
+	}
+}
+
+impl LengthReadable for ChannelAnnouncement {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self {
+			node_signature_1: Readable::read(r)?,
+			node_signature_2: Readable::read(r)?,
+			bitcoin_signature_1: Readable::read(r)?,
+			bitcoin_signature_2: Readable::read(r)?,
+			contents: LengthReadable::read_from_fixed_length_buffer(r)?,
+		})
+	}
+}
 
 impl Writeable for UnsignedChannelUpdate {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
@@ -3615,8 +3630,8 @@ impl Writeable for UnsignedChannelUpdate {
 	}
 }
 
-impl Readable for UnsignedChannelUpdate {
-	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+impl LengthReadable for UnsignedChannelUpdate {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
 		let res = Self {
 			chain_hash: Readable::read(r)?,
 			short_channel_id: Readable::read(r)?,
@@ -3640,10 +3655,22 @@ impl Readable for UnsignedChannelUpdate {
 	}
 }
 
-impl_writeable!(ChannelUpdate, {
-	signature,
-	contents
-});
+impl Writeable for ChannelUpdate {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.signature.write(w)?;
+		self.contents.write(w)?;
+		Ok(())
+	}
+}
+
+impl LengthReadable for ChannelUpdate {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self {
+			signature: Readable::read(r)?,
+			contents: LengthReadable::read_from_fixed_length_buffer(r)?,
+		})
+	}
+}
 
 impl Writeable for ErrorMessage {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
@@ -3721,8 +3748,8 @@ impl Writeable for UnsignedNodeAnnouncement {
 	}
 }
 
-impl Readable for UnsignedNodeAnnouncement {
-	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+impl LengthReadable for UnsignedNodeAnnouncement {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
 		let features: NodeFeatures = Readable::read(r)?;
 		let timestamp: u32 = Readable::read(r)?;
 		let node_id: NodeId = Readable::read(r)?;
@@ -3783,10 +3810,22 @@ impl Readable for UnsignedNodeAnnouncement {
 	}
 }
 
-impl_writeable!(NodeAnnouncement, {
-	signature,
-	contents
-});
+impl Writeable for NodeAnnouncement {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.signature.write(w)?;
+		self.contents.write(w)?;
+		Ok(())
+	}
+}
+
+impl LengthReadable for NodeAnnouncement {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self {
+			signature: Readable::read(r)?,
+			contents: LengthReadable::read_from_fixed_length_buffer(r)?,
+		})
+	}
+}
 
 impl Readable for QueryShortChannelIds {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
