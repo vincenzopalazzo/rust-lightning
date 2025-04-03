@@ -93,7 +93,7 @@ use crate::util::string::{PrintableString, UntrustedString};
 use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
 use bitcoin::secp256k1::schnorr::Signature;
-use bitcoin::secp256k1::{self, Keypair, PublicKey, Secp256k1};
+use bitcoin::secp256k1::{self, Keypair, PublicKey, Secp256k1, SecretKey};
 
 #[cfg(not(c_bindings))]
 use crate::offers::invoice::{DerivedSigningPubkey, ExplicitSigningPubkey, InvoiceBuilder};
@@ -188,6 +188,10 @@ macro_rules! invoice_request_builder_methods { (
 			offer_from_hrn: None,
 			#[cfg(test)]
 			experimental_bar: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
+			payer_bip_353_signature: None,
 		}
 	}
 
@@ -638,6 +642,11 @@ pub(super) struct InvoiceRequestContentsWithoutPayerSigningPubkey {
 	offer_from_hrn: Option<HumanReadableName>,
 	#[cfg(test)]
 	experimental_bar: Option<u64>,
+	// FIXME: make sure that we use the right type here
+	contact_secret: Option<SecretKey>,
+	payer_offer: Option<Offer>,
+	payer_bip_353_name: Option<HumanReadableName>,
+	payer_bip_353_signature: Option<Signature>,
 }
 
 macro_rules! invoice_request_accessors { ($self: ident, $contents: expr) => {
@@ -1351,6 +1360,10 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 				offer_from_hrn,
 				#[cfg(test)]
 				experimental_bar,
+				contact_secret: None,
+				payer_offer: None,
+				payer_bip_353_name: None,
+				payer_bip_353_signature: None,
 			},
 			payer_signing_pubkey,
 		})
