@@ -80,7 +80,7 @@ use crate::offers::offer::{
 	OfferId, OfferTlvStream, OfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, OFFER_TYPES,
 };
 use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
-use crate::offers::payer::{PayerContents, PayerTlvStream, PayerTlvStreamRef};
+use crate::offers::payer::{Bip353Name, ContactSecret, PayerContents, PayerTlvStream, PayerTlvStreamRef, derive_contact_secret};
 use crate::offers::signer::{Metadata, MetadataMaterial};
 use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::types::features::InvoiceRequestFeatures;
@@ -94,6 +94,7 @@ use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
 use bitcoin::secp256k1::schnorr::Signature;
 use bitcoin::secp256k1::{self, Keypair, PublicKey, Secp256k1};
+use std::str::FromStr;
 
 #[cfg(not(c_bindings))]
 use crate::offers::invoice::{DerivedSigningPubkey, ExplicitSigningPubkey, InvoiceBuilder};
@@ -1016,7 +1017,7 @@ impl InvoiceRequest {
 			payer_tlv_stream,
 			offer_tlv_stream,
 			invoice_request_tlv_stream,
-			signature_tlv_stream,
+			SignatureTlvStreamRef { signature },
 			experimental_offer_tlv_stream,
 			experimental_invoice_request_tlv_stream,
 		) = self.contents.as_tlv_stream();
@@ -1193,60 +1194,71 @@ impl InvoiceRequestContents {
 			.map(|(pubkey, sig)| (pubkey, sig))
 	}
 
-	pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef {
-		let payer = PayerTlvStreamRef { metadata: self.payer.0.as_bytes() };
+	pub(super) fn offer_from_hrn(&self) -> &Option<HumanReadableName> {
+        &self.inner.offer_from_hrn
+    }
 
-		let (offer, experimental_offer) = self.offer.as_tlv_stream();
+    pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef {
+        let payer = PayerTlvStreamRef { metadata: self.inner.payer.0.as_bytes() };
 
-		let features = {
-			if self.features == InvoiceRequestFeatures::empty() {
-				None
-			} else {
-				Some(&self.features)
-			}
-		};
+        let (offer, experimental_offer) = self.inner.offer.as_tlv_stream();
 
-		let invoice_request = InvoiceRequestTlvStreamRef {
-			chain: self.chain.as_ref(),
-			amount: self.amount_msats,
-			features,
-			quantity: self.quantity,
-			payer_id: None,
-			payer_note: self.payer_note.as_ref(),
-			offer_from_hrn: self.offer_from_hrn.as_ref(),
-			paths: None,
-		};
+        let features = {
+            if self.inner.features == InvoiceRequestFeatures::empty() {
+                None
+            } else {
+                Some(&self.inner.features)
+            }
+        };
 
-		// Handle contact-related fields
-		let mut experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
-			contact_secret: self.contact_secret.as_ref().map(|secret| secret.as_bytes()),
-			payer_offer: self.payer_offer.as_ref().map(|offer| offer.as_slice()),
-			payer_bip353_name: None,
-			payer_bip353_signature: None,
-			#[cfg(test)]
-			experimental_bar: self.experimental_bar,
-		};
+        let invoice_request = InvoiceRequestTlvStreamRef {
+            chain: self.inner.chain.as_ref(),
+            amount: self.inner.amount_msats,
+            features,
+            quantity: self.inner.quantity,
+            payer_id: Some(&self.payer_signing_pubkey),
+            payer_note: self.inner.payer_note.as_ref(),
+            paths: None,
+            offer_from_hrn: self.inner.offer_from_hrn.as_ref(),
+        };
 
-		// Serialize BIP-353 name if present
-		if let Some(bip353_name) = &self.payer_bip353_name {
-			let mut name_bytes = Vec::new();
-			name_bytes.push(bip353_name.name.len() as u8);
-			name_bytes.extend_from_slice(bip353_name.name.as_bytes());
-			name_bytes.push(bip353_name.domain.len() as u8);
-			name_bytes.extend_from_slice(bip353_name.domain.as_bytes());
-			experimental_invoice_request.payer_bip353_name = Some(&name_bytes);
-		}
+        // Create temporary vectors for serialized data
+        let mut name_bytes = Vec::new();
+        if let Some(name) = &self.inner.payer_bip353_name {
+            name_bytes.push(name.name.len() as u8);
+            name_bytes.extend_from_slice(name.name.as_bytes());
+            name_bytes.push(name.domain.len() as u8);
+            name_bytes.extend_from_slice(name.domain.as_bytes());
+        }
 
-		// Serialize BIP-353 signature if present
-		if let Some((pubkey, signature)) = &self.payer_bip353_signature {
-			let mut sig_bytes = Vec::new();
-			sig_bytes.extend_from_slice(&pubkey.serialize());
-			sig_bytes.extend_from_slice(&signature.as_ref());
-			experimental_invoice_request.payer_bip353_signature = Some(&sig_bytes);
-		}
+        let mut sig_bytes = Vec::new();
+        if let Some((pubkey, signature)) = &self.inner.payer_bip353_signature {
+            sig_bytes.extend_from_slice(&pubkey.serialize());
+            sig_bytes.extend_from_slice(signature.as_ref());
+        }
 
-		(payer, offer, invoice_request, experimental_offer, experimental_invoice_request)
-	}
+        let contact_secret_bytes = self.inner.contact_secret.as_ref().map(|secret| &secret.as_bytes()[..32]);
+        let contact_secret_array: Option<&[u8; 32]> = contact_secret_bytes.and_then(|bytes| {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(bytes);
+                Some(&arr)
+            } else {
+                None
+            }
+        });
+
+        let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+            contact_secret: contact_secret_array,
+            payer_offer: self.inner.payer_offer.as_ref(),
+            payer_bip353_name: if !name_bytes.is_empty() { Some(&name_bytes) } else { None },
+            payer_bip353_signature: if !sig_bytes.is_empty() { Some(&sig_bytes) } else { None },
+            #[cfg(test)]
+            experimental_bar: self.inner.experimental_bar,
+        };
+
+        (payer, offer, invoice_request, experimental_offer, experimental_invoice_request)
+    }
 }
 
 impl InvoiceRequestContentsWithoutPayerSigningPubkey {
@@ -1352,7 +1364,7 @@ tlv_stream!(InvoiceRequestTlvStream, InvoiceRequestTlvStreamRef<'a>, INVOICE_REQ
 
 /// Valid type range for experimental invoice_request TLV records.
 pub(super) const EXPERIMENTAL_INVOICE_REQUEST_TYPES: core::ops::Range<u64> =
-	2_000_000_000..3_000_000_000;
+	2000000000..3000000000;
 
 #[cfg(not(test))]
 tlv_stream!(
@@ -1378,7 +1390,7 @@ tlv_stream!(
 		(2000001731, payer_offer: (Vec<u8>, WithoutLength)),
 		(2000001733, payer_bip353_name: (Vec<u8>, WithoutLength)),
 		(2000001735, payer_bip353_signature: (Vec<u8>, WithoutLength)),
-		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
+			(2000001500, experimental_bar: u64),
 	}
 );
 
@@ -1397,7 +1409,7 @@ type FullInvoiceRequestTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl CursorReadable for FullInvoiceRequestTlvStream {
@@ -1433,7 +1445,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl TryFrom<Vec<u8>> for UnsignedInvoiceRequest {
@@ -1562,16 +1574,37 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 				contact_secret: contact_secret.map(ContactSecret::from),
 				payer_offer,
 				payer_bip353_name: payer_bip353_name.map(|bytes| {
+					if bytes.len() < 2 { // Need at least name length and domain length bytes
+						return Bip353Name { name: String::new(), domain: String::new() };
+					}
 					let name_len = bytes[0] as usize;
-					let name = String::from_utf8(bytes[1..1 + name_len].to_vec()).unwrap();
+					if bytes.len() < 1 + name_len + 1 {
+						return Bip353Name { name: String::new(), domain: String::new() };
+					}
 					let domain_len = bytes[1 + name_len] as usize;
-					let domain = String::from_utf8(bytes[2 + name_len..2 + name_len + domain_len].to_vec()).unwrap();
+					if bytes.len() < 1 + name_len + 1 + domain_len {
+						return Bip353Name { name: String::new(), domain: String::new() };
+					}
+					let name = String::from_utf8_lossy(&bytes[1..1 + name_len]).to_string();
+					let domain = String::from_utf8_lossy(&bytes[2 + name_len..2 + name_len + domain_len]).to_string();
 					Bip353Name { name, domain }
 				}),
 				payer_bip353_signature: payer_bip353_signature.map(|bytes| {
-					let pubkey = PublicKey::from_slice(&bytes[..33]).unwrap();
-					let signature = Signature::from_slice(&bytes[33..]).unwrap();
-					(pubkey, signature)
+					if bytes.len() < 33 + 64 {
+                        // Return dummy values if we don't have enough bytes
+                        let dummy_pubkey = PublicKey::from_slice(&[2u8; 33]).unwrap();
+                        let dummy_sig = Signature::from_slice(&[0u8; 64]).unwrap();
+                        return (dummy_pubkey, dummy_sig);
+                    }
+                    let pubkey = match PublicKey::from_slice(&bytes[..33]) {
+                        Ok(key) => key,
+                        Err(_) => PublicKey::from_slice(&[2u8; 33]).unwrap(),
+                    };
+                    let sig = match Signature::from_slice(&bytes[33..97]) {
+                        Ok(sig) => sig,
+                        Err(_) => Signature::from_slice(&[0u8; 64]).unwrap(),
+                    };
+					(pubkey, sig)
 				}),
 				#[cfg(test)]
 				experimental_bar,

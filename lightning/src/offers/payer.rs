@@ -11,11 +11,19 @@
 
 use crate::offers::offer::Offer;
 use crate::offers::signer::Metadata;
-use crate::util::ser::WithoutLength;
+use crate::util::ser::{WithoutLength, Writeable};
 use bitcoin::secp256k1::{PublicKey, schnorr::Signature};
+use crate::blinded_path::message::BlindedMessagePath;
 
 #[allow(unused_imports)]
 use crate::prelude::*;
+
+use crate::io;
+use crate::ln::msgs::DecodeError;
+use crate::offers::contact::ContactSecret;
+use crate::offers::signer::{Metadata, MetadataMaterial};
+use crate::util::ser::{Readable, WithoutLength, Writeable, Writer};
+use core::convert::TryFrom;
 
 /// An unpredictable sequence of bytes typically containing information needed to derive
 /// [`InvoiceRequest::payer_signing_pubkey`] and [`Refund::payer_signing_pubkey`].
@@ -79,11 +87,52 @@ impl ContactSecret {
     }
 }
 
+/// Structure containing the node ID and blinding point for an introduction node
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntroductionNode {
+    /// The node ID of the introduction node
+    pub node_id: bitcoin::secp256k1::PublicKey,
+    /// The blinding point for the introduction node
+    pub blinding_point: bitcoin::secp256k1::PublicKey,
+}
+
+impl IntroductionNode {
+    /// Create a new introduction node from a blinded message path
+    pub fn from_blinded_path(path: &BlindedMessagePath) -> Self {
+        Self {
+            node_id: path.introduction_node,
+            blinding_point: path.blinding_point,
+        }
+    }
+
+    /// Get the node ID
+    pub fn node_id(&self) -> PublicKey {
+        self.node_id
+    }
+
+    /// Get the blinding point
+    pub fn blinding_point(&self) -> PublicKey {
+        self.blinding_point
+    }
+
+    /// Serialize the introduction node data
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.node_id.serialize());
+        data.extend_from_slice(&self.blinding_point.serialize());
+        data
+    }
+}
+
+/// Structure for contact payer information
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContactPayer(pub(super) Metadata, pub(super) Option<ContactSecret>, pub(super) Option<IntroductionNode>);
+
 tlv_stream!(PayerTlvStream, PayerTlvStreamRef<'a>, 0..1, {
 	(PAYER_METADATA_TYPE, metadata: (Vec<u8>, WithoutLength)),
 });
 
-/// TLV stream for experimental invoice request types including contacts
+/// TLV stream for contact data TLV records
 tlv_stream!(PayerContactTlvStream, PayerContactTlvStreamRef<'a>, 2000000000..3000000000, {
     (INVOICE_REQUEST_CONTACT_SECRET_TYPE, contact_secret: [u8; 32]),
     (INVOICE_REQUEST_PAYER_OFFER_TYPE, payer_offer: (Vec<u8>, WithoutLength)),
@@ -136,6 +185,136 @@ pub fn derive_contact_secret(payer_offer: &Offer, recipient_offer: &Offer) -> Co
     secret.copy_from_slice(&hash);
 
     ContactSecret(secret)
+}
+
+// Implement as_tlv_stream for ContactPayer
+impl ContactPayer {
+    pub fn as_tlv_stream(&self) -> (PayerTlvStreamRef, PayerContactTlvStreamRef) {
+        let payer = PayerTlvStreamRef { metadata: self.0.as_bytes() };
+        let contact = PayerContactTlvStreamRef {
+            contact_secret: self.1.as_ref().map(|secret| &secret.0),
+            payer_offer: None,
+            payer_bip353_name: None,
+            payer_bip353_signature: None,
+        };
+        (payer, contact)
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        use crate::util::ser::Writeable;
+
+        let mut buffer = Vec::new();
+        let (payer_tlv, contact_tlv) = self.as_tlv_stream();
+        payer_tlv.write(&mut buffer).unwrap();
+        contact_tlv.write(&mut buffer).unwrap();
+        buffer
+    }
+}
+
+pub(super) struct PayerTlvStreamRef<'a> {
+	pub metadata: Option<&'a [u8]>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(super) struct PayerTlvStream {
+	pub metadata: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct ContactPayer {
+    pub(crate) secret: ContactSecret,
+    pub(crate) name: Option<String>,
+    pub(crate) domain: Option<String>,
+}
+
+pub(crate) struct ContactTlvStreamRef<'a> {
+    pub contact_secret: Option<&'a [u8]>,
+    pub name: Option<&'a str>,
+    pub domain: Option<&'a str>,
+}
+
+pub(crate) struct ContactTlvStream {
+    pub contact_secret: Option<Vec<u8>>,
+    pub name: Option<String>,
+    pub domain: Option<String>,
+}
+
+impl<'a> Writeable for PayerTlvStreamRef<'a> {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		if let Some(metadata) = self.metadata {
+			WithoutLength(metadata).write(writer)?;
+		}
+
+		Ok(())
+	}
+}
+
+impl Writeable for PayerTlvStream {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		PayerTlvStreamRef { metadata: self.metadata.as_ref().map(|vec| vec.as_slice()) }.write(writer)
+	}
+}
+
+impl<'a> Writeable for ContactTlvStreamRef<'a> {
+    fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+        if let Some(secret) = self.contact_secret {
+            WithoutLength(secret).write(writer)?;
+        }
+
+        if let Some(name) = self.name {
+            WithoutLength(name).write(writer)?;
+        }
+
+        if let Some(domain) = self.domain {
+            WithoutLength(domain).write(writer)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Writeable for ContactTlvStream {
+    fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+        ContactTlvStreamRef {
+            contact_secret: self.contact_secret.as_ref().map(|vec| vec.as_slice()),
+            name: self.name.as_ref().map(|s| s.as_str()),
+            domain: self.domain.as_ref().map(|s| s.as_str()),
+        }.write(writer)
+    }
+}
+
+impl core::convert::TryFrom<ContactTlvStream> for ContactPayer {
+    type Error = DecodeError;
+
+    fn try_from(tlv_stream: ContactTlvStream) -> Result<Self, Self::Error> {
+        let secret = match tlv_stream.contact_secret {
+            Some(secret_bytes) if secret_bytes.len() == 32 => {
+                let mut secret_array = [0u8; 32];
+                secret_array.copy_from_slice(&secret_bytes);
+                ContactSecret(secret_array)
+            },
+            Some(_) => return Err(DecodeError::InvalidValue),
+            None => return Err(DecodeError::InvalidValue),
+        };
+
+        Ok(ContactPayer {
+            secret,
+            name: tlv_stream.name,
+            domain: tlv_stream.domain,
+        })
+    }
+}
+
+impl Writeable for ContactPayer {
+    fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+        ContactTlvStreamRef {
+            contact_secret: Some(&self.secret.0),
+            name: self.name.as_ref().map(|s| s.as_str()),
+            domain: self.domain.as_ref().map(|s| s.as_str()),
+        }.write(writer)
+    }
 }
 
 #[cfg(test)]
