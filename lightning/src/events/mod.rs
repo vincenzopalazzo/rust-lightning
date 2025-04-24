@@ -575,8 +575,8 @@ pub enum PaymentFailureReason {
 	/// We failed to find a route while sending or retrying the payment.
 	///
 	/// Note that this generally indicates that we've exhausted the available set of possible
-	/// routes - we tried the payment over a few routes but were not able to find any further
-	/// candidate routes beyond those.
+		/// routes - we tried the payment over a few routes but were not able to find any further
+		/// candidate routes beyond those.
 	///
 	/// Also used for [`BlindedPathCreationFailed`] when downgrading to versions prior to 0.0.124.
 	///
@@ -627,6 +627,29 @@ pub enum InboundChannelFunds {
 	/// who is the channel opener in this case.
 	DualFunded,
 }
+
+/// Contact information attached to a payment as described in BLIP-42.
+///
+/// This contains optional contact details that a payer can include in an invoice request,
+/// allowing recipients to recognize and associate payments with contacts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactInfo {
+	/// Optional contact secret for private contact establishment
+	pub contact_secret: Option<Vec<u8>>,
+	/// Optional payer offer for recipient to initiate future payments
+	pub payer_offer: Option<Vec<u8>>,
+	/// Optional BIP-353 name information (name, username)
+	pub payer_bip353_name: Option<(String, String)>,
+	/// Optional BIP-353 signature for verifying the payer's identity
+	pub payer_bip353_signature: Option<(PublicKey, Vec<u8>)>,
+}
+
+impl_writeable_tlv_based!(ContactInfo, {
+	(0, contact_secret, option),
+	(2, payer_offer, option),
+	(4, payer_bip353_name, option),
+	(6, payer_bip353_signature, option),
+});
 
 /// An Event which you should probably take some action in response to.
 ///
@@ -795,6 +818,11 @@ pub enum Event {
 		///
 		/// Only filled in for payments received on LDK versions 0.1 and higher.
 		payment_id: Option<PaymentId>,
+		/// Contact information from the payer provided according to BLIP-42 specification.
+		///
+		/// This will be `None` for payments that don't include contact information or for
+		/// events serialized with LDK versions prior to 0.1.2.
+		contact_info: Option<ContactInfo>,
 	},
 	/// Indicates a payment has been claimed and we've received money!
 	///
@@ -850,6 +878,11 @@ pub enum Event {
 		///
 		/// Only filled in for payments received on LDK versions 0.1 and higher.
 		payment_id: Option<PaymentId>,
+		/// Contact information from the payer provided according to BLIP-42 specification.
+		///
+		/// This will be `None` for payments that don't include contact information or for
+		/// events serialized with LDK versions prior to 0.1.2.
+		contact_info: Option<ContactInfo>,
 	},
 	/// Indicates that a peer connection with a node is needed in order to send an [`OnionMessage`].
 	///
@@ -1520,7 +1553,7 @@ impl Writeable for Event {
 			},
 			&Event::PaymentClaimable { ref payment_hash, ref amount_msat, counterparty_skimmed_fee_msat,
 				ref purpose, ref receiver_node_id, ref via_channel_id, ref via_user_channel_id,
-				ref claim_deadline, ref onion_fields, ref payment_id,
+				ref claim_deadline, ref onion_fields, ref payment_id, ref contact_info,
 			} => {
 				1u8.write(writer)?;
 				let mut payment_secret = None;
@@ -1567,6 +1600,7 @@ impl Writeable for Event {
 					(10, skimmed_fee_opt, option),
 					(11, payment_context, option),
 					(13, payment_id, option),
+					(15, contact_info, option),
 				});
 			},
 			&Event::PaymentSent { ref payment_id, ref payment_preimage, ref payment_hash, ref amount_msat, ref fee_paid_msat, ref bolt12_invoice } => {
@@ -1733,7 +1767,7 @@ impl Writeable for Event {
 			},
 			&Event::PaymentClaimed { ref payment_hash, ref amount_msat, ref purpose,
 				ref receiver_node_id, ref htlcs, ref sender_intended_total_msat, ref onion_fields,
-				ref payment_id,
+				ref payment_id, ref contact_info,
 			} => {
 				19u8.write(writer)?;
 				write_tlv_fields!(writer, {
@@ -1745,6 +1779,7 @@ impl Writeable for Event {
 					(7, sender_intended_total_msat, option),
 					(9, onion_fields, option),
 					(11, payment_id, option),
+					(13, contact_info, option),
 				});
 			},
 			&Event::ProbeSuccessful { ref payment_id, ref payment_hash, ref path } => {
@@ -1869,6 +1904,7 @@ impl MaybeReadable for Event {
 					let mut onion_fields = None;
 					let mut payment_context = None;
 					let mut payment_id = None;
+					let mut contact_info = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, receiver_node_id, option),
@@ -1883,6 +1919,7 @@ impl MaybeReadable for Event {
 						(10, counterparty_skimmed_fee_msat_opt, option),
 						(11, payment_context, option),
 						(13, payment_id, option),
+						(15, contact_info, option),
 					});
 					let purpose = match payment_secret {
 						Some(secret) => PaymentPurpose::from_parts(payment_preimage, secret, payment_context)
@@ -1901,6 +1938,7 @@ impl MaybeReadable for Event {
 						claim_deadline,
 						onion_fields,
 						payment_id,
+						contact_info,
 					}))
 				};
 				f()
@@ -2158,6 +2196,7 @@ impl MaybeReadable for Event {
 					let mut sender_intended_total_msat: Option<u64> = None;
 					let mut onion_fields = None;
 					let mut payment_id = None;
+					let mut contact_info = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, receiver_node_id, option),
@@ -2167,6 +2206,7 @@ impl MaybeReadable for Event {
 						(7, sender_intended_total_msat, option),
 						(9, onion_fields, option),
 						(11, payment_id, option),
+						(13, contact_info, option),
 					});
 					Ok(Some(Event::PaymentClaimed {
 						receiver_node_id,
@@ -2177,6 +2217,7 @@ impl MaybeReadable for Event {
 						sender_intended_total_msat,
 						onion_fields,
 						payment_id,
+						contact_info,
 					}))
 				};
 				f()

@@ -6355,6 +6355,7 @@ where
 												claim_deadline: Some(earliest_expiry - HTLC_FAIL_BACK_BUFFER),
 												onion_fields: claimable_payment.onion_fields.clone(),
 												payment_id: Some(payment_id),
+												contact_info: None,
 											}, None));
 											payment_claimable_generated = true;
 										} else {
@@ -7587,6 +7588,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							sender_intended_total_msat,
 							onion_fields,
 							payment_id,
+							contact_info: None,
 						};
 						let event_action = (event, None);
 						let mut pending_events = self.pending_events.lock().unwrap();
@@ -14923,6 +14925,7 @@ where
 							sender_intended_total_msat: payment.htlcs.first().map(|htlc| htlc.total_msat),
 							onion_fields: payment.onion_fields,
 							payment_id: Some(payment_id),
+							contact_info: None,
 						}, None));
 					}
 				}
