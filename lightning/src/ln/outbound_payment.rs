@@ -676,6 +676,11 @@ pub struct RecipientOnionFields {
 	/// [`Self::payment_secret`] and while nearly all lightning senders support secrets, metadata
 	/// may not be supported as universally.
 	pub payment_metadata: Option<Vec<u8>>,
+	/// Contact information associated with the payment as specified in BLIP-0042.
+	///
+	/// This information helps the recipient identify the sender, establish contact,
+	/// or facilitate future payments.
+	pub contact_info: Option<crate::events::ContactInfo>,
 	/// See [`Self::custom_tlvs`] for more info.
 	pub(super) custom_tlvs: Vec<(u64, Vec<u8>)>,
 }
@@ -684,6 +689,7 @@ impl_writeable_tlv_based!(RecipientOnionFields, {
 	(0, payment_secret, option),
 	(1, custom_tlvs, optional_vec),
 	(2, payment_metadata, option),
+	(3, contact_info, option),
 });
 
 impl RecipientOnionFields {
@@ -691,7 +697,7 @@ impl RecipientOnionFields {
 	/// set of onion fields for today's BOLT11 invoices - most nodes require a [`PaymentSecret`]
 	/// but do not require or provide any further data.
 	pub fn secret_only(payment_secret: PaymentSecret) -> Self {
-		Self { payment_secret: Some(payment_secret), payment_metadata: None, custom_tlvs: Vec::new() }
+		Self { payment_secret: Some(payment_secret), payment_metadata: None, contact_info: None, custom_tlvs: Vec::new() }
 	}
 
 	/// Creates a new [`RecipientOnionFields`] with no fields. This generally does not create
@@ -703,7 +709,15 @@ impl RecipientOnionFields {
 	/// [`ChannelManager::send_spontaneous_payment`]: super::channelmanager::ChannelManager::send_spontaneous_payment
 	/// [`RecipientOnionFields::secret_only`]: RecipientOnionFields::secret_only
 	pub fn spontaneous_empty() -> Self {
-		Self { payment_secret: None, payment_metadata: None, custom_tlvs: Vec::new() }
+		Self { payment_secret: None, payment_metadata: None, contact_info: None, custom_tlvs: Vec::new() }
+	}
+
+	/// Creates a new [`RecipientOnionFields`] from an existing one, adding contact information as
+	/// specified in BLIP-0042. The contact information can help recipients identify the sender,
+	/// establish contact, or facilitate future payments.
+	pub fn with_contact_info(mut self, contact_info: crate::events::ContactInfo) -> Self {
+		self.contact_info = Some(contact_info);
+		self
 	}
 
 	/// Creates a new [`RecipientOnionFields`] from an existing one, adding custom TLVs. Each
@@ -912,66 +926,67 @@ impl OutboundPayments {
 		).map_err(|err| Bolt11PaymentError::SendingFailed(err))
 	}
 
-	pub(super) fn send_payment_for_bolt12_invoice<
-		R: Deref, ES: Deref, NS: Deref, NL: Deref, IH, SP, L: Deref
-	>(
-		&self, invoice: &Bolt12Invoice, payment_id: PaymentId, router: &R,
-		first_hops: Vec<ChannelDetails>, features: Bolt12InvoiceFeatures, inflight_htlcs: IH,
-		entropy_source: &ES, node_signer: &NS, node_id_lookup: &NL,
-		secp_ctx: &Secp256k1<secp256k1::All>, best_block_height: u32, logger: &L,
-		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>,
-		send_payment_along_path: SP,
-	) -> Result<(), Bolt12PaymentError>
-	where
-		R::Target: Router,
-		ES::Target: EntropySource,
-		NS::Target: NodeSigner,
-		NL::Target: NodeIdLookUp,
-		L::Target: Logger,
-		IH: Fn() -> InFlightHtlcs,
-		SP: Fn(SendAlongPathArgs) -> Result<(), APIError>,
+	/// Sends a payment for a BOLT 12 invoice.
+	///
+	/// As described in the reference `ChannelManager::send_payment_for_bolt12_invoice`. This is ultimately
+	/// required in order to create a payment for a BOLT 12 invoice which was generated through
+	/// `ChannelManager::create_one_time_payment` or `ChannelManager::pay_for_offer`.
+	pub fn send_payment_for_bolt12_invoice<R: Router, L: Deref>(&self, invoice: &Bolt12Invoice, payment_id: PaymentId, contact_info: Option<Vec<u8>>,
+		router: &R, usable_channels: Vec<ChannelDetails>, features: Bolt12InvoiceFeatures, inflight_htlcs: impl FnOnce() -> InFlightHtlcs,
+		entropy_source: &ES, node_signer: &NS, recipient_onion: &R2, secp_ctx: &Secp256k1<C>,
+		best_block_height: u32, logger: &L, pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>,
+		send_payment_along_path: SendPaymentAlongPath<SP>
+	) -> Result<(), Bolt12PaymentError> where L::Target: Logger, R2: Deref + Clone, R2::Target: RecipientOnionFields,
 	{
-		let payment_hash = invoice.payment_hash();
-		let params_config;
-		let retry_strategy;
-		match self.pending_outbound_payments.lock().unwrap().entry(payment_id) {
-			hash_map::Entry::Occupied(entry) => match entry.get() {
-				PendingOutboundPayment::AwaitingInvoice {
-					retry_strategy: retry, route_params_config, ..
-				} => {
-					retry_strategy = *retry;
-					params_config = *route_params_config;
-					*entry.into_mut() = PendingOutboundPayment::InvoiceReceived {
-						payment_hash,
-						retry_strategy: *retry,
-						route_params_config: *route_params_config,
-					};
-				},
-				_ => return Err(Bolt12PaymentError::DuplicateInvoice),
-			},
-			hash_map::Entry::Vacant(_) => return Err(Bolt12PaymentError::UnexpectedInvoice),
-		}
+		// Check that this is a new payment.
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let outbound_payment_id = OutboundPaymentId::Bolt12(payment_id.0);
+		if let hash_map::Entry::Vacant(entry) = self.pending_outbound_payments.entry(outbound_payment_id) {
+			let route_params = if invoice.supports_basic_mpp() {
+				PaymentParameters::for_mpp_bolt12_invoice(invoice.payment_paths(), invoice.payment_hash(),
+					invoice.metadata_directory_sig_check(), invoice.expiry_time())
+			} else {
+				PaymentParameters::for_bolt12_invoice(invoice.payment_paths(), invoice.payment_hash(), invoice.expiry_time())
+			};
 
-		if invoice.invoice_features().requires_unknown_bits_from(&features) {
-			self.abandon_payment(
-				payment_id, PaymentFailureReason::UnknownRequiredFeatures, pending_events,
-			);
-			return Err(Bolt12PaymentError::UnknownRequiredFeatures);
-		}
+			// Build `RecipientOnionFields` with any empty values to match the behavior of `ChannelManager::send_payment`.
+			let recipient_onion = RecipientOnionFields::spontaneous_empty();
+			// Add the contact_info if provided
+			let recipient_onion = if let Some(contact_info) = contact_info {
+				recipient_onion.with_contact_info(contact_info)
+			} else {
+				recipient_onion
+			};
 
-		let mut route_params = RouteParameters::from_payment_params_and_value(
-			PaymentParameters::from_bolt12_invoice(&invoice)
-				.with_user_config_ignoring_fee_limit(params_config), invoice.amount_msats()
-		);
-		if let Some(max_fee_msat) = params_config.max_total_routing_fee_msat {
-			route_params.max_total_routing_fee_msat = Some(max_fee_msat);
+			let route_params_config = RouteParametersConfig {
+				first_hops_rand_lower_bound: usable_channels, ..RouteParametersConfig::default()
+			};
+			let route_params = RouteParameters {
+				payment_params: route_params, final_value_msat: invoice.amount_msats(),
+				config: route_params_config,
+			};
+
+			let payment_params = PaymentParameters::from_node_id(
+				invoice.signing_pubkey(), invoice.min_final_cltv_expiry_delta() as u32
+			)
+			.with_route_hints(Vec::new())
+			.with_expiry_time(invoice.expiry_time());
+
+			let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+			let payee = Payee::Clear { node_id: invoice.signing_pubkey(), params: payment_params };
+			let payment_context = PaymentContext::from_bolt12_invoice(invoice);
+
+			// Setup a fresh payment, automatically canceling older entries with the same payment_id if
+			// needed. This enables us to use the same payment_id when retrying BOLT 12 invoice payment
+			// requests.
+			self.setup_outbound_payment(features, payment_id, Some(payment_hash), entry, payment_context, payee,
+				Some(invoice.amount_msats()), route_params, inflight_htlcs,
+				entropy_source, node_signer, recipient_onion, secp_ctx, best_block_height, logger,
+				pending_events, send_payment_along_path)?;
+			Ok(())
+		} else {
+			Err(Bolt12PaymentError::DuplicateInvoice)
 		}
-		let invoice = PaidBolt12Invoice::Bolt12Invoice(invoice.clone());
-		self.send_payment_for_bolt12_invoice_internal(
-			payment_id, payment_hash, None, None, invoice, route_params, retry_strategy, router, first_hops,
-			inflight_htlcs, entropy_source, node_signer, node_id_lookup, secp_ctx, best_block_height,
-			logger, pending_events, send_payment_along_path
-		)
 	}
 
 	fn send_payment_for_bolt12_invoice_internal<
@@ -1016,6 +1031,7 @@ impl OutboundPayments {
 		let recipient_onion = RecipientOnionFields {
 			payment_secret: None,
 			payment_metadata: None,
+			contact_info: None,
 			custom_tlvs: vec![],
 		};
 		let route = match self.find_initial_route(
@@ -1464,6 +1480,7 @@ impl OutboundPayments {
 							let recipient_onion = RecipientOnionFields {
 								payment_secret: *payment_secret,
 								payment_metadata: payment_metadata.clone(),
+								contact_info: None,
 								custom_tlvs: custom_tlvs.clone(),
 							};
 							let keysend_preimage = *keysend_preimage;
@@ -1665,11 +1682,11 @@ impl OutboundPayments {
 		let route = Route { paths: vec![path], route_params: None };
 		let onion_session_privs = self.add_new_pending_payment(payment_hash,
 			RecipientOnionFields::secret_only(payment_secret), payment_id, None, &route, None, None,
-			entropy_source, best_block_height, None
-		).map_err(|e| {
-			debug_assert!(matches!(e, PaymentSendFailure::DuplicatePayment));
-			ProbeSendFailure::DuplicateProbe
-		})?;
+			entropy_source, best_block_height, None)
+			.map_err(|e| {
+				debug_assert!(matches!(e, PaymentSendFailure::DuplicatePayment));
+				ProbeSendFailure::DuplicateProbe
+			})?;
 
 		let recipient_onion_fields = RecipientOnionFields::spontaneous_empty();
 		match self.pay_route_internal(&route, payment_hash, &recipient_onion_fields,

@@ -6199,7 +6199,7 @@ where
 									} => {
 										let _legacy_hop_data = Some(payment_data.clone());
 										let onion_fields = RecipientOnionFields { payment_secret: Some(payment_data.payment_secret),
-												payment_metadata, custom_tlvs };
+																						payment_metadata, custom_tlvs, contact_info: None };
 										(incoming_cltv_expiry, OnionPayload::Invoice { _legacy_hop_data },
 											Some(payment_data), payment_context, phantom_shared_secret, onion_fields,
 											true, None)
@@ -6213,6 +6213,7 @@ where
 											payment_secret: payment_data.as_ref().map(|data| data.payment_secret),
 											payment_metadata,
 											custom_tlvs,
+											contact_info: None,
 										};
 										(incoming_cltv_expiry, OnionPayload::Spontaneous(payment_preimage),
 											payment_data, payment_context, None, onion_fields,
@@ -10482,9 +10483,9 @@ where
 	pub fn pay_for_offer(
 		&self, offer: &Offer, quantity: Option<u64>, amount_msats: Option<u64>,
 		payer_note: Option<String>, payment_id: PaymentId, retry_strategy: Retry,
-		route_params_config: RouteParametersConfig
+		route_params_config: RouteParametersConfig, contact_info: Option<String>
 	) -> Result<(), Bolt12SemanticError> {
-		self.pay_for_offer_intern(offer, quantity, amount_msats, payer_note, payment_id, None, |invoice_request, nonce| {
+		self.pay_for_offer_intern(offer, quantity, amount_msats, payer_note, payment_id, None, contact_info, |invoice_request, nonce| {
 			let expiration = StaleExpiration::TimerTicks(1);
 			let retryable_invoice_request = RetryableInvoiceRequest {
 				invoice_request: invoice_request.clone(),
