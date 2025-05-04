@@ -58,6 +58,7 @@ const ASYNC_PAYMENTS_HELD_HTLC_HMAC_INPUT: &[u8; 16] = &[9; 16];
 /// Message metadata which possibly is derived from [`MetadataMaterial`] such that it can be
 /// verified.
 #[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(super) enum Metadata {
 	/// Metadata as parsed, supplied by the user, or derived from the message contents.
 	///

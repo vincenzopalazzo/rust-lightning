@@ -1521,7 +1521,7 @@ type FullInvoiceTlvStreamRef<'a> = (
 	InvoiceTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -1565,7 +1565,7 @@ type PartialInvoiceTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 

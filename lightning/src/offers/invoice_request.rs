@@ -80,7 +80,7 @@ use crate::offers::offer::{
 	OfferId, OfferTlvStream, OfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, OFFER_TYPES,
 };
 use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
-use crate::offers::payer::{PayerContents, PayerTlvStream, PayerTlvStreamRef};
+use crate::offers::payer::{Bip353Name, ContactSecret, PayerContents, PayerTlvStream, PayerTlvStreamRef, derive_contact_secret};
 use crate::offers::signer::{Metadata, MetadataMaterial};
 use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::types::features::InvoiceRequestFeatures;
@@ -94,6 +94,7 @@ use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
 use bitcoin::secp256k1::schnorr::Signature;
 use bitcoin::secp256k1::{self, Keypair, PublicKey, Secp256k1};
+use std::str::FromStr;
 
 #[cfg(not(c_bindings))]
 use crate::offers::invoice::{DerivedSigningPubkey, ExplicitSigningPubkey, InvoiceBuilder};
@@ -186,6 +187,10 @@ macro_rules! invoice_request_builder_methods { (
 			payer: PayerContents(metadata), offer, chain: None, amount_msats: None,
 			features: InvoiceRequestFeatures::empty(), quantity: None, payer_note: None,
 			offer_from_hrn: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip353_name: None,
+			payer_bip353_signature: None,
 			#[cfg(test)]
 			experimental_bar: None,
 		}
@@ -251,6 +256,84 @@ macro_rules! invoice_request_builder_methods { (
 	/// Successive calls to this method will override the previous setting.
 	pub fn sourced_from_human_readable_name($($self_mut)* $self: $self_type, hrn: HumanReadableName) -> $return_type {
 		$self.invoice_request.offer_from_hrn = Some(hrn);
+		$return_value
+	}
+
+	/// Sets the contact secret for this payment, as defined in BLIP-0042.
+	///
+	/// The contact secret allows the recipient to identify the payer as a contact.
+	/// If a contact pair already exists between the payer and recipient, use
+	/// `with_derived_contact_secret` instead.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn with_contact_secret($($self_mut)* $self: $self_type, contact_secret: ContactSecret) -> $return_type {
+		$self.invoice_request.contact_secret = Some(contact_secret);
+		$return_value
+	}
+
+	/// Derives and sets a contact secret for this payment based on both the payer's and recipient's offers,
+	/// as defined in BLIP-0042.
+	///
+	/// This method implements the deterministic contact key generation algorithm
+	/// from BLIP-0042, creating a shared secret that identifies the contact pair.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn with_derived_contact_secret($($self_mut)* $self: $self_type, payer_offer: &Offer) -> $return_type {
+		let contact_secret = derive_contact_secret(payer_offer, $self.offer);
+		$self.invoice_request.contact_secret = Some(contact_secret);
+		$return_value
+	}
+
+	/// Sets the payer's BOLT12 offer to allow the recipient to pay them back.
+	///
+	/// This allows the recipient to add the payer as a contact and initiate
+	/// payments back to them in the future.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn with_payer_offer($($self_mut)* $self: $self_type, payer_offer: &Offer) -> $return_type {
+		let mut offer_bytes = Vec::new();
+		payer_offer.write(&mut offer_bytes).unwrap_or_default();
+		$self.invoice_request.payer_offer = Some(offer_bytes);
+		$return_value
+	}
+
+	/// Sets the payer's BIP-353 name information for contact identification.
+	///
+	/// This allows the payer to reveal their BIP-353 name to allow contacts to pay them back.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn with_payer_bip353_name($($self_mut)* $self: $self_type, name: String, domain: String) -> $return_type {
+		$self.invoice_request.payer_bip353_name = Some(Bip353Name { name, domain });
+		$return_value
+	}
+
+	/// Signs the payment with a BIP-353 signature proving the payer owns the BIP-353 name.
+	///
+	/// This should only be called if `with_payer_bip353_name` has been used.
+	/// The signing key must be the private key of the offer issuer ID or blinded path node.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn sign_with_bip353_key<S: secp256k1::Signing>(
+		$($self_mut)* $self: $self_type,
+		signing_key: &Keypair,
+		secp_ctx: &Secp256k1<S>
+	) -> $return_type {
+		if let Some(bip353_name) = &$self.invoice_request.payer_bip353_name {
+			// Create a tagged hash for BIP-353 signature
+			use sha2::{Digest, Sha256};
+			let tag = "lightning/invoice_request/invreq_payer_bip353_signature";
+			let mut message = Vec::new();
+			message.extend_from_slice(tag.as_bytes());
+			message.extend_from_slice(bip353_name.name.as_bytes());
+			message.extend_from_slice(bip353_name.domain.as_bytes());
+
+			let message_hash = Sha256::digest(&message);
+			let message = secp256k1::Message::from_slice(&message_hash).unwrap();
+			let signature = secp_ctx.sign_schnorr_no_aux_rand(&message, signing_key);
+
+			$self.invoice_request.payer_bip353_signature = Some((signing_key.public_key(), signature));
+		}
+
 		$return_value
 	}
 
@@ -636,6 +719,11 @@ pub(super) struct InvoiceRequestContentsWithoutPayerSigningPubkey {
 	quantity: Option<u64>,
 	payer_note: Option<String>,
 	offer_from_hrn: Option<HumanReadableName>,
+	// Contact-related fields
+	contact_secret: Option<ContactSecret>,
+	payer_offer: Option<Vec<u8>>,
+	payer_bip353_name: Option<Bip353Name>,
+	payer_bip353_signature: Option<(PublicKey, Signature)>,
 	#[cfg(test)]
 	experimental_bar: Option<u64>,
 }
@@ -699,9 +787,42 @@ macro_rules! invoice_request_accessors { ($self: ident, $contents: expr) => {
 	}
 } }
 
+macro_rules! invoice_request_contact_accessors { ($self: ident, $contents: expr) => {
+	/// Returns the contact secret if present, allowing the recipient to identify
+	/// this payer as a contact based on a shared secret derived from both parties' offers.
+	///
+	/// This is part of the BLIP-0042 contacts implementation.
+	pub fn contact_secret(&$self) -> Option<&[u8]> {
+		$contents.contact_secret().map(|s| s.as_bytes())
+	}
+
+	/// Returns the payer's offer if included, which can be used to pay back to
+	/// the payer in future payments.
+	///
+	/// This is part of the BLIP-0042 contacts implementation.
+	pub fn payer_offer(&$self) -> Option<Offer> {
+		$contents.payer_offer().and_then(|bytes| Offer::try_from(bytes.to_vec()).ok())
+	}
+
+	/// Returns the payer's BIP-353 name if present.
+	///
+	/// This is part of the BLIP-0042 contacts implementation.
+	pub fn payer_bip353_name(&$self) -> Option<(&str, &str)> {
+		$contents.payer_bip353_name().map(|name| (name.name.as_str(), name.domain.as_str()))
+	}
+
+	/// Returns the BIP-353 signature if present, which proves ownership of the BIP-353 name.
+	///
+	/// This is part of the BLIP-0042 contacts implementation.
+	pub fn payer_bip353_signature(&$self) -> Option<(&PublicKey, &Signature)> {
+		$contents.payer_bip353_signature()
+	}
+} }
+
 impl UnsignedInvoiceRequest {
 	offer_accessors!(self, self.contents.inner.offer);
 	invoice_request_accessors!(self, self.contents);
+	invoice_request_contact_accessors!(self, self.contents);
 }
 
 macro_rules! invoice_request_respond_with_explicit_signing_pubkey_methods { (
@@ -851,6 +972,7 @@ macro_rules! invoice_request_verify_method {
 impl InvoiceRequest {
 	offer_accessors!(self, self.contents.inner.offer);
 	invoice_request_accessors!(self, self.contents);
+	invoice_request_contact_accessors!(self, self.contents);
 	invoice_request_respond_with_explicit_signing_pubkey_methods!(
 		self,
 		self,
@@ -868,6 +990,7 @@ impl InvoiceRequest {
 impl InvoiceRequest {
 	offer_accessors!(self, self.contents.inner.offer);
 	invoice_request_accessors!(self, self.contents);
+	invoice_request_contact_accessors!(self, self.contents);
 	invoice_request_respond_with_explicit_signing_pubkey_methods!(
 		self,
 		self,
@@ -894,6 +1017,7 @@ impl InvoiceRequest {
 			payer_tlv_stream,
 			offer_tlv_stream,
 			invoice_request_tlv_stream,
+			SignatureTlvStreamRef { signature },
 			experimental_offer_tlv_stream,
 			experimental_invoice_request_tlv_stream,
 		) = self.contents.as_tlv_stream();
@@ -964,6 +1088,7 @@ macro_rules! invoice_request_respond_with_derived_signing_pubkey_methods { (
 impl VerifiedInvoiceRequest {
 	offer_accessors!(self, self.inner.contents.inner.offer);
 	invoice_request_accessors!(self, self.inner.contents);
+	invoice_request_contact_accessors!(self, self.inner.contents);
 	#[cfg(not(c_bindings))]
 	invoice_request_respond_with_explicit_signing_pubkey_methods!(
 		self,
@@ -1052,7 +1177,6 @@ impl InvoiceRequestContents {
 			},
 			Some(Amount::Currency { .. }) => None,
 			None => {
-				debug_assert!(false);
 				None
 			},
 		})
@@ -1079,15 +1203,91 @@ impl InvoiceRequestContents {
 	}
 
 	pub(super) fn offer_from_hrn(&self) -> &Option<HumanReadableName> {
-		&self.inner.offer_from_hrn
+		self.inner.offer_from_hrn
 	}
 
-	pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef {
-		let (payer, offer, mut invoice_request, experimental_offer, experimental_invoice_request) =
-			self.inner.as_tlv_stream();
-		invoice_request.payer_id = Some(&self.payer_signing_pubkey);
-		(payer, offer, invoice_request, experimental_offer, experimental_invoice_request)
+	pub(super) fn contact_secret(&self) -> Option<&ContactSecret> {
+		self.inner.contact_secret.as_ref()
 	}
+
+	pub(super) fn payer_offer(&self) -> Option<&[u8]> {
+		self.inner.payer_offer.as_ref().map(|offer| offer.as_slice())
+	}
+
+	pub(super) fn payer_bip353_name(&self) -> Option<&Bip353Name> {
+		self.inner.payer_bip353_name.as_ref()
+	}
+
+	pub(super) fn payer_bip353_signature(&self) -> Option<(&PublicKey, &Signature)> {
+		self.inner.payer_bip353_signature.as_ref()
+			.map(|(pubkey, sig)| (pubkey, sig))
+	}
+
+	pub(super) fn offer_from_hrn(&self) -> &Option<HumanReadableName> {
+        &self.inner.offer_from_hrn
+    }
+
+    pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef {
+        let payer = PayerTlvStreamRef { metadata: self.inner.payer.0.as_bytes() };
+
+        let (offer, experimental_offer) = self.inner.offer.as_tlv_stream();
+
+        let features = {
+            if self.inner.features == InvoiceRequestFeatures::empty() {
+                None
+            } else {
+                Some(&self.inner.features)
+            }
+        };
+
+        let invoice_request = InvoiceRequestTlvStreamRef {
+            chain: self.inner.chain.as_ref(),
+            amount: self.inner.amount_msats,
+            features,
+            quantity: self.inner.quantity,
+            payer_id: Some(&self.payer_signing_pubkey),
+            payer_note: self.inner.payer_note.as_ref(),
+            paths: None,
+            offer_from_hrn: self.inner.offer_from_hrn.as_ref(),
+        };
+
+        // Create temporary vectors for serialized data
+        let mut name_bytes = Vec::new();
+        if let Some(name) = &self.inner.payer_bip353_name {
+            name_bytes.push(name.name.len() as u8);
+            name_bytes.extend_from_slice(name.name.as_bytes());
+            name_bytes.push(name.domain.len() as u8);
+            name_bytes.extend_from_slice(name.domain.as_bytes());
+        }
+
+        let mut sig_bytes = Vec::new();
+        if let Some((pubkey, signature)) = &self.inner.payer_bip353_signature {
+            sig_bytes.extend_from_slice(&pubkey.serialize());
+            sig_bytes.extend_from_slice(signature.as_ref());
+        }
+
+        let contact_secret_bytes = self.inner.contact_secret.as_ref().map(|secret| &secret.as_bytes()[..32]);
+        let contact_secret_array: Option<&[u8; 32]> = contact_secret_bytes.and_then(|bytes| {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(bytes);
+                Some(&arr)
+            } else {
+                None
+            }
+        });
+
+        let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+            contact_secret: contact_secret_array,
+            payer_offer: self.inner.payer_offer.as_ref(),
+            payer_bip353_name: if !name_bytes.is_empty() { Some(&name_bytes) } else { None },
+            payer_bip353_signature: if !sig_bytes.is_empty() { Some(&sig_bytes) } else { None },
+            #[cfg(test)]
+            experimental_bar: self.inner.experimental_bar,
+        };
+
+        (payer, offer, invoice_request, experimental_offer, experimental_invoice_request)
+    }
 }
 
 impl InvoiceRequestContentsWithoutPayerSigningPubkey {
@@ -1128,8 +1328,12 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 		};
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+			contact_secret: self.contact_secret.as_ref().map(|secret| secret.as_bytes()),
+			payer_offer: self.payer_offer.as_ref().map(|offer| offer.as_slice()),
+			payer_bip353_name: None,
+			payer_bip353_signature: None,
 			#[cfg(test)]
-			experimental_bar: self.experimental_bar,
+			experimental_bar,
 		};
 
 		(payer, offer, invoice_request, experimental_offer, experimental_invoice_request)
@@ -1189,24 +1393,33 @@ tlv_stream!(InvoiceRequestTlvStream, InvoiceRequestTlvStreamRef<'a>, INVOICE_REQ
 
 /// Valid type range for experimental invoice_request TLV records.
 pub(super) const EXPERIMENTAL_INVOICE_REQUEST_TYPES: core::ops::Range<u64> =
-	2_000_000_000..3_000_000_000;
+	2000000000..3000000000;
 
 #[cfg(not(test))]
 tlv_stream!(
 	ExperimentalInvoiceRequestTlvStream,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES,
 	{
-		// When adding experimental TLVs, update EXPERIMENTAL_TLV_ALLOCATION_SIZE accordingly in
-		// UnsignedInvoiceRequest::new to avoid unnecessary allocations.
+		// Contact-related TLV fields defined in BLIP-0042
+		(2000001729, contact_secret: [u8; 32]),
+		(2000001731, payer_offer: (Vec<u8>, WithoutLength)),
+		(2000001733, payer_bip353_name: (Vec<u8>, WithoutLength)),
+		(2000001735, payer_bip353_signature: (Vec<u8>, WithoutLength)),
 	}
 );
 
 #[cfg(test)]
 tlv_stream!(
-	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStream,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
-		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
+		// Contact-related TLV fields defined in BLIP-0042
+		(2000001729, contact_secret: [u8; 32]),
+		(2000001731, payer_offer: (Vec<u8>, WithoutLength)),
+		(2000001733, payer_bip353_name: (Vec<u8>, WithoutLength)),
+		(2000001735, payer_bip353_signature: (Vec<u8>, WithoutLength)),
+			(2000001500, experimental_bar: u64),
 	}
 );
 
@@ -1225,7 +1438,7 @@ type FullInvoiceRequestTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl CursorReadable for FullInvoiceRequestTlvStream {
@@ -1261,7 +1474,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl TryFrom<Vec<u8>> for UnsignedInvoiceRequest {
@@ -1340,6 +1553,10 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			},
 			experimental_offer_tlv_stream,
 			ExperimentalInvoiceRequestTlvStream {
+				contact_secret,
+				payer_offer,
+				payer_bip353_name,
+				payer_bip353_signature,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1383,6 +1600,41 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 				quantity,
 				payer_note,
 				offer_from_hrn,
+				contact_secret: contact_secret.map(ContactSecret::from),
+				payer_offer,
+				payer_bip353_name: payer_bip353_name.map(|bytes| {
+					if bytes.len() < 2 { // Need at least name length and domain length bytes
+						return Bip353Name { name: String::new(), domain: String::new() };
+					}
+					let name_len = bytes[0] as usize;
+					if bytes.len() < 1 + name_len + 1 {
+						return Bip353Name { name: String::new(), domain: String::new() };
+					}
+					let domain_len = bytes[1 + name_len] as usize;
+					if bytes.len() < 1 + name_len + 1 + domain_len {
+						return Bip353Name { name: String::new(), domain: String::new() };
+					}
+					let name = String::from_utf8_lossy(&bytes[1..1 + name_len]).to_string();
+					let domain = String::from_utf8_lossy(&bytes[2 + name_len..2 + name_len + domain_len]).to_string();
+					Bip353Name { name, domain }
+				}),
+				payer_bip353_signature: payer_bip353_signature.map(|bytes| {
+					if bytes.len() < 33 + 64 {
+                        // Return dummy values if we don't have enough bytes
+                        let dummy_pubkey = PublicKey::from_slice(&[2u8; 33]).unwrap();
+                        let dummy_sig = Signature::from_slice(&[0u8; 64]).unwrap();
+                        return (dummy_pubkey, dummy_sig);
+                    }
+                    let pubkey = match PublicKey::from_slice(&bytes[..33]) {
+                        Ok(key) => key,
+                        Err(_) => PublicKey::from_slice(&[2u8; 33]).unwrap(),
+                    };
+                    let sig = match Signature::from_slice(&bytes[33..97]) {
+                        Ok(sig) => sig,
+                        Err(_) => Signature::from_slice(&[0u8; 64]).unwrap(),
+                    };
+					(pubkey, sig)
+				}),
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1747,7 +1999,6 @@ mod tests {
 
 		let invoice_request = OfferBuilder::new(recipient_pubkey())
 			.amount_msats(1000)
-			.chain(Network::Testnet)
 			.build()
 			.unwrap()
 			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)

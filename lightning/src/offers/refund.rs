@@ -815,9 +815,14 @@ impl RefundContents {
 			experimental_foo: self.experimental_foo,
 		};
 
+		// Create an ExperimentalInvoiceRequestTlvStreamRef with all fields set to None
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip353_name: None,
+			payer_bip353_signature: None,
 			#[cfg(test)]
-			experimental_bar: self.experimental_bar,
+			experimental_bar: None,
 		};
 
 		(payer, offer, invoice_request, experimental_offer, experimental_invoice_request)
@@ -861,7 +866,7 @@ type RefundTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl CursorReadable for RefundTlvStream {
@@ -892,59 +897,54 @@ impl TryFrom<Vec<u8>> for Refund {
 	type Error = Bolt12ParseError;
 
 	fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
-		let refund = ParsedMessage::<RefundTlvStream>::try_from(bytes)?;
-		let ParsedMessage { bytes, tlv_stream } = refund;
-		let contents = RefundContents::try_from(tlv_stream)?;
-
-		Ok(Refund { bytes, contents })
-	}
-}
-
-impl TryFrom<RefundTlvStream> for RefundContents {
-	type Error = Bolt12SemanticError;
-
-	fn try_from(tlv_stream: RefundTlvStream) -> Result<Self, Self::Error> {
-		let (
-			PayerTlvStream { metadata: payer_metadata },
-			OfferTlvStream {
-				chains,
-				metadata,
-				currency,
-				amount: offer_amount,
-				description,
-				features: offer_features,
-				absolute_expiry,
-				paths: offer_paths,
-				issuer,
-				quantity_max,
-				issuer_id,
-			},
-			InvoiceRequestTlvStream {
-				chain,
-				amount,
-				features,
-				quantity,
-				payer_id,
-				payer_note,
-				paths,
-				offer_from_hrn,
-			},
-			ExperimentalOfferTlvStream {
-				#[cfg(test)]
-				experimental_foo,
-			},
-			ExperimentalInvoiceRequestTlvStream {
-				#[cfg(test)]
-				experimental_bar,
-			},
-		) = tlv_stream;
+		let tlv_stream = match ParsedMessage::<FullRefundTlvStream>::try_from(bytes) {
+            Ok(message) => message.tlv_stream,
+            Err(e) => return Err(e),
+        };
+        let (
+            PayerTlvStream { metadata: payer_metadata },
+            OfferTlvStream {
+                chains,
+                metadata: offer_metadata,
+                currency,
+                amount,
+                description,
+                features: offer_features,
+                absolute_expiry,
+                paths,
+                issuer,
+                quantity_max,
+                issuer_id,
+            },
+            InvoiceRequestTlvStream {
+                chain,
+                amount: amount_msats,
+                features,
+                quantity,
+                payer_id,
+                payer_note,
+                paths: refund_paths,
+                offer_from_hrn
+            },
+            SignatureTlvStream { signature },
+            ExperimentalOfferTlvStream { experimental_foo },
+            ExperimentalInvoiceRequestTlvStream {
+                contact_secret,
+                payer_offer,
+                payer_bip353_name,
+                payer_bip353_signature,
+                #[cfg(test)]
+                experimental_bar,
+            },
+        ) = tlv_stream;
+        // Process fields as needed...
 
 		let payer = match payer_metadata {
 			None => return Err(Bolt12SemanticError::MissingPayerMetadata),
 			Some(metadata) => PayerContents(Metadata::Bytes(metadata)),
 		};
 
-		if metadata.is_some() {
+		if offer_metadata.is_some() {
 			return Err(Bolt12SemanticError::UnexpectedMetadata);
 		}
 
@@ -952,7 +952,7 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 			return Err(Bolt12SemanticError::UnexpectedChain);
 		}
 
-		if currency.is_some() || offer_amount.is_some() {
+		if currency.is_some() || amount.is_some() {
 			return Err(Bolt12SemanticError::UnexpectedAmount);
 		}
 
@@ -967,7 +967,7 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 
 		let absolute_expiry = absolute_expiry.map(Duration::from_secs);
 
-		if offer_paths.is_some() {
+		if paths.is_some() {
 			return Err(Bolt12SemanticError::UnexpectedPaths);
 		}
 
@@ -984,7 +984,7 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 			return Err(Bolt12SemanticError::UnexpectedHumanReadableName);
 		}
 
-		let amount_msats = match amount {
+		let amount_msats = match amount_msats {
 			None => return Err(Bolt12SemanticError::MissingAmount),
 			Some(amount_msats) if amount_msats > MAX_VALUE_MSAT => {
 				return Err(Bolt12SemanticError::InvalidAmount);
@@ -1010,7 +1010,7 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 			quantity,
 			payer_signing_pubkey,
 			payer_note,
-			paths,
+			paths: refund_paths,
 			#[cfg(test)]
 			experimental_foo,
 			#[cfg(test)]
