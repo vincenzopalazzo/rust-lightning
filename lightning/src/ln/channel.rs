@@ -2565,8 +2565,10 @@ impl AddSigned for u64 {
 	}
 }
 
-/// Info about a pending splice
-struct PendingSplice {
+/// Information about pending attempts at funding a channel. This includes funding currently under
+/// negotiation and any negotiated attempts waiting enough on-chain confirmations. More than one
+/// such attempt indicates use of RBF to increase the chances of confirmation.
+struct PendingFunding {
 	funding_negotiation: Option<FundingNegotiation>,
 
 	/// Funding candidates that have been negotiated but have not reached enough confirmations
@@ -2596,7 +2598,7 @@ impl FundingNegotiation {
 	}
 }
 
-impl PendingSplice {
+impl PendingFunding {
 	fn check_get_splice_locked<SP: Deref>(
 		&mut self, context: &ChannelContext<SP>, confirmed_funding_index: usize, height: u32,
 	) -> Option<msgs::SpliceLocked>
@@ -6668,7 +6670,7 @@ where
 	pub interactive_tx_signing_session: Option<InteractiveTxSigningSession>,
 	holder_commitment_point: HolderCommitmentPoint,
 	/// Info about an in-progress, pending splice (if any), on the pre-splice channel
-	pending_splice: Option<PendingSplice>,
+	pending_splice: Option<PendingFunding>,
 
 	/// Once we become quiescent, if we're the initiator, there's some action we'll want to take.
 	/// This keeps track of that action. Note that if we become quiescent and we're not the
@@ -11580,7 +11582,7 @@ where
 			change_script,
 		};
 
-		self.pending_splice = Some(PendingSplice {
+		self.pending_splice = Some(PendingFunding {
 			funding_negotiation: Some(FundingNegotiation::AwaitingAck(funding_negotiation_context)),
 			negotiated_candidates: vec![],
 			sent_funding_txid: None,
@@ -11800,7 +11802,7 @@ where
 
 		let funding_pubkey = splice_funding.get_holder_pubkeys().funding_pubkey;
 
-		self.pending_splice = Some(PendingSplice {
+		self.pending_splice = Some(PendingFunding {
 			funding_negotiation: Some(FundingNegotiation::ConstructingTransaction(
 				splice_funding,
 				interactive_tx_constructor,
