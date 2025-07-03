@@ -2568,7 +2568,10 @@ impl AddSigned for u64 {
 /// Info about a pending splice
 struct PendingSplice {
 	funding_negotiation: Option<FundingNegotiation>,
-	pending_funding: Vec<FundingScope>,
+
+	/// Funding candidates that have been negotiated but have not reached enough confirmations
+	/// by both counterparties to have exchanged `splice_locked` and be promoted.
+	negotiated_candidates: Vec<FundingScope>,
 
 	/// The funding txid used in the `splice_locked` sent to the counterparty.
 	sent_funding_txid: Option<Txid>,
@@ -2600,9 +2603,9 @@ impl PendingSplice {
 	where
 		SP::Target: SignerProvider,
 	{
-		debug_assert!(confirmed_funding_index < self.pending_funding.len());
+		debug_assert!(confirmed_funding_index < self.negotiated_candidates.len());
 
-		let funding = &self.pending_funding[confirmed_funding_index];
+		let funding = &self.negotiated_candidates[confirmed_funding_index];
 		if !context.check_funding_meets_minimum_depth(funding, height) {
 			return None;
 		}
@@ -6685,7 +6688,7 @@ macro_rules! promote_splice_funding {
 
 		// The swap above places the previous `FundingScope` into `pending_funding`.
 		let discarded_funding = $pending_splice
-			.pending_funding
+			.negotiated_candidates
 			.drain(..)
 			.filter(|funding| funding.get_funding_txid() != prev_funding_txid)
 			.map(|mut funding| {
@@ -6822,7 +6825,7 @@ where
 
 	fn pending_funding(&self) -> &[FundingScope] {
 		if let Some(pending_splice) = &self.pending_splice {
-			pending_splice.pending_funding.as_slice()
+			pending_splice.negotiated_candidates.as_slice()
 		} else {
 			&[]
 		}
@@ -6832,7 +6835,7 @@ where
 		core::iter::once(&mut self.funding).chain(
 			self.pending_splice
 				.as_mut()
-				.map(|pending_splice| pending_splice.pending_funding.as_mut_slice())
+				.map(|pending_splice| pending_splice.negotiated_candidates.as_mut_slice())
 				.unwrap_or(&mut [])
 				.iter_mut(),
 		)
@@ -10753,7 +10756,7 @@ where
 			// Scope `funding` since it is swapped within `promote_splice_funding` and we don't want
 			// to unintentionally use it.
 			let funding = pending_splice
-				.pending_funding
+				.negotiated_candidates
 				.iter_mut()
 				.find(|funding| funding.get_funding_txid() == Some(splice_txid))
 				.unwrap();
@@ -10828,7 +10831,7 @@ where
 			let mut confirmed_funding_index = None;
 			let mut funding_already_confirmed = false;
 			if let Some(pending_splice) = &mut self.pending_splice {
-				for (index, funding) in pending_splice.pending_funding.iter_mut().enumerate() {
+				for (index, funding) in pending_splice.negotiated_candidates.iter_mut().enumerate() {
 					if self.context.check_for_funding_tx_confirmed(
 						funding, block_hash, height, index_in_block, &mut confirmed_tx, logger,
 					)? {
@@ -11000,7 +11003,7 @@ where
 					return Err(ClosureReason::ProcessingError { err });
 				},
 			};
-			let funding = &mut pending_splice.pending_funding[confirmed_funding_index];
+			let funding = &mut pending_splice.negotiated_candidates[confirmed_funding_index];
 
 			// Check if the splice funding transaction was unconfirmed
 			if funding.get_funding_tx_confirmations(height) == 0 {
@@ -11579,7 +11582,7 @@ where
 
 		self.pending_splice = Some(PendingSplice {
 			funding_negotiation: Some(FundingNegotiation::AwaitingAck(funding_negotiation_context)),
-			pending_funding: vec![],
+			negotiated_candidates: vec![],
 			sent_funding_txid: None,
 			received_funding_txid: None,
 		});
@@ -11802,7 +11805,7 @@ where
 				splice_funding,
 				interactive_tx_constructor,
 			)),
-			pending_funding: Vec::new(),
+			negotiated_candidates: Vec::new(),
 			received_funding_txid: None,
 			sent_funding_txid: None,
 		});
@@ -11991,7 +11994,7 @@ where
 		};
 
 		if !pending_splice
-			.pending_funding
+			.negotiated_candidates
 			.iter()
 			.any(|funding| funding.get_funding_txid() == Some(msg.splice_txid))
 		{
