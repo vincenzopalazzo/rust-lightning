@@ -117,9 +117,7 @@ where
 ///
 /// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
 /// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
-pub fn sign_message<F, T>(
-	f: F, message: &T, pubkey: PublicKey,
-) -> Result<Signature, SignError>
+pub fn sign_message<F, T>(f: F, message: &T, pubkey: PublicKey) -> Result<Signature, SignError>
 where
 	F: SignFn<T>,
 	T: AsRef<TaggedHash>,

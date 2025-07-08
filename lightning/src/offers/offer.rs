@@ -133,6 +133,15 @@ impl OfferId {
 		let tagged_hash = TaggedHash::from_tlv_stream(Self::ID_TAG, tlv_stream);
 		Self(tagged_hash.to_bytes())
 	}
+
+	/// Computes the [`OfferId`] from a [`Bolt12Invoice`] bytes.
+	pub(crate) fn from_invoice_bytes(bytes: &[u8]) -> Self {
+		let offer_tlv_stream = TlvStream::new(bytes).range(OFFER_TYPES);
+		let experimental_offer_tlv_stream = TlvStream::new(bytes).range(EXPERIMENTAL_OFFER_TYPES);
+		let combined_tlv_stream = offer_tlv_stream.chain(experimental_offer_tlv_stream);
+		let tagged_hash = TaggedHash::from_tlv_stream(Self::ID_TAG, combined_tlv_stream);
+		Self(tagged_hash.to_bytes())
+	}
 }
 
 impl Borrow<[u8]> for OfferId {
