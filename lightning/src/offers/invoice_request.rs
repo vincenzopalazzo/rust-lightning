@@ -64,6 +64,66 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## BOLT 12 Contacts
+//!
+//! The invoice request builder also supports BOLT 12 contacts functionality, allowing payers
+//! to reveal their identity to recipients for mutual authentication:
+//!
+//! ```
+//! # extern crate bitcoin;
+//! # extern crate lightning;
+//! # use bitcoin::network::Network;
+//! # use bitcoin::secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey};
+//! # use lightning::ln::channelmanager::PaymentId;
+//! # use lightning::ln::inbound_payment::ExpandedKey;
+//! # use lightning::offers::invoice_request::UnsignedInvoiceRequest;
+//! # use lightning::offers::nonce::Nonce;
+//! # use lightning::offers::offer::Offer;
+//! # use lightning::sign::EntropySource;
+//! # use lightning::util::ser::Writeable;
+//! # use lightning::offers::contacts::Contacts;
+//! # struct FixedEntropy;
+//! # impl EntropySource for FixedEntropy {
+//! #     fn get_secure_random_bytes(&self) -> [u8; 32] { [42; 32] }
+//! # }
+//! # fn contacts_example() -> Result<(), lightning::offers::parse::Bolt12ParseError> {
+//! let expanded_key = ExpandedKey::new([42; 32]);
+//! let entropy = FixedEntropy {};
+//! let nonce = Nonce::from_entropy_source(&entropy);
+//! let secp_ctx = Secp256k1::new();
+//! let payment_id = PaymentId([1; 32]);
+//! let our_private_key = SecretKey::from_slice(&[1; 32]).unwrap();
+//! let mut buffer = Vec::new();
+//!
+//! // Parse the recipient's offer
+//! let recipient_offer: Offer = "lno1qcp4256ypq".parse()?;
+//!
+//! // Create our own offer for the recipient to pay us back
+//! # use lightning::offers::offer::OfferBuilder;
+//! let our_offer = OfferBuilder::new(PublicKey::from_secret_key(&secp_ctx, &our_private_key))
+//!     .amount_msats(500)
+//!     .build().unwrap();
+//!
+//! // Compute contact secret for this recipient
+//! let contact_secrets = Contacts::compute_contact_secret(&our_private_key, &recipient_offer, &secp_ctx)
+//!     .expect("Failed to compute contact secret");
+//!
+//! // Build invoice request with contact information
+//! # use lightning::offers::invoice_request::InvoiceRequestBuilder;
+//! # <InvoiceRequestBuilder<_>>::from(
+//! recipient_offer
+//!     .request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)?
+//! # )
+//!     .amount_msats(1000)?
+//!     .contact_secret(contact_secrets.primary_secret()) // Reveal our identity
+//!     .payer_offer(our_offer) // Allow them to pay us back
+//!     .build_and_sign()?
+//!     .write(&mut buffer)
+//!     .unwrap();
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::payment::BlindedPaymentPath;
@@ -187,6 +247,8 @@ macro_rules! invoice_request_builder_methods { (
 			payer: PayerContents(metadata), offer, chain: None, amount_msats: None,
 			features: InvoiceRequestFeatures::empty(), quantity: None, payer_note: None,
 			offer_from_hrn: None,
+			contact_secret: None,
+			payer_offer: None,
 			#[cfg(test)]
 			experimental_bar: None,
 		}
@@ -252,6 +314,29 @@ macro_rules! invoice_request_builder_methods { (
 	/// Successive calls to this method will override the previous setting.
 	pub fn sourced_from_human_readable_name($($self_mut)* $self: $self_type, hrn: HumanReadableName) -> $return_type {
 		$self.invoice_request.offer_from_hrn = Some(hrn);
+		$return_value
+	}
+
+	/// Sets the contact secret to reveal the payer's identity to the recipient.
+	///
+	/// When set, this allows the recipient to identify payments from this payer and optionally
+	/// add them to their contacts list. This enables mutual authentication between trusted contacts.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn contact_secret($($self_mut)* $self: $self_type, contact_secret: SecretKey) -> $return_type {
+		$self.invoice_request.contact_secret = Some(contact_secret);
+		$return_value
+	}
+
+	/// Sets the payer's offer to allow the recipient to pay them back.
+	///
+	/// When a contact secret is provided, this offer allows the recipient to add the payer
+	/// to their contacts list and make payments back to them. This should typically be
+	/// the payer's own offer.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn payer_offer($($self_mut)* $self: $self_type, payer_offer: Offer) -> $return_type {
+		$self.invoice_request.payer_offer = Some(payer_offer);
 		$return_value
 	}
 
@@ -637,6 +722,8 @@ pub(super) struct InvoiceRequestContentsWithoutPayerSigningPubkey {
 	quantity: Option<u64>,
 	payer_note: Option<String>,
 	offer_from_hrn: Option<HumanReadableName>,
+	contact_secret: Option<SecretKey>,
+	payer_offer: Option<Offer>,
 	#[cfg(test)]
 	experimental_bar: Option<u64>,
 }
@@ -697,6 +784,22 @@ macro_rules! invoice_request_accessors { ($self: ident, $contents: expr) => {
 	/// builder to indicate the original [`HumanReadableName`] which was resolved.
 	pub fn offer_from_hrn(&$self) -> &Option<HumanReadableName> {
 		$contents.offer_from_hrn()
+	}
+
+	/// The contact secret used to reveal the payer's identity to the recipient.
+	///
+	/// When present, this allows the recipient to identify payments from this payer and optionally
+	/// add them to their contacts list for mutual authentication.
+	pub fn contact_secret(&$self) -> Option<&SecretKey> {
+		$contents.contact_secret()
+	}
+
+	/// The payer's offer to allow the recipient to pay them back.
+	///
+	/// When a contact secret is provided, this offer allows the recipient to add the payer
+	/// to their contacts list and make payments back to them.
+	pub fn payer_offer(&$self) -> Option<&Offer> {
+		$contents.payer_offer()
 	}
 } }
 
@@ -1083,6 +1186,14 @@ impl InvoiceRequestContents {
 		&self.inner.offer_from_hrn
 	}
 
+	pub(super) fn contact_secret(&self) -> Option<&SecretKey> {
+		self.inner.contact_secret.as_ref()
+	}
+
+	pub(super) fn payer_offer(&self) -> Option<&Offer> {
+		self.inner.payer_offer.as_ref()
+	}
+
 	pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef {
 		let (payer, offer, mut invoice_request, experimental_offer, experimental_invoice_request) =
 			self.inner.as_tlv_stream();
@@ -1129,8 +1240,8 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 		};
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
-			contact_secret: None,
-			payer_offer: None,
+			contact_secret: self.contact_secret.as_ref(),
+			payer_offer: self.payer_offer.as_ref(),
 			payer_bip353_name: None,
 			payer_bip353_signature: None,
 			#[cfg(test)]
@@ -1359,6 +1470,8 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			},
 			experimental_offer_tlv_stream,
 			ExperimentalInvoiceRequestTlvStream {
+				contact_secret,
+				payer_offer,
 				#[cfg(test)]
 				experimental_bar,
 				..
@@ -1403,6 +1516,8 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 				quantity,
 				payer_note,
 				offer_from_hrn,
+				contact_secret,
+				payer_offer,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1584,11 +1699,12 @@ mod tests {
 				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
 				ExperimentalInvoiceRequestTlvStreamRef {
-					experimental_bar: None,
 					contact_secret: None,
 					payer_offer: None,
 					payer_bip353_name: None,
-					payer_bip353_signature: None
+					payer_bip353_signature: None,
+					#[cfg(test)]
+					experimental_bar: None,
 				},
 			),
 		);
@@ -3080,5 +3196,60 @@ mod tests {
 				assert_eq!(s[..new_len], string_truncate_safe(s.clone(), new_len));
 			}
 		}
+	}
+
+	#[test]
+	fn builds_invoice_request_with_contact_secret_and_payer_offer() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		// Create a contact secret
+		let contact_secret = SecretKey::from_slice(&[1; 32]).unwrap();
+
+		// Create a payer offer
+		let payer_offer = OfferBuilder::new(pubkey(1))
+			.amount_msats(500)
+			.description("Payer's offer".to_string())
+			.build()
+			.unwrap();
+
+		// Build invoice request with contact secret and payer offer
+		let invoice_request = OfferBuilder::new(recipient_pubkey())
+			.amount_msats(1000)
+			.build()
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.contact_secret(contact_secret)
+			.payer_offer(payer_offer.clone())
+			.build_and_sign()
+			.unwrap();
+
+		// Verify the contact fields are accessible
+		assert_eq!(invoice_request.contact_secret(), Some(&contact_secret));
+		assert_eq!(invoice_request.payer_offer(), Some(&payer_offer));
+
+		// Verify the TLV stream contains the contact fields
+		let (_, _, _, _, _, experimental_tlv_stream) = invoice_request.as_tlv_stream();
+		assert_eq!(experimental_tlv_stream.contact_secret, Some(&contact_secret));
+		assert_eq!(experimental_tlv_stream.payer_offer, Some(&payer_offer));
+
+		// Serialize and deserialize to test round-trip
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+
+		let parsed_invoice_request = InvoiceRequest::try_from(buffer).unwrap();
+
+		// Verify the parsed invoice request has the same contact fields
+		assert_eq!(parsed_invoice_request.contact_secret(), Some(&contact_secret));
+		assert_eq!(parsed_invoice_request.payer_offer(), Some(&payer_offer));
+
+		// Verify the TLV stream of the parsed request
+		let (_, _, _, _, _, experimental_tlv_stream) = parsed_invoice_request.as_tlv_stream();
+		assert_eq!(experimental_tlv_stream.contact_secret, Some(&contact_secret));
+		assert_eq!(experimental_tlv_stream.payer_offer, Some(&payer_offer));
 	}
 }
