@@ -93,6 +93,7 @@ use crate::util::ser::{
 use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
 use bitcoin::secp256k1::schnorr::Signature;
+use bitcoin::secp256k1::SecretKey;
 use bitcoin::secp256k1::{self, Keypair, PublicKey, Secp256k1};
 
 #[cfg(not(c_bindings))]
@@ -1128,6 +1129,10 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 		};
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip353_name: None,
+			payer_bip353_signature: None,
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
 		};
@@ -1191,21 +1196,35 @@ tlv_stream!(InvoiceRequestTlvStream, InvoiceRequestTlvStreamRef<'a>, INVOICE_REQ
 pub(super) const EXPERIMENTAL_INVOICE_REQUEST_TYPES: core::ops::Range<u64> =
 	2_000_000_000..3_000_000_000;
 
+// Add constants for Bolt12 contacts TLVs
+pub(super) const INVOICE_REQUEST_CONTACT_SECRET_TYPE: u64 = 2000001729;
+pub(super) const INVOICE_REQUEST_PAYER_OFFER_TYPE: u64 = 2000001731;
+pub(super) const INVOICE_REQUEST_PAYER_BIP353_NAME_TYPE: u64 = 2000001733;
+pub(super) const INVOICE_REQUEST_PAYER_BIP353_SIGNATURE_TYPE: u64 = 2000001735;
+
 #[cfg(not(test))]
 tlv_stream!(
 	ExperimentalInvoiceRequestTlvStream,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES,
 	{
 		// When adding experimental TLVs, update EXPERIMENTAL_TLV_ALLOCATION_SIZE accordingly in
 		// UnsignedInvoiceRequest::new to avoid unnecessary allocations.
+		(INVOICE_REQUEST_CONTACT_SECRET_TYPE, contact_secret: SecretKey),
+		(INVOICE_REQUEST_PAYER_OFFER_TYPE, payer_offer: Offer),
+		(INVOICE_REQUEST_PAYER_BIP353_NAME_TYPE, payer_bip353_name: String),
+		(INVOICE_REQUEST_PAYER_BIP353_SIGNATURE_TYPE, payer_bip353_signature: Signature),
 	}
 );
 
 #[cfg(test)]
 tlv_stream!(
-	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
+		(INVOICE_REQUEST_CONTACT_SECRET_TYPE, contact_secret: SecretKey),
+		(INVOICE_REQUEST_PAYER_OFFER_TYPE, payer_offer: Offer),
+		(INVOICE_REQUEST_PAYER_BIP353_NAME_TYPE, payer_bip353_name: String),
+		(INVOICE_REQUEST_PAYER_BIP353_SIGNATURE_TYPE, payer_bip353_signature: Signature),
 		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
 	}
 );
@@ -1225,7 +1244,7 @@ type FullInvoiceRequestTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl CursorReadable for FullInvoiceRequestTlvStream {
@@ -1261,7 +1280,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl TryFrom<Vec<u8>> for UnsignedInvoiceRequest {
@@ -1342,6 +1361,7 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			ExperimentalInvoiceRequestTlvStream {
 				#[cfg(test)]
 				experimental_bar,
+				..
 			},
 		) = tlv_stream;
 
@@ -1563,7 +1583,13 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					experimental_bar: None,
+					contact_secret: None,
+					payer_offer: None,
+					payer_bip353_name: None,
+					payer_bip353_signature: None
+				},
 			),
 		);
 

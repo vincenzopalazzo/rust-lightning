@@ -818,6 +818,10 @@ impl RefundContents {
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip353_name: None,
+			payer_bip353_signature: None,
 		};
 
 		(payer, offer, invoice_request, experimental_offer, experimental_invoice_request)
@@ -861,7 +865,7 @@ type RefundTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl CursorReadable for RefundTlvStream {
@@ -934,6 +938,10 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 				experimental_foo,
 			},
 			ExperimentalInvoiceRequestTlvStream {
+				contact_secret,
+				payer_offer,
+				payer_bip353_name,
+				payer_bip353_signature,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1120,7 +1128,13 @@ mod tests {
 					offer_from_hrn: None,
 				},
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					experimental_bar: None,
+					contact_secret: None,
+					payer_offer: None,
+					payer_bip353_name: None,
+					payer_bip353_signature: None
+				},
 			),
 		);
 

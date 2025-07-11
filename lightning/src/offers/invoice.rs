@@ -1525,7 +1525,7 @@ type FullInvoiceTlvStreamRef<'a> = (
 	InvoiceTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -1569,7 +1569,7 @@ type PartialInvoiceTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -1989,7 +1989,13 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					experimental_bar: None,
+					contact_secret: None,
+					payer_offer: None,
+					payer_bip353_name: None,
+					payer_bip353_signature: None
+				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
 		);
@@ -2092,7 +2098,13 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					experimental_bar: None,
+					contact_secret: None,
+					payer_offer: None,
+					payer_bip353_name: None,
+					payer_bip353_signature: None
+				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
 		);
