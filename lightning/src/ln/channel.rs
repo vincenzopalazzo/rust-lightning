@@ -8206,7 +8206,10 @@ where
 
 		// Reset any quiescence-related state as it is implicitly terminated once disconnected.
 		if matches!(self.context.channel_state, ChannelState::ChannelReady(_)) {
-			self.context.channel_state.clear_awaiting_quiescence();
+			if self.quiescent_action.is_some() {
+				// If we were trying to get quiescent, try again after reconnection.
+				self.context.channel_state.set_awaiting_quiescence();
+			}
 			self.context.channel_state.clear_local_stfu_sent();
 			self.context.channel_state.clear_remote_stfu_sent();
 			self.context.channel_state.clear_quiescent();
@@ -11554,9 +11557,9 @@ where
 	{
 		log_debug!(logger, "Attempting to initiate quiescence");
 
-		if !self.context.is_live() {
+		if !self.context.is_usable() {
 			return Err(ChannelError::Ignore(
-				"Channel is not in a live state to propose quiescence".to_owned()
+				"Channel is not in a usable state to propose quiescence".to_owned()
 			));
 		}
 		if self.quiescent_action.is_some() {
@@ -11572,7 +11575,11 @@ where
 		}
 
 		self.context.channel_state.set_awaiting_quiescence();
-		Ok(Some(self.send_stfu(logger)?))
+		if self.context.is_live() {
+			Ok(Some(self.send_stfu(logger)?))
+		} else {
+			Ok(None)
+		}
 	}
 
 	// Assumes we are either awaiting quiescence or our counterparty has requested quiescence.
@@ -11582,7 +11589,6 @@ where
 		L::Target: Logger,
 	{
 		debug_assert!(!self.context.channel_state.is_local_stfu_sent());
-		// Either state being set implies the channel is live.
 		debug_assert!(
 			self.context.channel_state.is_awaiting_quiescence()
 				|| self.context.channel_state.is_remote_stfu_sent()
@@ -11713,6 +11719,10 @@ where
 			!(self.context.channel_state.is_local_stfu_sent()
 				&& self.context.channel_state.is_remote_stfu_sent())
 		);
+
+		if !self.context.is_live() {
+			return Ok(None);
+		}
 
 		// We need to send our `stfu`, either because we're trying to initiate quiescence, or the
 		// counterparty is and we've yet to send ours.
@@ -12853,7 +12863,11 @@ where
 			match channel_state {
 				ChannelState::AwaitingChannelReady(_) => {},
 				ChannelState::ChannelReady(_) => {
-					channel_state.clear_awaiting_quiescence();
+					if self.quiescent_action.is_some() {
+						// If we're trying to get quiescent to do something, try again when we
+						// reconnect to the peer.
+						channel_state.set_awaiting_quiescence();
+					}
 					channel_state.clear_local_stfu_sent();
 					channel_state.clear_remote_stfu_sent();
 					channel_state.clear_quiescent();
@@ -13261,6 +13275,7 @@ where
 			(60, self.context.historical_scids, optional_vec), // Added in 0.2
 			(61, fulfill_attribution_data, optional_vec), // Added in 0.2
 			(63, holder_commitment_point_current, option), // Added in 0.2
+			(65, self.quiescent_action, option), // Added in 0.2
 		});
 
 		Ok(())
@@ -13622,6 +13637,8 @@ where
 
 		let mut minimum_depth_override: Option<u32> = None;
 
+		let mut quiescent_action = None;
+
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
 			(1, minimum_depth, option),
@@ -13665,6 +13682,7 @@ where
 			(60, historical_scids, optional_vec), // Added in 0.2
 			(61, fulfill_attribution_data, optional_vec), // Added in 0.2
 			(63, holder_commitment_point_current_opt, option), // Added in 0.2
+			(65, quiescent_action, upgradable_option), // Added in 0.2
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -14011,7 +14029,7 @@ where
 			holder_commitment_point,
 			#[cfg(splicing)]
 			pending_splice: None,
-			quiescent_action: None,
+			quiescent_action,
 		})
 	}
 }
