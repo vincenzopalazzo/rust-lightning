@@ -2582,6 +2582,13 @@ struct PendingFunding {
 	received_funding_txid: Option<Txid>,
 }
 
+impl_writeable_tlv_based!(PendingFunding, {
+	(1, funding_negotiation, upgradable_option),
+	(3, negotiated_candidates, required_vec),
+	(5, sent_funding_txid, option),
+	(7, received_funding_txid, option),
+});
+
 enum FundingNegotiation {
 	AwaitingAck {
 		context: FundingNegotiationContext,
@@ -2594,6 +2601,13 @@ enum FundingNegotiation {
 		funding: FundingScope,
 	},
 }
+
+impl_writeable_tlv_based_enum_upgradable!(FundingNegotiation,
+	(0, AwaitingSignatures) => {
+		(1, funding, required),
+	},
+	unread_variants: AwaitingAck, ConstructingTransaction
+);
 
 impl FundingNegotiation {
 	fn as_funding(&self) -> Option<&FundingScope> {
@@ -14331,6 +14345,7 @@ where
 			(60, self.context.historical_scids, optional_vec), // Added in 0.2
 			(61, fulfill_attribution_data, optional_vec), // Added in 0.2
 			(63, holder_commitment_point_current, option), // Added in 0.2
+			(64, self.pending_splice, option), // Added in 0.2
 			(65, self.quiescent_action, option), // Added in 0.2
 		});
 
@@ -14692,6 +14707,7 @@ where
 
 		let mut minimum_depth_override: Option<u32> = None;
 
+		let mut pending_splice: Option<PendingFunding> = None;
 		let mut quiescent_action = None;
 
 		read_tlv_fields!(reader, {
@@ -14736,6 +14752,7 @@ where
 			(60, historical_scids, optional_vec), // Added in 0.2
 			(61, fulfill_attribution_data, optional_vec), // Added in 0.2
 			(63, holder_commitment_point_current_opt, option), // Added in 0.2
+			(64, pending_splice, option), // Added in 0.2
 			(65, quiescent_action, upgradable_option), // Added in 0.2
 		});
 
@@ -15096,7 +15113,7 @@ where
 			},
 			interactive_tx_signing_session,
 			holder_commitment_point,
-			pending_splice: None,
+			pending_splice,
 			quiescent_action,
 		})
 	}
