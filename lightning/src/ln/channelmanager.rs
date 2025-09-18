@@ -9627,6 +9627,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					msg: msgs::ErrorMessage { channel_id: *temporary_channel_id, data: "No zero confirmation channels accepted".to_owned(), }
 				}
 			};
+			debug_assert!(peer_state.is_connected);
 			peer_state.pending_msg_events.push(send_msg_err_event);
 			let err_str = "Please use accept_inbound_channel_from_trusted_peer_0conf to accept channels with zero confirmations.".to_owned();
 			log_error!(logger, "{}", err_str);
@@ -9643,6 +9644,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						msg: msgs::ErrorMessage { channel_id: *temporary_channel_id, data: "Have too many peers with unfunded channels, not accepting new ones".to_owned(), }
 					}
 				};
+				debug_assert!(peer_state.is_connected);
 				peer_state.pending_msg_events.push(send_msg_err_event);
 				let err_str = "Too many peers with unfunded channels, refusing to accept new ones".to_owned();
 				log_error!(logger, "{}", err_str);
@@ -9656,6 +9658,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		channel.context_mut().set_outbound_scid_alias(outbound_scid_alias);
 
 		if let Some(message_send_event) = message_send_event {
+			debug_assert!(peer_state.is_connected);
 			peer_state.pending_msg_events.push(message_send_event);
 		}
 		peer_state.channel_by_id.insert(channel_id, channel);
@@ -13410,7 +13413,7 @@ where
 
 			{
 				let mut peer_state_lock = self.per_peer_state.write().unwrap();
-				match peer_state_lock.entry(counterparty_node_id.clone()) {
+				match peer_state_lock.entry(counterparty_node_id) {
 					hash_map::Entry::Vacant(e) => {
 						if inbound_peer_limited {
 							res = Err(());
@@ -13441,6 +13444,9 @@ where
 							res = Err(());
 							return NotifyOption::SkipPersistNoEvents;
 						}
+
+						debug_assert!(peer_state.pending_msg_events.is_empty());
+						peer_state.pending_msg_events.clear();
 
 						debug_assert!(!peer_state.is_connected, "A peer shouldn't be connected twice");
 						peer_state.is_connected = true;
