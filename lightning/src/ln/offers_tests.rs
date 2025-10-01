@@ -2509,3 +2509,86 @@ fn no_double_pay_with_stale_channelmanager() {
 	// generated in response to the duplicate invoice.
 	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
 }
+
+// Pay and offer while adding the contacts information the invoice request!
+#[test]
+fn pay_offer_and_add_contacts_info_blip42() {
+	let mut features = channelmanager::provided_init_features(&accept_forward_cfg);
+	features.set_onion_messages_optional();
+	features.set_route_blinding_optional();
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+
+	*node_cfgs[1].override_init_features.borrow_mut() = Some(features);
+
+	let node_chanmgrs = create_node_chanmgrs(
+		2, &node_cfgs, &[None, None]
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let (alice, bob) = (&nodes[0], &nodes[1]);
+	let alice_id = alice.node.get_our_node_id();
+	let bob_id = bob.node.get_our_node_id();
+
+	// For the Offer Builder we do not need to change anything
+	// because the contacts are not included in the offer itself.
+	let offer = alice.node
+		.create_offer_builder()
+		.unwrap()
+		.amount_msats(10_000_000)
+		.build()
+		.unwrap();
+
+
+	assert_ne!(offer.issuer_signing_pubkey(), Some(alice_id));
+	assert!(!offer.paths().is_empty());
+
+	let payment_id = PaymentId([1; 32]);
+	bob.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+	// Probably a good place to add the information that we use for the contact secret.
+	// but need to double check if the sender of the invoice request still need to ask anything.
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+
+	let (invoice_request, reply_path) = extract_invoice_request(alice, &onion_message);
+	// TODO: check if the invoice request contains the contact information.
+
+	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
+		offer_id: offer.id(),
+		invoice_request: InvoiceRequestFields {
+			payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
+			quantity: None,
+			payer_note_truncated: None,
+			human_readable_name: None,
+		},
+	});
+	assert_eq!(invoice_request.amount_msats(), Some(10_000_000));
+	assert_ne!(invoice_request.payer_signing_pubkey(), bob_id);
+	assert!(check_compact_path_introduction_node(&reply_path, alice, bob_id));
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, reply_path) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice.amount_msats(), 10_000_000);
+	assert_ne!(invoice.signing_pubkey(), alice_id);
+	assert!(!invoice.payment_paths().is_empty());
+
+	for path in invoice.payment_paths() {
+		assert_eq!(path.introduction_node(), &IntroductionNode::NodeId(alice_id));
+	}
+	assert!(check_compact_path_introduction_node(&reply_path, bob, alice_id));
+
+	route_bolt12_payment(bob, &[alice], &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	claim_bolt12_payment(bob, &[alice], payment_context, &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+
+	// TODO: now should be possible that alice will be able to repay bob without that
+	// bob give any offer in exchange!! but there is a contact list somewhere that allow
+	// to run something like bob.pay_for_contact(alice_contact_name, amount);
+}
