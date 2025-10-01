@@ -12633,6 +12633,14 @@ where
 			Some(hrn) => builder.sourced_from_human_readable_name(hrn),
 		};
 
+		let inject_contact_info = self.config.read().unwrap().inject_contact_info_for_offers;
+		let builder = if inject_contact_info {
+			// Use the key manager to get the contact secret, look at the FIXME and TODO around the code!
+			// We need something like: builder.invreq_contact_secret(vec![0; 32]) // TODO: Replace with actual contact secret
+		} else {
+			builder
+		};
+
 		let invoice_request = builder.build_and_sign()?;
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 
