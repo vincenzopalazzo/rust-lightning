@@ -318,4 +318,49 @@ mod tests {
 		);
 		assert_eq!(alice_computed, bob_computed);
 	}
+
+	// derive deterministic contact_secret when one offer uses both blinded paths and issuer_id
+	#[test]
+	fn test_compute_contact_secret_test_vector_blinded_paths_and_issuer_id() {
+		let alice_offer_str = "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcsesp0grlulxv3jygx83h7tghy3233sqd6xlcccvpar2l8jshxrtwvtcsrejlwh4vyz70s46r62vtakl4sxztqj6gxjged0wx0ly8qtrygufcsyq5agaes6v605af5rr9ydnj9srneudvrmc73n7evp72tzpqcnd28puqr8a3wmcff9wfjwgk32650vl747m2ev4zsjagzucntctlmcpc6vhmdnxlywneg5caqz0ansr45z2faxq7unegzsnyuduzys7kzyugpwcmhdqqj0h70zy92p75pseunclwsrwhaelvsqy9zsejcytxulndppmykcznn7y5h";
+		let alice_priv_key =
+			SecretKey::from_str("4ed1a01dae275f7b7ba503dbae23dddd774a8d5f64788ef7a768ed647dd0e1eb")
+				.unwrap();
+		let alice_offer = Offer::from_str(alice_offer_str).unwrap();
+
+		assert!(alice_offer.issuer_signing_pubkey().is_none());
+		assert_eq!(alice_offer.paths().len(), 1);
+
+		let alice_offer_node_id = alice_offer
+			.paths()
+			.iter()
+			.filter_map(|path| path.blinded_hops().last())
+			.map(|hop| hop.blinded_node_id)
+			.collect::<Vec<_>>();
+		let alice_offer_node_id = alice_offer_node_id.first().unwrap();
+		assert_eq!(
+			alice_offer_node_id.to_string(),
+			"0284c9c6f04487ac22710176377680127dfcf110aa0fa8186793c7dd01bafdcfd9"
+		);
+
+		let bob_offer_str = "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcsesp0grlulxv3jygx83h7tghy3233sqd6xlcccvpar2l8jshxrtwvtcsz4n88s74qhussxsu0vs3c4unck4yelk67zdc29ree3sztvjn7pc9qyqlcpj54jnj67aa9rd2n5dhjlxyfmv3vgqymrks2nf7gnf5u200mn5qrxfrxh9d0ug43j5egklhwgyrfv3n84gyjd2aajhwqxa0cc7zn37sncrwptz4uhlp523l83xpjx9dw72spzecrtex3ku3h3xpepeuend5rtmurekfmnqsq6kva9yr4k3dtplku9v6qqyxr5ep6lls3hvrqyt9y7htaz9qjzcssy065ctv38c5h03lu0hlvq2t4p5fg6u668y6pmzcg64hmdm050jxx";
+		let bob_priv_key =
+			SecretKey::from_str("bcaafa8ed73da11437ce58c7b3458567a870168c0da325a40292fed126b97845")
+				.unwrap();
+		let bob_offer = Offer::from_str(bob_offer_str).unwrap();
+		let bob_offer_node_id = bob_offer.issuer_signing_pubkey().unwrap();
+		assert_eq!(
+			bob_offer_node_id.to_string(),
+			"023f54c2d913e2977c7fc7dfec029750d128d735a39341d8b08d56fb6edf47c8c6"
+		);
+
+		let alice_computed = compute_contact_secret(&alice_priv_key, &bob_offer);
+		let bob_computed = compute_contact_secret(&bob_priv_key, &alice_offer);
+
+		assert_eq!(
+			alice_computed.primary_secret().to_hex_string(bitcoin::hex::Case::Lower),
+			"4e0aa72cc42eae9f8dc7c6d2975bbe655683ada2e9abfdfe9f299d391ed9736c".to_owned()
+		);
+		assert_eq!(alice_computed, bob_computed);
+	}
 }
