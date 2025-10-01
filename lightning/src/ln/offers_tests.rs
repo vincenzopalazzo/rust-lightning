@@ -2522,8 +2522,11 @@ fn pay_offer_and_add_contacts_info_blip42() {
 
 	*node_cfgs[1].override_init_features.borrow_mut() = Some(features);
 
+	let mut bob_config = test_default_channel_config();
+	bob_config.inject_contact_info_for_offers = true;
+
 	let node_chanmgrs = create_node_chanmgrs(
-		2, &node_cfgs, &[None, None]
+		2, &node_cfgs, &[None, Some(bob_config)]
 	);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 

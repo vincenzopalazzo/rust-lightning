@@ -956,6 +956,15 @@ pub struct UserConfig {
 	///
 	/// [`StaticInvoice`]: crate::offers::static_invoice::StaticInvoice
 	pub hold_outbound_htlcs_at_next_hop: bool,
+	/// If this is set to `true`, contact information will be automatically injected into every
+	/// new offer received by the node. This allows for better contact management and tracking
+	/// of offer sources.
+	///
+	/// When enabled, offers received will include contact metadata that can be used for
+	/// identifying and managing payment relationships.
+	///
+	/// Default value: `false`
+	pub inject_contact_info_for_offers: bool,
 }
 
 impl Default for UserConfig {
@@ -972,6 +981,7 @@ impl Default for UserConfig {
 			enable_dual_funded_channels: false,
 			enable_htlc_hold: false,
 			hold_outbound_htlcs_at_next_hop: false,
+			inject_contact_info_for_offers: false,
 		}
 	}
 }
@@ -994,6 +1004,7 @@ impl Readable for UserConfig {
 			enable_dual_funded_channels: Readable::read(reader)?,
 			hold_outbound_htlcs_at_next_hop: Readable::read(reader)?,
 			enable_htlc_hold: Readable::read(reader)?,
+			inject_contact_info_for_offers: Readable::read(reader)?,
 		})
 	}
 }
