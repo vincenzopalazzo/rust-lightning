@@ -1062,6 +1062,12 @@ pub enum Event {
 		///
 		/// [`StaticInvoice`]: crate::offers::static_invoice::StaticInvoice
 		bolt12_invoice: Option<PaidBolt12Invoice>,
+		/// The contact secret from the invoice request, if present.
+		/// This is used for BLIP-42 contact management.
+		///
+		/// This is only present for BOLT 12 payments where a contact secret was included
+		/// in the invoice request.
+		contact_secret: Option<Vec<u8>>,
 	},
 	/// Indicates an outbound payment failed. Individual [`Event::PaymentPathFailed`] events
 	/// provide failure information for each path attempt in the payment, including retries.
@@ -1865,6 +1871,7 @@ impl Writeable for Event {
 				ref amount_msat,
 				ref fee_paid_msat,
 				ref bolt12_invoice,
+				ref contact_secret,
 			} => {
 				2u8.write(writer)?;
 				write_tlv_fields!(writer, {
@@ -1874,6 +1881,7 @@ impl Writeable for Event {
 					(5, fee_paid_msat, option),
 					(7, amount_msat, option),
 					(9, bolt12_invoice, option),
+					(11, contact_secret, option),
 				});
 			},
 			&Event::PaymentPathFailed {
@@ -2300,6 +2308,7 @@ impl MaybeReadable for Event {
 					let mut amount_msat = None;
 					let mut fee_paid_msat = None;
 					let mut bolt12_invoice = None;
+					let mut contact_secret = None;
 					read_tlv_fields!(reader, {
 						(0, payment_preimage, required),
 						(1, payment_hash, option),
@@ -2307,6 +2316,7 @@ impl MaybeReadable for Event {
 						(5, fee_paid_msat, option),
 						(7, amount_msat, option),
 						(9, bolt12_invoice, option),
+						(11, contact_secret, option),
 					});
 					if payment_hash.is_none() {
 						payment_hash = Some(PaymentHash(
@@ -2320,6 +2330,7 @@ impl MaybeReadable for Event {
 						amount_msat,
 						fee_paid_msat,
 						bolt12_invoice,
+						contact_secret,
 					}))
 				};
 				f()
