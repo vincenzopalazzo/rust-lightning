@@ -91,6 +91,7 @@ use crate::ln::outbound_payment::{
 };
 use crate::ln::types::ChannelId;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
+use crate::offers::contacts::ContactSecrets;
 use crate::offers::flow::{HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow};
 use crate::offers::invoice::{
 	Bolt12Invoice, DerivedSigningPubkey, InvoiceBuilder, DEFAULT_RELATIVE_EXPIRY,
@@ -717,6 +718,9 @@ pub struct OptionalOfferPaymentParams {
 	/// will ultimately fail once all pending paths have failed (generating an
 	/// [`Event::PaymentFailed`]).
 	pub retry_strategy: Retry,
+	/// Contact secrets to include in the invoice request for BLIP-42 contact management.
+	/// If provided, these secrets will be used to establish a contact relationship with the recipient.
+	pub contact_secrects: Option<ContactSecrets>,
 }
 
 impl Default for OptionalOfferPaymentParams {
@@ -728,6 +732,7 @@ impl Default for OptionalOfferPaymentParams {
 			retry_strategy: Retry::Timeout(core::time::Duration::from_secs(2)),
 			#[cfg(not(feature = "std"))]
 			retry_strategy: Retry::Attempts(3),
+			contact_secrects: None,
 		}
 	}
 }
@@ -12529,6 +12534,7 @@ where
 			payment_id,
 			None,
 			create_pending_payment_fn,
+			optional_params.contact_secrects,
 		)
 	}
 
@@ -12558,6 +12564,7 @@ where
 			payment_id,
 			Some(offer.hrn),
 			create_pending_payment_fn,
+			optional_params.contact_secrects,
 		)
 	}
 
@@ -12600,6 +12607,7 @@ where
 			payment_id,
 			None,
 			create_pending_payment_fn,
+			optional_params.contact_secrects,
 		)
 	}
 
@@ -12608,6 +12616,7 @@ where
 		&self, offer: &Offer, quantity: Option<u64>, amount_msats: Option<u64>,
 		payer_note: Option<String>, payment_id: PaymentId,
 		human_readable_name: Option<HumanReadableName>, create_pending_payment: CPP,
+		contacts: Option<ContactSecrets>,
 	) -> Result<(), Bolt12SemanticError> {
 		let entropy = &*self.entropy_source;
 		let nonce = Nonce::from_entropy_source(entropy);
@@ -12633,13 +12642,11 @@ where
 			Some(hrn) => builder.sourced_from_human_readable_name(hrn),
 		};
 
-		let inject_contact_info = self.config.read().unwrap().inject_contact_info_for_offers;
-		let builder = if inject_contact_info {
-			// Use the key manager to get the contact secret, look at the FIXME and TODO around the code!
-			// We need something like: builder.invreq_contact_secret(vec![0; 32]) // TODO: Replace with actual contact secret
-		} else {
-			builder
+		let contacts = match contacts {
+			None => ContactSecrets::new(self.entropy_source.get_secure_random_bytes()),
+			Some(c) => c,
 		};
+		let builder = builder.contact_secrets(contacts.clone());
 
 		let invoice_request = builder.build_and_sign()?;
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
@@ -15139,7 +15146,7 @@ where
 								self.pending_outbound_payments
 									.received_offer(payment_id, Some(retryable_invoice_request))
 									.map_err(|_| Bolt12SemanticError::DuplicatePaymentId)
-						});
+						}, None);
 					if offer_pay_res.is_err() {
 						// The offer we tried to pay is the canonical current offer for the name we
 						// wanted to pay. If we can't pay it, there's no way to recover so fail the
