@@ -13062,6 +13062,11 @@ where
 			Some(c) => c,
 		};
 		let builder = builder.contact_secrets(contacts.clone());
+		// Create a minimal offer for BLIP-42 contact exchange (just node_id, no description/paths)
+		// TODO: Create a better minimal offer with a single blinded path hop for privacy,
+		// while keeping the size small enough to fit in the onion packet.
+		let payer_offer = self.create_offer_builder()?.build()?;
+		let builder = builder.payer_offer(&payer_offer);
 
 		let invoice_request = builder.build_and_sign()?;
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
