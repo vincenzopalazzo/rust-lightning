@@ -186,7 +186,7 @@ macro_rules! invoice_request_builder_methods { (
 		InvoiceRequestContentsWithoutPayerSigningPubkey {
 			payer: PayerContents(metadata), offer, chain: None, amount_msats: None,
 			features: InvoiceRequestFeatures::empty(), quantity: None, payer_note: None,
-			offer_from_hrn: None, invreq_contact_secret: None,
+			offer_from_hrn: None, invreq_contact_secret: None, invreq_payer_offer: None,
 			#[cfg(test)]
 			experimental_bar: None,
 		}
@@ -663,6 +663,7 @@ pub(super) struct InvoiceRequestContentsWithoutPayerSigningPubkey {
 	payer_note: Option<String>,
 	offer_from_hrn: Option<HumanReadableName>,
 	invreq_contact_secret: Option<Vec<u8>>,
+	invreq_payer_offer: Option<Vec<u8>>,
 	#[cfg(test)]
 	experimental_bar: Option<u64>,
 }
@@ -728,6 +729,11 @@ macro_rules! invoice_request_accessors { ($self: ident, $contents: expr) => {
 	/// Returns the contact secret if present in the invoice request.
 	pub fn contact_secret(&$self) -> Option<&[u8]> {
 		$contents.contact_secret()
+	}
+
+	/// Returns the payer offer if present in the invoice request.
+	pub fn payer_offer(&$self) -> Option<&[u8]> {
+		$contents.payer_offer()
 	}
 } }
 
@@ -1118,6 +1124,10 @@ impl InvoiceRequestContents {
 		self.inner.invreq_contact_secret.as_ref().map(|secret| secret.as_slice())
 	}
 
+	pub(super) fn payer_offer(&self) -> Option<&[u8]> {
+		self.inner.invreq_payer_offer.as_ref().map(|offer| offer.as_slice())
+	}
+
 	pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef<'_> {
 		let (payer, offer, mut invoice_request, experimental_offer, experimental_invoice_request) =
 			self.inner.as_tlv_stream();
@@ -1165,7 +1175,7 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
 			invreq_contact_secret: self.invreq_contact_secret.as_ref(),
-			invreq_payer_offer: None,
+			invreq_payer_offer: self.invreq_payer_offer.as_ref(),
 			invreq_payer_bip_353_name: None,
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
@@ -1406,7 +1416,7 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			experimental_offer_tlv_stream,
 			ExperimentalInvoiceRequestTlvStream {
 				invreq_contact_secret,
-				invreq_payer_offer: _,
+				invreq_payer_offer,
 				invreq_payer_bip_353_name: _,
 				#[cfg(test)]
 				experimental_bar,
@@ -1452,6 +1462,7 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 				payer_note,
 				offer_from_hrn,
 				invreq_contact_secret,
+				invreq_payer_offer,
 				#[cfg(test)]
 				experimental_bar,
 			},
