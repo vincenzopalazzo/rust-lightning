@@ -183,6 +183,39 @@ impl PaymentPurpose {
 		}
 	}
 
+	/// Returns a copy of this purpose with the preimage set, if it was previously unknown.
+	/// If the preimage was already known, returns self unchanged.
+	pub(crate) fn with_preimage(self, preimage: PaymentPreimage) -> Self {
+		match self {
+			PaymentPurpose::Bolt11InvoicePayment { payment_preimage: None, payment_secret } => {
+				PaymentPurpose::Bolt11InvoicePayment {
+					payment_preimage: Some(preimage),
+					payment_secret,
+				}
+			},
+			PaymentPurpose::Bolt12OfferPayment {
+				payment_preimage: None,
+				payment_secret,
+				payment_context,
+			} => PaymentPurpose::Bolt12OfferPayment {
+				payment_preimage: Some(preimage),
+				payment_secret,
+				payment_context,
+			},
+			PaymentPurpose::Bolt12RefundPayment {
+				payment_preimage: None,
+				payment_secret,
+				payment_context,
+			} => PaymentPurpose::Bolt12RefundPayment {
+				payment_preimage: Some(preimage),
+				payment_secret,
+				payment_context,
+			},
+			// Already has preimage or is spontaneous (which always has one)
+			other => other,
+		}
+	}
+
 	/// Errors when provided an `AsyncBolt12OfferContext`, see below.
 	pub(crate) fn from_parts(
 		payment_preimage: Option<PaymentPreimage>, payment_secret: PaymentSecret,

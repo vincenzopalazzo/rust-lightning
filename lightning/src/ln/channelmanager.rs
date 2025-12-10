@@ -8686,7 +8686,7 @@ where
 
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 
-		let (sources, claiming_payment) = {
+		let (sources, mut claiming_payment) = {
 			let res = self.claimable_payments.lock().unwrap().begin_claiming_payment(
 				payment_hash,
 				&self.node_signer,
@@ -8718,6 +8718,12 @@ where
 			}
 		};
 		debug_assert!(!sources.is_empty());
+
+		// Update the payment purpose with the preimage. This handles the case where the invoice
+		// was created with a custom payment hash via `create_inbound_payment_for_hash` and the
+		// preimage was not known until the user called `claim_funds`.
+		claiming_payment.payment_purpose =
+			claiming_payment.payment_purpose.with_preimage(payment_preimage);
 
 		// Just in case one HTLC has been failed between when we generated the `PaymentClaimable`
 		// and when we got here we need to check that the amount we're about to claim matches the
