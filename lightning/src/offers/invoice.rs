@@ -1635,7 +1635,7 @@ type FullInvoiceTlvStreamRef<'a> = (
 	InvoiceTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -1679,7 +1679,7 @@ type PartialInvoiceTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -2102,7 +2102,11 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					experimental_bar: None,
+					invreq_contact_secret: None,
+					invreq_payer_offer: None,
+				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
 		);
@@ -2205,7 +2209,11 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					experimental_bar: None,
+					invreq_contact_secret: None,
+					invreq_payer_offer: None,
+				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
 		);
