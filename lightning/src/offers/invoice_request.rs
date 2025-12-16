@@ -505,7 +505,10 @@ impl UnsignedInvoiceRequest {
 
 		invoice_request_tlv_stream.write(&mut bytes).unwrap();
 
-		const EXPERIMENTAL_TLV_ALLOCATION_SIZE: usize = 0;
+		// Allocate sufficient capacity for experimental TLV fields to avoid reallocations.
+		// The new fields (invreq_contact_secret: ~48 bytes, invreq_payer_offer: ~116 bytes)
+		// total ~164 bytes, with 600 providing headroom for future experimental fields.
+		const EXPERIMENTAL_TLV_ALLOCATION_SIZE: usize = 600;
 		let mut experimental_bytes = Vec::with_capacity(EXPERIMENTAL_TLV_ALLOCATION_SIZE);
 
 		let experimental_tlv_stream =
@@ -1273,6 +1276,8 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 		};
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+			invreq_contact_secret: None,
+			invreq_payer_offer: None,
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
 		};
@@ -1339,9 +1344,11 @@ pub(super) const EXPERIMENTAL_INVOICE_REQUEST_TYPES: core::ops::Range<u64> =
 #[cfg(not(test))]
 tlv_stream!(
 	ExperimentalInvoiceRequestTlvStream,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES,
 	{
+		(2_000_001_729, invreq_contact_secret: [u8; 32]),
+		(2_000_001_731, invreq_payer_offer: (Vec<u8>, WithoutLength)),
 		// When adding experimental TLVs, update EXPERIMENTAL_TLV_ALLOCATION_SIZE accordingly in
 		// UnsignedInvoiceRequest::new to avoid unnecessary allocations.
 	}
@@ -1349,8 +1356,10 @@ tlv_stream!(
 
 #[cfg(test)]
 tlv_stream!(
-	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
+		(2_000_001_729, invreq_contact_secret: [u8; 32]),
+		(2_000_001_731, invreq_payer_offer: (Vec<u8>, WithoutLength)),
 		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
 	}
 );
@@ -1370,7 +1379,7 @@ type FullInvoiceRequestTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl CursorReadable for FullInvoiceRequestTlvStream {
@@ -1406,7 +1415,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl TryFrom<Vec<u8>> for UnsignedInvoiceRequest {
@@ -1485,6 +1494,8 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			},
 			experimental_offer_tlv_stream,
 			ExperimentalInvoiceRequestTlvStream {
+				invreq_contact_secret: _,
+				invreq_payer_offer: _,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1716,7 +1727,11 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					invreq_contact_secret: None,
+					invreq_payer_offer: None,
+					experimental_bar: None,
+				},
 			),
 		);
 
