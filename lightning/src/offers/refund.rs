@@ -577,6 +577,8 @@ impl Refund {
 				.clone()
 				.map(|s| UntrustedString(string_truncate_safe(s, PAYER_NOTE_LIMIT))),
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
 		}
 	}
 }
