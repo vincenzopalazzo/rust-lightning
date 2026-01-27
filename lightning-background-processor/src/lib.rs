@@ -417,6 +417,8 @@ pub const NO_ONION_MESSENGER: Option<
 				APH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
 				DNSResolverMessageHandler = lightning::ln::peer_handler::IgnoringMessageHandler,
 				DRH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
+				PosNotificationHandler = lightning::ln::peer_handler::IgnoringMessageHandler,
+				PNH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
 				CustomOnionMessageHandler = lightning::ln::peer_handler::IgnoringMessageHandler,
 				CMH = &'static lightning::ln::peer_handler::IgnoringMessageHandler,
 			> + Send
@@ -2002,6 +2004,7 @@ mod tests {
 		Arc<ChannelManager>,
 		IgnoringMessageHandler,
 		IgnoringMessageHandler,
+		IgnoringMessageHandler,
 	>;
 
 	type LM = LiquidityManagerSync<
@@ -2423,6 +2426,7 @@ mod tests {
 				Arc::clone(&msg_router),
 				IgnoringMessageHandler {},
 				Arc::clone(&manager),
+				IgnoringMessageHandler {},
 				IgnoringMessageHandler {},
 				IgnoringMessageHandler {},
 			));

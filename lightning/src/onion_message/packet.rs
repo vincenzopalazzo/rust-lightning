@@ -16,6 +16,7 @@ use super::async_payments::AsyncPaymentsMessage;
 use super::dns_resolution::DNSResolverMessage;
 use super::messenger::CustomOnionMessageHandler;
 use super::offers::OffersMessage;
+use super::pos_notification::PosNotificationMessage;
 use crate::blinded_path::message::{
 	BlindedMessagePath, DummyTlv, ForwardTlvs, NextMessageHop, ReceiveTlvs,
 };
@@ -141,6 +142,8 @@ pub enum ParsedOnionMessageContents<T: OnionMessageContents> {
 	AsyncPayments(AsyncPaymentsMessage),
 	/// A message requesting or providing a DNSSEC proof
 	DNSResolver(DNSResolverMessage),
+	/// A message related to PoS payment notifications.
+	PosNotification(PosNotificationMessage),
 	/// A custom onion message specified by the user.
 	Custom(T),
 }
@@ -154,6 +157,7 @@ impl<T: OnionMessageContents> OnionMessageContents for ParsedOnionMessageContent
 			&ParsedOnionMessageContents::Offers(ref msg) => msg.tlv_type(),
 			&ParsedOnionMessageContents::AsyncPayments(ref msg) => msg.tlv_type(),
 			&ParsedOnionMessageContents::DNSResolver(ref msg) => msg.tlv_type(),
+			&ParsedOnionMessageContents::PosNotification(ref msg) => msg.tlv_type(),
 			&ParsedOnionMessageContents::Custom(ref msg) => msg.tlv_type(),
 		}
 	}
@@ -163,6 +167,7 @@ impl<T: OnionMessageContents> OnionMessageContents for ParsedOnionMessageContent
 			ParsedOnionMessageContents::Offers(ref msg) => msg.msg_type(),
 			ParsedOnionMessageContents::AsyncPayments(ref msg) => msg.msg_type(),
 			ParsedOnionMessageContents::DNSResolver(ref msg) => msg.msg_type(),
+			ParsedOnionMessageContents::PosNotification(ref msg) => msg.msg_type(),
 			ParsedOnionMessageContents::Custom(ref msg) => msg.msg_type(),
 		}
 	}
@@ -172,6 +177,7 @@ impl<T: OnionMessageContents> OnionMessageContents for ParsedOnionMessageContent
 			ParsedOnionMessageContents::Offers(ref msg) => msg.msg_type(),
 			ParsedOnionMessageContents::AsyncPayments(ref msg) => msg.msg_type(),
 			ParsedOnionMessageContents::DNSResolver(ref msg) => msg.msg_type(),
+			ParsedOnionMessageContents::PosNotification(ref msg) => msg.msg_type(),
 			ParsedOnionMessageContents::Custom(ref msg) => msg.msg_type(),
 		}
 	}
@@ -183,6 +189,7 @@ impl<T: OnionMessageContents> Writeable for ParsedOnionMessageContents<T> {
 			ParsedOnionMessageContents::Offers(msg) => msg.write(w),
 			ParsedOnionMessageContents::AsyncPayments(msg) => msg.write(w),
 			ParsedOnionMessageContents::DNSResolver(msg) => msg.write(w),
+			ParsedOnionMessageContents::PosNotification(msg) => msg.write(w),
 			ParsedOnionMessageContents::Custom(msg) => msg.write(w),
 		}
 	}
@@ -307,6 +314,11 @@ impl<H: CustomOnionMessageHandler + ?Sized, L: Logger + ?Sized>
 				tlv_type if DNSResolverMessage::is_known_type(tlv_type) => {
 					let msg = DNSResolverMessage::read(msg_reader, tlv_type)?;
 					message = Some(ParsedOnionMessageContents::DNSResolver(msg));
+					Ok(true)
+				},
+				tlv_type if PosNotificationMessage::is_known_type(tlv_type) => {
+					let msg = PosNotificationMessage::read(msg_reader, tlv_type)?;
+					message = Some(ParsedOnionMessageContents::PosNotification(msg));
 					Ok(true)
 				},
 				_ => match handler.read_custom_message(msg_type, msg_reader)? {

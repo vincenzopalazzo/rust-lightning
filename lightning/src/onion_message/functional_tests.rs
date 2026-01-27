@@ -16,6 +16,7 @@ use super::async_payments::{
 use super::dns_resolution::{
 	DNSResolverMessage, DNSResolverMessageHandler, DNSSECProof, DNSSECQuery,
 };
+use super::pos_notification::{PaymentNotification, PosNotificationHandler};
 use super::messenger::{
 	CustomOnionMessageHandler, DefaultMessageRouter, Destination, MessageSendInstructions,
 	OnionMessagePath, OnionMessenger, Responder, ResponseInstruction, SendError, SendSuccess,
@@ -65,6 +66,7 @@ struct MessengerNode {
 		Arc<TestOffersMessageHandler>,
 		Arc<TestAsyncPaymentsMessageHandler>,
 		Arc<TestDNSResolverMessageHandler>,
+		Arc<TestPosNotificationHandler>,
 		Arc<TestCustomMessageHandler>,
 	>,
 	custom_message_handler: Arc<TestCustomMessageHandler>,
@@ -132,6 +134,12 @@ impl DNSResolverMessageHandler for TestDNSResolverMessageHandler {
 		None
 	}
 	fn handle_dnssec_proof(&self, _message: DNSSECProof, _context: DNSResolverContext) {}
+}
+
+struct TestPosNotificationHandler {}
+
+impl PosNotificationHandler for TestPosNotificationHandler {
+	fn handle_payment_notification(&self, _message: PaymentNotification) {}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -310,6 +318,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 		let offers_message_handler = Arc::new(TestOffersMessageHandler {});
 		let async_payments_message_handler = Arc::new(TestAsyncPaymentsMessageHandler {});
 		let dns_resolver_message_handler = Arc::new(TestDNSResolverMessageHandler {});
+		let pos_notification_handler = Arc::new(TestPosNotificationHandler {});
 		let custom_message_handler = Arc::new(TestCustomMessageHandler::new());
 		let messenger = if cfg.intercept_offline_peer_oms {
 			OnionMessenger::new_with_offline_peer_interception(
@@ -321,6 +330,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 				offers_message_handler,
 				async_payments_message_handler,
 				dns_resolver_message_handler,
+				pos_notification_handler,
 				Arc::clone(&custom_message_handler),
 			)
 		} else {
@@ -333,6 +343,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 				offers_message_handler,
 				async_payments_message_handler,
 				dns_resolver_message_handler,
+				pos_notification_handler,
 				Arc::clone(&custom_message_handler),
 			)
 		};

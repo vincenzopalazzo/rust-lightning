@@ -354,6 +354,10 @@ pub enum MessageContext {
 	///
 	/// [`DNSResolverMessage`]: crate::onion_message::dns_resolution::DNSResolverMessage
 	DNSResolver(DNSResolverContext),
+	/// Context specific to a [`PosNotificationMessage`].
+	///
+	/// [`PosNotificationMessage`]: crate::onion_message::pos_notification::PosNotificationMessage
+	PosNotification(PosNotificationContext),
 	/// Context specific to a [`CustomOnionMessageHandler::CustomMessage`].
 	///
 	/// [`CustomOnionMessageHandler::CustomMessage`]: crate::onion_message::messenger::CustomOnionMessageHandler::CustomMessage
@@ -609,6 +613,7 @@ impl_writeable_tlv_based_enum!(MessageContext,
 	{1, Custom} => (),
 	{2, AsyncPayments} => (),
 	{3, DNSResolver} => (),
+	{4, PosNotification} => (),
 );
 
 // Note: Several TLV fields (`nonce`, `hmac`, etc.) were removed in LDK v0.2 following the
@@ -679,6 +684,16 @@ pub struct DNSResolverContext {
 impl_writeable_tlv_based!(DNSResolverContext, {
 	(0, nonce, required),
 });
+
+/// Context for a blinded path used by PoS devices to receive payment notifications.
+///
+/// This context is included when receiving a [`PaymentNotification`] message.
+///
+/// [`PaymentNotification`]: crate::onion_message::pos_notification::PaymentNotification
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct PosNotificationContext {}
+
+impl_writeable_tlv_based!(PosNotificationContext, {});
 
 /// Represents the padding round off size (in bytes) that is used
 /// to pad message blinded path's [`BlindedHop`]

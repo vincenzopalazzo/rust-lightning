@@ -532,6 +532,7 @@ type TestOnionMessenger<'chan_man, 'node_cfg, 'chan_mon_cfg> = OnionMessenger<
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	IgnoringMessageHandler,
 	IgnoringMessageHandler,
+	IgnoringMessageHandler,
 >;
 
 #[cfg(feature = "dnssec")]
@@ -544,6 +545,7 @@ type TestOnionMessenger<'chan_man, 'node_cfg, 'chan_mon_cfg> = OnionMessenger<
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
+	IgnoringMessageHandler,
 	IgnoringMessageHandler,
 >;
 
@@ -4596,6 +4598,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(
 			&chan_mgrs[i],
 			&chan_mgrs[i],
 			IgnoringMessageHandler {},
+			IgnoringMessageHandler {},
 		);
 		#[cfg(not(feature = "dnssec"))]
 		let onion_messenger = OnionMessenger::new_with_offline_peer_interception(
@@ -4606,6 +4609,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(
 			&cfgs[i].message_router,
 			&chan_mgrs[i],
 			&chan_mgrs[i],
+			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 		);

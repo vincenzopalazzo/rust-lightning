@@ -20,13 +20,14 @@ use super::dns_resolution::{DNSResolverMessage, DNSResolverMessageHandler};
 use super::offers::{OffersMessage, OffersMessageHandler};
 use super::packet::OnionMessageContents;
 use super::packet::ParsedOnionMessageContents;
+use super::pos_notification::{PosNotificationHandler, PosNotificationMessage};
 use super::packet::{
 	ForwardControlTlvs, Packet, Payload, ReceiveControlTlvs, BIG_PACKET_HOP_DATA_LEN,
 	SMALL_PACKET_HOP_DATA_LEN,
 };
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, DNSResolverContext, ForwardTlvs, MessageContext,
-	MessageForwardNode, NextMessageHop, OffersContext, ReceiveTlvs,
+	MessageForwardNode, NextMessageHop, OffersContext, PosNotificationContext, ReceiveTlvs,
 };
 use crate::blinded_path::utils;
 use crate::blinded_path::{IntroductionNode, NodeIdLookUp};
@@ -97,6 +98,10 @@ pub trait AOnionMessenger {
 	type DNSResolverMessageHandler: DNSResolverMessageHandler + ?Sized;
 	/// A type that may be dereferenced to [`Self::DNSResolverMessageHandler`]
 	type DRH: Deref<Target = Self::DNSResolverMessageHandler>;
+	/// A type implementing [`PosNotificationHandler`]
+	type PosNotificationHandler: PosNotificationHandler + ?Sized;
+	/// A type that may be dereferenced to [`Self::PosNotificationHandler`]
+	type PNH: Deref<Target = Self::PosNotificationHandler>;
 	/// A type implementing [`CustomOnionMessageHandler`]
 	type CustomOnionMessageHandler: CustomOnionMessageHandler + ?Sized;
 	/// A type that may be dereferenced to [`Self::CustomOnionMessageHandler`]
@@ -113,6 +118,7 @@ pub trait AOnionMessenger {
 		Self::OMH,
 		Self::APH,
 		Self::DRH,
+		Self::PNH,
 		Self::CMH,
 	>;
 }
@@ -126,8 +132,9 @@ impl<
 		OMH: Deref,
 		APH: Deref,
 		DRH: Deref,
+		PNH: Deref,
 		CMH: Deref,
-	> AOnionMessenger for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, CMH>
+	> AOnionMessenger for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, PNH, CMH>
 where
 	ES::Target: EntropySource,
 	NS::Target: NodeSigner,
@@ -137,6 +144,7 @@ where
 	OMH::Target: OffersMessageHandler,
 	APH::Target: AsyncPaymentsMessageHandler,
 	DRH::Target: DNSResolverMessageHandler,
+	PNH::Target: PosNotificationHandler,
 	CMH::Target: CustomOnionMessageHandler,
 {
 	type EntropySource = ES::Target;
@@ -155,9 +163,11 @@ where
 	type APH = APH;
 	type DNSResolverMessageHandler = DRH::Target;
 	type DRH = DRH;
+	type PosNotificationHandler = PNH::Target;
+	type PNH = PNH;
 	type CustomOnionMessageHandler = CMH::Target;
 	type CMH = CMH;
-	fn get_om(&self) -> &OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, CMH> {
+	fn get_om(&self) -> &OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, PNH, CMH> {
 		self
 	}
 }
@@ -292,6 +302,7 @@ pub struct OnionMessenger<
 	OMH: Deref,
 	APH: Deref,
 	DRH: Deref,
+	PNH: Deref,
 	CMH: Deref,
 > where
 	ES::Target: EntropySource,
@@ -302,6 +313,7 @@ pub struct OnionMessenger<
 	OMH::Target: OffersMessageHandler,
 	APH::Target: AsyncPaymentsMessageHandler,
 	DRH::Target: DNSResolverMessageHandler,
+	PNH::Target: PosNotificationHandler,
 	CMH::Target: CustomOnionMessageHandler,
 {
 	entropy_source: ES,
@@ -318,6 +330,7 @@ pub struct OnionMessenger<
 	#[allow(unused)]
 	async_payments_handler: APH,
 	dns_resolver_handler: DRH,
+	pos_notification_handler: PNH,
 	custom_handler: CMH,
 	intercept_messages_for_offline_peers: bool,
 	pending_intercepted_msgs_events: Mutex<Vec<Event>>,
@@ -1010,6 +1023,8 @@ pub enum PeeledOnion<T: OnionMessageContents> {
 	AsyncPayments(AsyncPaymentsMessage, AsyncPaymentsContext, Option<BlindedMessagePath>),
 	/// Received DNS resolver onion message, with decrypted contents, context, and reply path
 	DNSResolver(DNSResolverMessage, Option<DNSResolverContext>, Option<BlindedMessagePath>),
+	/// Received PoS notification onion message, with decrypted contents, context, and reply path
+	PosNotification(PosNotificationMessage, Option<PosNotificationContext>, Option<BlindedMessagePath>),
 	/// Received custom onion message, with decrypted contents, context, and reply path
 	Custom(T, Option<Vec<u8>>, Option<BlindedMessagePath>),
 }
@@ -1281,6 +1296,19 @@ where
 			(ParsedOnionMessageContents::DNSResolver(msg), None) => {
 				Ok(PeeledOnion::DNSResolver(msg, None, reply_path))
 			},
+			(
+				ParsedOnionMessageContents::PosNotification(msg),
+				Some(MessageContext::PosNotification(ctx)),
+			) => {
+				if !control_tlvs_authenticated {
+					log_trace!(logger, "Received an unauthenticated PoS notification onion message");
+					return Err(());
+				}
+				Ok(PeeledOnion::PosNotification(msg, Some(ctx), reply_path))
+			},
+			(ParsedOnionMessageContents::PosNotification(msg), None) => {
+				Ok(PeeledOnion::PosNotification(msg, None, reply_path))
+			},
 			_ => {
 				log_trace!(
 					logger,
@@ -1371,8 +1399,9 @@ impl<
 		OMH: Deref,
 		APH: Deref,
 		DRH: Deref,
+		PNH: Deref,
 		CMH: Deref,
-	> OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, CMH>
+	> OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, PNH, CMH>
 where
 	ES::Target: EntropySource,
 	NS::Target: NodeSigner,
@@ -1382,13 +1411,15 @@ where
 	OMH::Target: OffersMessageHandler,
 	APH::Target: AsyncPaymentsMessageHandler,
 	DRH::Target: DNSResolverMessageHandler,
+	PNH::Target: PosNotificationHandler,
 	CMH::Target: CustomOnionMessageHandler,
 {
 	/// Constructs a new `OnionMessenger` to send, forward, and delegate received onion messages to
 	/// their respective handlers.
 	pub fn new(
 		entropy_source: ES, node_signer: NS, logger: L, node_id_lookup: NL, message_router: MR,
-		offers_handler: OMH, async_payments_handler: APH, dns_resolver: DRH, custom_handler: CMH,
+		offers_handler: OMH, async_payments_handler: APH, dns_resolver: DRH,
+		pos_notification_handler: PNH, custom_handler: CMH,
 	) -> Self {
 		Self::new_inner(
 			entropy_source,
@@ -1399,6 +1430,7 @@ where
 			offers_handler,
 			async_payments_handler,
 			dns_resolver,
+			pos_notification_handler,
 			custom_handler,
 			false,
 		)
@@ -1427,7 +1459,8 @@ where
 	/// peers.
 	pub fn new_with_offline_peer_interception(
 		entropy_source: ES, node_signer: NS, logger: L, node_id_lookup: NL, message_router: MR,
-		offers_handler: OMH, async_payments_handler: APH, dns_resolver: DRH, custom_handler: CMH,
+		offers_handler: OMH, async_payments_handler: APH, dns_resolver: DRH,
+		pos_notification_handler: PNH, custom_handler: CMH,
 	) -> Self {
 		Self::new_inner(
 			entropy_source,
@@ -1438,6 +1471,7 @@ where
 			offers_handler,
 			async_payments_handler,
 			dns_resolver,
+			pos_notification_handler,
 			custom_handler,
 			true,
 		)
@@ -1445,7 +1479,8 @@ where
 
 	fn new_inner(
 		entropy_source: ES, node_signer: NS, logger: L, node_id_lookup: NL, message_router: MR,
-		offers_handler: OMH, async_payments_handler: APH, dns_resolver: DRH, custom_handler: CMH,
+		offers_handler: OMH, async_payments_handler: APH, dns_resolver: DRH,
+		pos_notification_handler: PNH, custom_handler: CMH,
 		intercept_messages_for_offline_peers: bool,
 	) -> Self {
 		let mut secp_ctx = Secp256k1::new();
@@ -1461,6 +1496,7 @@ where
 			offers_handler,
 			async_payments_handler,
 			dns_resolver_handler: dns_resolver,
+			pos_notification_handler,
 			custom_handler,
 			intercept_messages_for_offline_peers,
 			pending_intercepted_msgs_events: Mutex::new(Vec::new()),
@@ -1844,6 +1880,15 @@ where
 			);
 		}
 
+		// Enqueue any initiating `PosNotificationMessage`s to send.
+		for (message, instructions) in self.pos_notification_handler.release_pending_messages() {
+			let _ = self.send_onion_message_internal(
+				message,
+				instructions,
+				format_args!("when sending PosNotificationMessage"),
+			);
+		}
+
 		// Enqueue any initiating `CustomMessage`s to send.
 		for (message, instructions) in self.custom_handler.release_pending_custom_messages() {
 			let _ = self.send_onion_message_internal(
@@ -2015,8 +2060,9 @@ impl<
 		OMH: Deref,
 		APH: Deref,
 		DRH: Deref,
+		PNH: Deref,
 		CMH: Deref,
-	> EventsProvider for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, CMH>
+	> EventsProvider for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, PNH, CMH>
 where
 	ES::Target: EntropySource,
 	NS::Target: NodeSigner,
@@ -2026,6 +2072,7 @@ where
 	OMH::Target: OffersMessageHandler,
 	APH::Target: AsyncPaymentsMessageHandler,
 	DRH::Target: DNSResolverMessageHandler,
+	PNH::Target: PosNotificationHandler,
 	CMH::Target: CustomOnionMessageHandler,
 {
 	fn process_pending_events<H: Deref>(&self, handler: H)
@@ -2136,8 +2183,9 @@ impl<
 		OMH: Deref,
 		APH: Deref,
 		DRH: Deref,
+		PNH: Deref,
 		CMH: Deref,
-	> BaseMessageHandler for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, CMH>
+	> BaseMessageHandler for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, PNH, CMH>
 where
 	ES::Target: EntropySource,
 	NS::Target: NodeSigner,
@@ -2147,6 +2195,7 @@ where
 	OMH::Target: OffersMessageHandler,
 	APH::Target: AsyncPaymentsMessageHandler,
 	DRH::Target: DNSResolverMessageHandler,
+	PNH::Target: PosNotificationHandler,
 	CMH::Target: CustomOnionMessageHandler,
 {
 	fn provided_node_features(&self) -> NodeFeatures {
@@ -2208,8 +2257,9 @@ impl<
 		OMH: Deref,
 		APH: Deref,
 		DRH: Deref,
+		PNH: Deref,
 		CMH: Deref,
-	> OnionMessageHandler for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, CMH>
+	> OnionMessageHandler for OnionMessenger<ES, NS, L, NL, MR, OMH, APH, DRH, PNH, CMH>
 where
 	ES::Target: EntropySource,
 	NS::Target: NodeSigner,
@@ -2219,6 +2269,7 @@ where
 	OMH::Target: OffersMessageHandler,
 	APH::Target: AsyncPaymentsMessageHandler,
 	DRH::Target: DNSResolverMessageHandler,
+	PNH::Target: PosNotificationHandler,
 	CMH::Target: CustomOnionMessageHandler,
 {
 	fn handle_onion_message(&self, peer_node_id: PublicKey, msg: &OnionMessage) {
@@ -2317,6 +2368,14 @@ where
 					},
 				}
 			},
+			Ok(PeeledOnion::PosNotification(message, _context, reply_path)) => {
+				log_receive!(message, reply_path.is_some());
+				match message {
+					PosNotificationMessage::PaymentNotification(msg) => {
+						self.pos_notification_handler.handle_payment_notification(msg);
+					},
+				}
+			},
 			Ok(PeeledOnion::Custom(message, context, reply_path)) => {
 				log_receive!(message, reply_path.is_some());
 				let responder = reply_path.map(Responder::new);
@@ -2391,6 +2450,7 @@ pub type SimpleArcOnionMessenger<M, T, F, L> = OnionMessenger<
 	Arc<SimpleArcChannelManager<M, T, F, L>>,
 	Arc<SimpleArcChannelManager<M, T, F, L>>,
 	IgnoringMessageHandler,
+	IgnoringMessageHandler,
 >;
 
 /// Useful for simplifying the parameters of [`SimpleArcChannelManager`] and
@@ -2410,6 +2470,7 @@ pub type SimpleArcOnionMessenger<M, T, F, L> = OnionMessenger<
 	Arc<DefaultMessageRouter<Arc<NetworkGraph<Arc<L>>>, Arc<L>, Arc<KeysManager>>>,
 	Arc<SimpleArcChannelManager<M, T, F, L>>,
 	Arc<SimpleArcChannelManager<M, T, F, L>>,
+	IgnoringMessageHandler,
 	IgnoringMessageHandler,
 	IgnoringMessageHandler,
 >;
@@ -2434,6 +2495,7 @@ pub type SimpleRefOnionMessenger<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, 'j, M, T, F
 		&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L>,
 		&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L>,
 		IgnoringMessageHandler,
+		IgnoringMessageHandler,
 	>;
 
 /// Useful for simplifying the parameters of [`SimpleRefChannelManager`] and
@@ -2454,6 +2516,7 @@ pub type SimpleRefOnionMessenger<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, 'j, M, T, F
 		&'i DefaultMessageRouter<&'g NetworkGraph<&'b L>, &'b L, &'a KeysManager>,
 		&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L>,
 		&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L>,
+		IgnoringMessageHandler,
 		IgnoringMessageHandler,
 		IgnoringMessageHandler,
 	>;
