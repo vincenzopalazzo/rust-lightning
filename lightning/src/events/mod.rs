@@ -159,6 +159,37 @@ pub enum PaymentPurpose {
 		/// [`Refund`]: crate::offers::refund::Refund
 		payment_context: Bolt12RefundContext,
 	},
+	/// A payment for a PoS-delegated BOLT 12 [`Offer`].
+	///
+	/// This variant is used when the offer was created by a PoS device with `notification_paths`
+	/// to receive payment notifications. The merchant can use these paths to send a
+	/// payment notification back to the PoS when the payment is received.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	DelegatedBolt12OfferPayment {
+		/// The preimage to the payment hash. When handling [`Event::PaymentClaimable`], this can be
+		/// passed directly to [`ChannelManager::claim_funds`], if provided. No action is needed
+		/// when seen in [`Event::PaymentClaimed`].
+		///
+		/// [`ChannelManager::claim_funds`]: crate::ln::channelmanager::ChannelManager::claim_funds
+		payment_preimage: Option<PaymentPreimage>,
+		/// The secret used to authenticate the sender to the recipient, preventing a number of
+		/// de-anonymization attacks while routing a payment.
+		///
+		/// See [`PaymentPurpose::Bolt11InvoicePayment::payment_secret`] for further details.
+		payment_secret: PaymentSecret,
+		/// The context of the payment such as information about the corresponding [`Offer`] and
+		/// [`InvoiceRequest`].
+		///
+		/// [`Offer`]: crate::offers::offer::Offer
+		/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+		payment_context: Bolt12OfferContext,
+		/// Blinded paths to the PoS for sending payment notifications.
+		///
+		/// The merchant should use these paths to send a payment notification message
+		/// to the PoS when the payment is received and claimed.
+		notification_paths: Vec<BlindedMessagePath>,
+	},
 	/// Because this is a spontaneous payment, the payer generated their own preimage rather than us
 	/// (the payee) providing a preimage.
 	SpontaneousPayment(PaymentPreimage),
@@ -171,6 +202,9 @@ impl PaymentPurpose {
 			PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => *payment_preimage,
 			PaymentPurpose::Bolt12OfferPayment { payment_preimage, .. } => *payment_preimage,
 			PaymentPurpose::Bolt12RefundPayment { payment_preimage, .. } => *payment_preimage,
+			PaymentPurpose::DelegatedBolt12OfferPayment { payment_preimage, .. } => {
+				*payment_preimage
+			},
 			PaymentPurpose::SpontaneousPayment(preimage) => Some(*preimage),
 		}
 	}
@@ -180,6 +214,7 @@ impl PaymentPurpose {
 			PaymentPurpose::Bolt11InvoicePayment { .. } => false,
 			PaymentPurpose::Bolt12OfferPayment { .. } => false,
 			PaymentPurpose::Bolt12RefundPayment { .. } => false,
+			PaymentPurpose::DelegatedBolt12OfferPayment { .. } => false,
 			PaymentPurpose::SpontaneousPayment(..) => true,
 		}
 	}
@@ -209,6 +244,17 @@ impl PaymentPurpose {
 				debug_assert!(false);
 				Err(())
 			},
+			Some(PaymentContext::DelegatedBolt12Offer(context)) => {
+				Ok(PaymentPurpose::DelegatedBolt12OfferPayment {
+					payment_preimage,
+					payment_secret,
+					payment_context: Bolt12OfferContext {
+						offer_id: context.offer_id,
+						invoice_request: context.invoice_request,
+					},
+					notification_paths: context.notification_paths,
+				})
+			},
 		}
 	}
 }
@@ -227,6 +273,12 @@ impl_writeable_tlv_based_enum_legacy!(PaymentPurpose,
 		(0, payment_preimage, option),
 		(2, payment_secret, required),
 		(4, payment_context, required),
+	},
+	(8, DelegatedBolt12OfferPayment) => {
+		(0, payment_preimage, option),
+		(2, payment_secret, required),
+		(4, payment_context, required),
+		(6, notification_paths, required_vec),
 	},
 	;
 	(2, SpontaneousPayment)
@@ -1888,6 +1940,8 @@ impl Writeable for Event {
 				let mut payment_secret = None;
 				let payment_preimage;
 				let mut payment_context = None;
+				let empty_notification_paths: Vec<BlindedMessagePath> = Vec::new();
+				let notification_paths: &Vec<BlindedMessagePath>;
 				match &purpose {
 					PaymentPurpose::Bolt11InvoicePayment {
 						payment_preimage: preimage,
@@ -1895,6 +1949,7 @@ impl Writeable for Event {
 					} => {
 						payment_secret = Some(secret);
 						payment_preimage = *preimage;
+						notification_paths = &empty_notification_paths;
 					},
 					PaymentPurpose::Bolt12OfferPayment {
 						payment_preimage: preimage,
@@ -1904,6 +1959,7 @@ impl Writeable for Event {
 						payment_secret = Some(secret);
 						payment_preimage = *preimage;
 						payment_context = Some(PaymentContextRef::Bolt12Offer(context));
+						notification_paths = &empty_notification_paths;
 					},
 					PaymentPurpose::Bolt12RefundPayment {
 						payment_preimage: preimage,
@@ -1913,9 +1969,22 @@ impl Writeable for Event {
 						payment_secret = Some(secret);
 						payment_preimage = *preimage;
 						payment_context = Some(PaymentContextRef::Bolt12Refund(context));
+						notification_paths = &empty_notification_paths;
+					},
+					PaymentPurpose::DelegatedBolt12OfferPayment {
+						payment_preimage: preimage,
+						payment_secret: secret,
+						payment_context: context,
+						notification_paths: paths,
+					} => {
+						payment_secret = Some(secret);
+						payment_preimage = *preimage;
+						payment_context = Some(PaymentContextRef::Bolt12Offer(context));
+						notification_paths = paths;
 					},
 					PaymentPurpose::SpontaneousPayment(preimage) => {
 						payment_preimage = Some(*preimage);
+						notification_paths = &empty_notification_paths;
 					},
 				}
 				let skimmed_fee_opt = if counterparty_skimmed_fee_msat == 0 {
@@ -1949,6 +2018,7 @@ impl Writeable for Event {
 					(11, payment_context, option),
 					(13, payment_id, option),
 					(15, *receiving_channel_ids, optional_vec),
+					(17, *notification_paths, optional_vec),
 				});
 			},
 			&Event::PaymentSent {
@@ -2376,6 +2446,7 @@ impl MaybeReadable for Event {
 					let mut payment_context = None;
 					let mut payment_id = None;
 					let mut receiving_channel_ids_opt = None;
+					let mut notification_paths_opt: Option<Vec<BlindedMessagePath>> = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, receiver_node_id, option),
@@ -2391,11 +2462,28 @@ impl MaybeReadable for Event {
 						(11, payment_context, option),
 						(13, payment_id, option),
 						(15, receiving_channel_ids_opt, optional_vec),
+						(17, notification_paths_opt, optional_vec),
 					});
 					let purpose = match payment_secret {
 						Some(secret) => {
-							PaymentPurpose::from_parts(payment_preimage, secret, payment_context)
-								.map_err(|()| msgs::DecodeError::InvalidValue)?
+							// If notification_paths are present with a Bolt12Offer context,
+							// create DelegatedBolt12OfferPayment
+							match (notification_paths_opt, payment_context) {
+								(Some(paths), Some(PaymentContext::Bolt12Offer(context)))
+									if !paths.is_empty() =>
+								{
+									PaymentPurpose::DelegatedBolt12OfferPayment {
+										payment_preimage,
+										payment_secret: secret,
+										payment_context: context,
+										notification_paths: paths,
+									}
+								},
+								(_, context) => {
+									PaymentPurpose::from_parts(payment_preimage, secret, context)
+										.map_err(|()| msgs::DecodeError::InvalidValue)?
+								},
+							}
 						},
 						None if payment_preimage.is_some() => {
 							PaymentPurpose::SpontaneousPayment(payment_preimage.unwrap())

@@ -12,6 +12,7 @@
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
 
+use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::utils::{self, BlindedPathWithPadding};
 use crate::blinded_path::{BlindedHop, BlindedPath, IntroductionNode, NodeIdLookUp};
 use crate::crypto::streams::ChaChaDualPolyReadAdapter;
@@ -412,6 +413,14 @@ pub enum PaymentContext {
 	///
 	/// [`Refund`]: crate::offers::refund::Refund
 	Bolt12Refund(Bolt12RefundContext),
+
+	/// The payment was made for a PoS-delegated BOLT 12 [`Offer`].
+	///
+	/// This variant includes additional context for notifying the PoS device
+	/// when the payment is received.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	DelegatedBolt12Offer(DelegatedBolt12OfferContext),
 }
 
 // Used when writing PaymentContext in Event::PaymentClaimable to avoid cloning.
@@ -454,6 +463,32 @@ pub struct AsyncBolt12OfferContext {
 /// [`Refund`]: crate::offers::refund::Refund
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bolt12RefundContext {}
+
+/// The context of a payment made for a PoS-delegated BOLT 12 [`Offer`].
+///
+/// This context includes the information needed to notify the PoS device
+/// when the payment is received, including the blinded paths to reach the PoS.
+///
+/// [`Offer`]: crate::offers::offer::Offer
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedBolt12OfferContext {
+	/// The identifier of the [`Offer`].
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	pub offer_id: OfferId,
+
+	/// Fields from an [`InvoiceRequest`] sent for a [`Bolt12Invoice`].
+	///
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	/// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
+	pub invoice_request: InvoiceRequestFields,
+
+	/// Blinded paths to the PoS for sending payment notifications.
+	///
+	/// The merchant uses these paths to send a payment notification message
+	/// to the PoS when the payment is received.
+	pub notification_paths: Vec<BlindedMessagePath>,
+}
 
 impl TryFrom<CounterpartyForwardingInfo> for PaymentRelay {
 	type Error = ();
@@ -783,6 +818,7 @@ impl_writeable_tlv_based_enum_legacy!(PaymentContext,
 	(1, Bolt12Offer),
 	(2, Bolt12Refund),
 	(3, AsyncBolt12Offer),
+	(4, DelegatedBolt12Offer),
 );
 
 impl<'a> Writeable for PaymentContextRef<'a> {
@@ -812,6 +848,12 @@ impl_writeable_tlv_based!(AsyncBolt12OfferContext, {
 });
 
 impl_writeable_tlv_based!(Bolt12RefundContext, {});
+
+impl_writeable_tlv_based!(DelegatedBolt12OfferContext, {
+	(0, offer_id, required),
+	(2, invoice_request, required),
+	(4, notification_paths, required_vec),
+});
 
 #[cfg(test)]
 mod tests {
