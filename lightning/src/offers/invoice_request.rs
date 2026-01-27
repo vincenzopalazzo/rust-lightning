@@ -1321,7 +1321,7 @@ type FullInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceRequestTlvStreamRef,
 );
 
@@ -1357,7 +1357,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	PayerTlvStreamRef<'a>,
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceRequestTlvStreamRef,
 );
 
@@ -1659,7 +1659,7 @@ mod tests {
 					offer_from_hrn: None,
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef { notification_paths: None, experimental_foo: None },
 				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
 			),
 		);

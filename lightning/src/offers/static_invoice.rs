@@ -616,7 +616,7 @@ type PartialInvoiceTlvStream =
 type PartialInvoiceTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -758,7 +758,7 @@ mod tests {
 		OfferTlvStreamRef<'a>,
 		InvoiceTlvStreamRef<'a>,
 		SignatureTlvStreamRef<'a>,
-		ExperimentalOfferTlvStreamRef,
+		ExperimentalOfferTlvStreamRef<'a>,
 		ExperimentalInvoiceTlvStreamRef,
 	);
 
@@ -924,7 +924,7 @@ mod tests {
 					message_paths: Some(&paths),
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef { notification_paths: None, experimental_foo: None },
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			)
 		);

@@ -247,6 +247,7 @@ macro_rules! offer_explicit_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(signing_pubkey),
+					notification_paths: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -301,6 +302,7 @@ macro_rules! offer_derived_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(node_id),
+					notification_paths: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -386,6 +388,17 @@ macro_rules! offer_builder_methods { (
 	/// adding duplicate paths.
 	pub fn path($($self_mut)* $self: $self_type, path: BlindedMessagePath) -> $return_type {
 		$self.offer.paths.get_or_insert_with(Vec::new).push(path);
+		$return_value
+	}
+
+	/// Adds a blinded path for PoS payment notifications to [`Offer::notification_paths`].
+	///
+	/// When a PoS device creates an offer delegating payment to a merchant, it includes
+	/// notification paths so the merchant can notify the PoS when payment is received.
+	///
+	/// Successive calls to this method will add another notification path.
+	pub fn notification_path($($self_mut)* $self: $self_type, path: BlindedMessagePath) -> $return_type {
+		$self.offer.notification_paths.get_or_insert_with(Vec::new).push(path);
 		$return_value
 	}
 
@@ -632,6 +645,8 @@ pub(super) struct OfferContents {
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
 	issuer_signing_pubkey: Option<PublicKey>,
+	/// Blinded paths for PoS devices to receive payment notifications.
+	notification_paths: Option<Vec<BlindedMessagePath>>,
 	#[cfg(test)]
 	experimental_foo: Option<u64>,
 }
@@ -687,6 +702,14 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 	/// recipient privacy by obfuscating its node id.
 	pub fn paths(&$self) -> &[$crate::blinded_path::message::BlindedMessagePath] {
 		$contents.paths()
+	}
+
+	/// Blinded paths to PoS devices for receiving payment notifications.
+	///
+	/// When this offer was created by a PoS device delegating to a merchant, these paths
+	/// allow the merchant to notify the PoS when payment is received.
+	pub fn notification_paths(&$self) -> &[$crate::blinded_path::message::BlindedMessagePath] {
+		$contents.notification_paths()
 	}
 
 	/// The quantity of items supported.
@@ -930,6 +953,14 @@ impl OfferContents {
 		self.paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
 	}
 
+	/// Blinded paths to PoS devices for receiving payment notifications.
+	///
+	/// When this offer was created by a PoS device delegating to a merchant, these paths
+	/// allow the merchant to notify the PoS when payment is received.
+	pub fn notification_paths(&self) -> &[BlindedMessagePath] {
+		self.notification_paths.as_ref().map(|p| p.as_slice()).unwrap_or(&[])
+	}
+
 	pub(super) fn check_amount_msats_for_quantity(
 		&self, amount_msats: Option<u64>, quantity: Option<u64>,
 	) -> Result<(), Bolt12SemanticError> {
@@ -1075,6 +1106,7 @@ impl OfferContents {
 		};
 
 		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			notification_paths: self.notification_paths.as_ref(),
 			#[cfg(test)]
 			experimental_foo: self.experimental_foo,
 		};
@@ -1232,17 +1264,19 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
 
 #[cfg(not(test))]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(1_000_000_000, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
 });
 
 #[cfg(test)]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(1_000_000_000, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
 	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
 });
 
 type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
 
-type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef);
+type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef<'a>);
 
 impl CursorReadable for FullOfferTlvStream {
 	fn read<R: AsRef<[u8]>>(r: &mut io::Cursor<R>) -> Result<Self, DecodeError> {
@@ -1297,6 +1331,7 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 				issuer_id,
 			},
 			ExperimentalOfferTlvStream {
+				notification_paths,
 				#[cfg(test)]
 				experimental_foo,
 			},
@@ -1352,6 +1387,7 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 			paths,
 			supported_quantity,
 			issuer_signing_pubkey,
+			notification_paths,
 			#[cfg(test)]
 			experimental_foo,
 		})
@@ -1446,7 +1482,7 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef { notification_paths: None, experimental_foo: None },
 			),
 		);
 
@@ -2177,7 +2213,9 @@ mod tests {
 
 		let mut encoded_offer = Vec::new();
 		offer.write(&mut encoded_offer).unwrap();
-		BigSize(EXPERIMENTAL_OFFER_TYPES.start).write(&mut encoded_offer).unwrap();
+		// Use an unknown even (required) TLV type in the experimental range
+		// (1_000_000_000 is now used for notification_paths)
+		BigSize(EXPERIMENTAL_OFFER_TYPES.start + 2).write(&mut encoded_offer).unwrap();
 		BigSize(32).write(&mut encoded_offer).unwrap();
 		[42u8; 32].write(&mut encoded_offer).unwrap();
 
