@@ -698,7 +698,6 @@ impl TryFrom<Vec<u8>> for PayerProof {
 /// - MUST NOT contain signature TLV element numbers (240-1000)
 /// - MUST be in strict ascending order
 /// - MUST NOT contain the number of an included TLV field
-/// - MUST NOT contain more than one number larger than the largest included non-signature TLV
 /// - Markers MUST be minimized: each marker must be exactly prev_value + 1 within
 ///   a run, and the first marker after an included type X must be X + 1
 fn validate_omitted_markers_for_parsing(
@@ -707,8 +706,6 @@ fn validate_omitted_markers_for_parsing(
 	let mut inc_iter = included_types.iter().copied().peekable();
 	// After implicit TLV0 (marker 0), the first minimized marker would be 1
 	let mut expected_next: u64 = 1;
-	let mut trailing_count = 0;
-	let max_included = included_types.iter().copied().max().unwrap_or(0);
 	let mut prev = 0u64;
 
 	for &marker in omitted_markers {
@@ -753,17 +750,7 @@ fn validate_omitted_markers_for_parsing(
 
 		expected_next = marker + 1;
 
-		// Count markers larger than largest included
-		if marker > max_included {
-			trailing_count += 1;
-		}
-
 		prev = marker;
-	}
-
-	// MUST NOT contain more than one number larger than largest included
-	if trailing_count > 1 {
-		return Err(crate::ln::msgs::DecodeError::InvalidValue);
 	}
 
 	Ok(())
@@ -1050,15 +1037,15 @@ mod tests {
 		assert!(matches!(result, Err(crate::ln::msgs::DecodeError::InvalidValue)));
 	}
 
-	/// Test validation of omitted_markers - must not have too many trailing markers.
+	/// Test validation of omitted_markers with multiple trailing markers.
 	#[test]
-	fn test_validate_omitted_markers_rejects_too_many_trailing() {
+	fn test_validate_omitted_markers_accepts_multiple_trailing_markers() {
 		// included=[10, 20], markers=[1, 21, 22] — both 21 and 22 > max included (20)
 		let omitted = vec![1, 21, 22];
 		let included: BTreeSet<u64> = [10, 20].iter().copied().collect();
 
 		let result = validate_omitted_markers_for_parsing(&omitted, &included);
-		assert!(matches!(result, Err(crate::ln::msgs::DecodeError::InvalidValue)));
+		assert!(result.is_ok());
 	}
 
 	/// Test that valid minimized omitted_markers pass validation.
