@@ -3531,6 +3531,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([1; 32]),
 			bolt12_invoice: None,
+			payment_nonce: None,
 		};
 
 		process_onion_failure(&ctx_full, &logger, &htlc_source, onion_error)
@@ -3717,6 +3718,7 @@ mod tests {
 				first_hop_htlc_msat: dummy_amt_msat,
 				payment_id: PaymentId([1; 32]),
 				bolt12_invoice: None,
+				payment_nonce: None,
 			};
 
 			{
@@ -3905,6 +3907,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([1; 32]),
 			bolt12_invoice: None,
+			payment_nonce: None,
 		};
 
 		// Iterate over all possible failure positions and check that the cases that can be attributed are.
@@ -4014,6 +4017,7 @@ mod tests {
 			first_hop_htlc_msat: 0,
 			payment_id: PaymentId([1; 32]),
 			bolt12_invoice: None,
+			payment_nonce: None,
 		};
 
 		let decrypted_failure = process_onion_failure(&ctx_full, &logger, &htlc_source, packet);
