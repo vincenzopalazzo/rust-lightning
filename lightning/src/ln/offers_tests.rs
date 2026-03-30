@@ -270,7 +270,7 @@ fn extract_offer_nonce<'a, 'b, 'c>(node: &Node<'a, 'b, 'c>, message: &OnionMessa
 ///
 /// When the payer receives an invoice through their reply path, the blinded path context
 /// contains the nonce originally used for deriving their payer signing key. This nonce is
-/// needed to build a [`PayerProof`] using [`PayerProofBuilder::build_with_derived_key`].
+/// needed to build a [`PayerProof`] using [`Bolt12Invoice::payer_proof_builder_derived`].
 fn extract_payer_context<'a, 'b, 'c>(node: &Node<'a, 'b, 'c>, message: &OnionMessage) -> (PaymentId, Nonce) {
 	match node.onion_messenger.peel_onion_message(message) {
 		Ok(PeeledOnion::Offers(_, Some(OffersContext::OutboundPaymentForOffer { payment_id, nonce, .. }), _)) => (payment_id, nonce),
@@ -2764,11 +2764,14 @@ fn creates_and_verifies_payer_proof_after_offer_payment() {
 	// Bob (the payer) creates a proof-of-payment with selective disclosure.
 	// He includes the offer description and invoice amount, but omits other fields for privacy.
 	let expanded_key = bob.keys_manager.get_expanded_key();
-	let proof = invoice.payer_proof_builder(payment_preimage).unwrap()
+	let secp_ctx = Secp256k1::new();
+	let proof = invoice.payer_proof_builder_derived(
+		payment_preimage, &expanded_key, payer_nonce, payment_id, &secp_ctx,
+	).unwrap()
 		.include_offer_description()
 		.include_invoice_amount()
 		.include_invoice_created_at()
-		.build_with_derived_key(&expanded_key, payer_nonce, payment_id, None)
+		.build_signed(None)
 		.unwrap();
 
 	// Check proof contents match the original payment
@@ -2864,30 +2867,37 @@ fn creates_payer_proof_with_note_and_selective_disclosure() {
 	let wrong_preimage = PaymentPreimage([0xDE; 32]);
 	assert!(invoice.payer_proof_builder(wrong_preimage).is_err());
 
-	// --- Test 2: Wrong payment_id causes key derivation failure ---
+	// --- Test 2: Wrong payment_id causes key derivation failure at construction ---
 	let expanded_key = bob.keys_manager.get_expanded_key();
+	let secp_ctx = Secp256k1::new();
 	let wrong_payment_id = PaymentId([0xFF; 32]);
-	let result = invoice.payer_proof_builder(payment_preimage).unwrap()
-		.build_with_derived_key(&expanded_key, payer_nonce, wrong_payment_id, None);
+	let result = invoice.payer_proof_builder_derived(
+		payment_preimage, &expanded_key, payer_nonce, wrong_payment_id, &secp_ctx,
+	);
 	assert!(matches!(result, Err(PayerProofError::KeyDerivationFailed)));
 
-	// --- Test 3: Wrong nonce causes key derivation failure ---
+	// --- Test 3: Wrong nonce causes key derivation failure at construction ---
 	let wrong_nonce = Nonce::from_entropy_source(&chanmon_cfgs[0].keys_manager);
-	let result = invoice.payer_proof_builder(payment_preimage).unwrap()
-		.build_with_derived_key(&expanded_key, wrong_nonce, payment_id, None);
+	let result = invoice.payer_proof_builder_derived(
+		payment_preimage, &expanded_key, wrong_nonce, payment_id, &secp_ctx,
+	);
 	assert!(matches!(result, Err(PayerProofError::KeyDerivationFailed)));
 
 	// --- Test 4: Minimal proof (only required fields) ---
-	let minimal_proof = invoice.payer_proof_builder(payment_preimage).unwrap()
-		.build_with_derived_key(&expanded_key, payer_nonce, payment_id, None)
+	let minimal_proof = invoice.payer_proof_builder_derived(
+		payment_preimage, &expanded_key, payer_nonce, payment_id, &secp_ctx,
+	).unwrap()
+		.build_signed(None)
 		.unwrap();
 	// --- Test 5: Proof with selective disclosure and payer note ---
-	let proof_with_note = invoice.payer_proof_builder(payment_preimage).unwrap()
+	let proof_with_note = invoice.payer_proof_builder_derived(
+		payment_preimage, &expanded_key, payer_nonce, payment_id, &secp_ctx,
+	).unwrap()
 		.include_offer_description()
 		.include_offer_issuer()
 		.include_invoice_amount()
 		.include_invoice_created_at()
-		.build_with_derived_key(&expanded_key, payer_nonce, payment_id, Some("Paid for coffee"))
+		.build_signed(Some("Paid for coffee"))
 		.unwrap();
 	assert_eq!(proof_with_note.payer_note().map(|p| p.0), Some("Paid for coffee"));
 

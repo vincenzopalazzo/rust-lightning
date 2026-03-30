@@ -987,6 +987,11 @@ impl Bolt12Invoice {
 		self.signature
 	}
 
+	/// The raw serialized bytes of the invoice.
+	pub(super) fn invoice_bytes(&self) -> &[u8] {
+		&self.bytes
+	}
+
 	/// Hash that was used for signing the invoice.
 	pub fn signable_hash(&self) -> [u8; 32] {
 		self.tagged_hash.as_digest().as_ref().clone()
@@ -1044,6 +1049,23 @@ impl Bolt12Invoice {
 		&self, preimage: PaymentPreimage,
 	) -> Result<PayerProofBuilder<'_>, PayerProofError> {
 		PayerProofBuilder::new(self, preimage)
+	}
+
+	/// Creates a [`PayerProofBuilder`] with a pre-derived signing keypair.
+	///
+	/// This eagerly derives the payer signing key, failing early if derivation fails.
+	/// The `nonce` and `payment_id` must be the same ones used when creating the original
+	/// invoice request (available from [`OffersContext::OutboundPaymentForOffer`]).
+	///
+	/// Use [`PayerProofBuilder::build_signed`] to build the proof.
+	///
+	/// [`PayerProofBuilder`]: crate::offers::payer_proof::PayerProofBuilder
+	/// [`OffersContext::OutboundPaymentForOffer`]: crate::blinded_path::message::OffersContext::OutboundPaymentForOffer
+	pub fn payer_proof_builder_derived<T: secp256k1::Signing>(
+		&self, preimage: PaymentPreimage, expanded_key: &ExpandedKey, nonce: Nonce,
+		payment_id: PaymentId, secp_ctx: &Secp256k1<T>,
+	) -> Result<PayerProofBuilder<'_>, PayerProofError> {
+		PayerProofBuilder::new_derived(self, preimage, expanded_key, nonce, payment_id, secp_ctx)
 	}
 
 	/// Re-derives the payer's signing keypair for payer proof creation.
