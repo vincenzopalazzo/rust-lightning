@@ -132,19 +132,36 @@ struct DisclosedFields {
 	invoice_created_at: Option<Duration>,
 }
 
+/// The signing key was explicitly provided.
+pub struct ExplicitSigningKey {}
+
+/// The signing key was derived from an [`ExpandedKey`] and [`Nonce`].
+pub struct DerivedSigningKey(Keypair);
+
 /// Builds a [`PayerProof`] from a paid invoice and its preimage.
 ///
 /// By default, only the required fields are included (payer_id, payment_hash,
 /// issuer_signing_pubkey). Additional fields can be included for selective disclosure
 /// using the `include_*` methods.
-pub struct PayerProofBuilder<'a> {
+pub struct PayerProofBuilder<'a, S: SigningStrategy> {
 	invoice: &'a Bolt12Invoice,
 	preimage: PaymentPreimage,
 	included_types: BTreeSet<u64>,
-	signing_keys: Option<Keypair>,
+	signing_strategy: S,
 }
 
-impl<'a> PayerProofBuilder<'a> {
+/// Sealed trait for signing strategy type-state.
+pub trait SigningStrategy: sealed_signing::Sealed {}
+impl SigningStrategy for ExplicitSigningKey {}
+impl SigningStrategy for DerivedSigningKey {}
+
+mod sealed_signing {
+	pub trait Sealed {}
+	impl Sealed for super::ExplicitSigningKey {}
+	impl Sealed for super::DerivedSigningKey {}
+}
+
+impl<'a> PayerProofBuilder<'a, ExplicitSigningKey> {
 	/// Create a new builder from a paid invoice and its preimage.
 	///
 	/// Returns an error if the preimage doesn't match the invoice's payment hash.
@@ -163,24 +180,33 @@ impl<'a> PayerProofBuilder<'a> {
 		included_types.insert(INVOICE_PAYMENT_HASH_TYPE);
 		included_types.insert(INVOICE_NODE_ID_TYPE);
 
-		// Per spec, invoice_features MUST be included "if present" — meaning if the
-		// TLV exists in the invoice byte stream, regardless of whether the parsed
-		// value is empty. Check the raw bytes so we handle invoices from other
-		// implementations that may serialize empty features.
 		let has_features_tlv =
 			TlvStream::new(invoice_bytes).any(|r| r.r#type == INVOICE_FEATURES_TYPE);
 		if has_features_tlv {
 			included_types.insert(INVOICE_FEATURES_TYPE);
 		}
 
-		Ok(Self { invoice, preimage, included_types, signing_keys: None })
+		Ok(Self { invoice, preimage, included_types, signing_strategy: ExplicitSigningKey {} })
 	}
 
+	/// Builds a signed [`PayerProof`] using the provided signing function.
+	///
+	/// Use this when you have direct access to the payer's signing key.
+	pub fn build<F>(self, sign_fn: F, note: Option<&str>) -> Result<PayerProof, PayerProofError>
+	where
+		F: FnOnce(&Message) -> Result<Signature, ()>,
+	{
+		let unsigned = self.build_unsigned()?;
+		unsigned.sign(sign_fn, note)
+	}
+}
+
+impl<'a> PayerProofBuilder<'a, DerivedSigningKey> {
 	/// Create a new builder from a paid invoice with a pre-derived signing keypair.
 	///
 	/// This eagerly derives the payer signing key using the same derivation scheme as
 	/// invoice requests created with `deriving_signing_pubkey`. Fails early if key
-	/// derivation fails rather than deferring to build time.
+	/// derivation fails.
 	///
 	/// The `nonce` and `payment_id` must be the same ones used when creating the original
 	/// invoice request (available from [`OffersContext::OutboundPaymentForOffer`]).
@@ -190,14 +216,41 @@ impl<'a> PayerProofBuilder<'a> {
 		invoice: &'a Bolt12Invoice, preimage: PaymentPreimage, expanded_key: &ExpandedKey,
 		nonce: Nonce, payment_id: PaymentId, secp_ctx: &Secp256k1<T>,
 	) -> Result<Self, PayerProofError> {
-		let mut builder = Self::new(invoice, preimage)?;
+		let computed_hash = sha256::Hash::hash(&preimage.0);
+		if computed_hash.as_byte_array() != &invoice.payment_hash().0 {
+			return Err(PayerProofError::PreimageMismatch);
+		}
+
 		let keys = invoice
 			.derive_payer_signing_keys(payment_id, nonce, expanded_key, secp_ctx)
 			.map_err(|_| PayerProofError::KeyDerivationFailed)?;
-		builder.signing_keys = Some(keys);
-		Ok(builder)
+
+		let invoice_bytes = invoice.invoice_bytes();
+
+		let mut included_types = BTreeSet::new();
+		included_types.insert(INVOICE_REQUEST_PAYER_ID_TYPE);
+		included_types.insert(INVOICE_PAYMENT_HASH_TYPE);
+		included_types.insert(INVOICE_NODE_ID_TYPE);
+
+		let has_features_tlv =
+			TlvStream::new(invoice_bytes).any(|r| r.r#type == INVOICE_FEATURES_TYPE);
+		if has_features_tlv {
+			included_types.insert(INVOICE_FEATURES_TYPE);
+		}
+
+		Ok(Self { invoice, preimage, included_types, signing_strategy: DerivedSigningKey(keys) })
 	}
 
+	/// Builds a signed [`PayerProof`] using the keypair derived at construction time.
+	pub fn build(self, note: Option<&str>) -> Result<PayerProof, PayerProofError> {
+		let secp_ctx = Secp256k1::signing_only();
+		let keys = self.signing_strategy.0;
+		let unsigned = self.build_unsigned()?;
+		unsigned.sign(|message| Ok(secp_ctx.sign_schnorr_no_aux_rand(message, &keys)), note)
+	}
+}
+
+impl<'a, S: SigningStrategy> PayerProofBuilder<'a, S> {
 	/// Include a specific TLV type in the proof.
 	///
 	/// Returns an error if the type is not allowed (e.g., invreq_metadata or
@@ -236,33 +289,6 @@ impl<'a> PayerProofBuilder<'a> {
 	pub fn include_invoice_created_at(mut self) -> Self {
 		self.included_types.insert(INVOICE_CREATED_AT_TYPE);
 		self
-	}
-
-	/// Builds a signed [`PayerProof`] using the provided signing function.
-	///
-	/// Use this when you have direct access to the payer's signing key.
-	pub fn build<F>(self, sign_fn: F, note: Option<&str>) -> Result<PayerProof, PayerProofError>
-	where
-		F: FnOnce(&Message) -> Result<Signature, ()>,
-	{
-		let unsigned = self.build_unsigned()?;
-		unsigned.sign(sign_fn, note)
-	}
-
-	/// Builds a signed [`PayerProof`] using the keypair provided at construction time.
-	///
-	/// The builder must have been created with [`Bolt12Invoice::payer_proof_builder_derived`]
-	/// which derives the signing key eagerly.
-	///
-	/// Returns [`PayerProofError::KeyDerivationFailed`] if the builder was not constructed
-	/// with a derived keypair.
-	pub fn build_signed(
-		self, note: Option<&str>,
-	) -> Result<PayerProof, PayerProofError> {
-		let keys = self.signing_keys.ok_or(PayerProofError::KeyDerivationFailed)?;
-		let secp_ctx = Secp256k1::signing_only();
-		let unsigned = self.build_unsigned()?;
-		unsigned.sign(|message| Ok(secp_ctx.sign_schnorr_no_aux_rand(message, &keys)), note)
 	}
 
 	fn build_unsigned(self) -> Result<UnsignedPayerProof<'a>, PayerProofError> {
@@ -1594,7 +1620,7 @@ mod tests {
 		let proof = invoice
 			.payer_proof_builder_derived(preimage, &expanded_key, nonce, payment_id, &secp_ctx)
 			.unwrap()
-			.build_signed(Some("refund"))
+			.build(Some("refund"))
 			.unwrap();
 		let parsed = PayerProof::try_from(proof.bytes().to_vec()).unwrap();
 

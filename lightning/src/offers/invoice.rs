@@ -141,7 +141,9 @@ use crate::offers::offer::{
 };
 use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
 use crate::offers::payer::{PayerTlvStream, PayerTlvStreamRef, PAYER_METADATA_TYPE};
-use crate::offers::payer_proof::{PayerProofBuilder, PayerProofError};
+use crate::offers::payer_proof::{
+	DerivedSigningKey, ExplicitSigningKey, PayerProofBuilder, PayerProofError,
+};
 use crate::offers::refund::{
 	Refund, RefundContents, IV_BYTES_WITHOUT_METADATA as REFUND_IV_BYTES_WITHOUT_METADATA,
 	IV_BYTES_WITH_METADATA as REFUND_IV_BYTES_WITH_METADATA,
@@ -1047,7 +1049,7 @@ impl Bolt12Invoice {
 	/// [`PayerProofBuilder`]: crate::offers::payer_proof::PayerProofBuilder
 	pub fn payer_proof_builder(
 		&self, preimage: PaymentPreimage,
-	) -> Result<PayerProofBuilder<'_>, PayerProofError> {
+	) -> Result<PayerProofBuilder<'_, ExplicitSigningKey>, PayerProofError> {
 		PayerProofBuilder::new(self, preimage)
 	}
 
@@ -1057,14 +1059,12 @@ impl Bolt12Invoice {
 	/// The `nonce` and `payment_id` must be the same ones used when creating the original
 	/// invoice request (available from [`OffersContext::OutboundPaymentForOffer`]).
 	///
-	/// Use [`PayerProofBuilder::build_signed`] to build the proof.
-	///
 	/// [`PayerProofBuilder`]: crate::offers::payer_proof::PayerProofBuilder
 	/// [`OffersContext::OutboundPaymentForOffer`]: crate::blinded_path::message::OffersContext::OutboundPaymentForOffer
 	pub fn payer_proof_builder_derived<T: secp256k1::Signing>(
 		&self, preimage: PaymentPreimage, expanded_key: &ExpandedKey, nonce: Nonce,
 		payment_id: PaymentId, secp_ctx: &Secp256k1<T>,
-	) -> Result<PayerProofBuilder<'_>, PayerProofError> {
+	) -> Result<PayerProofBuilder<'_, DerivedSigningKey>, PayerProofError> {
 		PayerProofBuilder::new_derived(self, preimage, expanded_key, nonce, payment_id, secp_ctx)
 	}
 
