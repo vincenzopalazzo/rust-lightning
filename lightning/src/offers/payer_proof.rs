@@ -397,7 +397,9 @@ impl UnsignedPayerProof<'_> {
 		}
 
 		BigSize(TLV_SIGNATURE).write(&mut bytes).expect("Vec write should not fail");
-		BigSize(SCHNORR_SIGNATURE_SIZE as u64).write(&mut bytes).expect("Vec write should not fail");
+		BigSize(SCHNORR_SIGNATURE_SIZE as u64)
+			.write(&mut bytes)
+			.expect("Vec write should not fail");
 		self.invoice_signature.write(&mut bytes).expect("Vec write should not fail");
 
 		BigSize(TLV_PREIMAGE).write(&mut bytes).expect("Vec write should not fail");
@@ -958,7 +960,8 @@ mod tests {
 			TlvStream::new(&invoice_bytes).filter(|r| included_types.contains(&r.r#type)),
 		)
 		.unwrap();
-		let disclosure = compute_selective_disclosure(TlvStream::new(&invoice_bytes), &included_types).unwrap();
+		let disclosure =
+			compute_selective_disclosure(TlvStream::new(&invoice_bytes), &included_types).unwrap();
 
 		let unsigned = UnsignedPayerProof {
 			invoice_signature,
@@ -1012,7 +1015,8 @@ mod tests {
 			TlvStream::new(&invoice_bytes).filter(|r| included_types.contains(&r.r#type)),
 		)
 		.unwrap();
-		let disclosure = compute_selective_disclosure(TlvStream::new(&invoice_bytes), &included_types).unwrap();
+		let disclosure =
+			compute_selective_disclosure(TlvStream::new(&invoice_bytes), &included_types).unwrap();
 		assert_eq!(disclosure.omitted_markers, vec![177, 178]);
 
 		let unsigned = UnsignedPayerProof {
@@ -1084,7 +1088,8 @@ mod tests {
 			TlvStream::new(&invoice_bytes).filter(|r| included_types.contains(&r.r#type)),
 		)
 		.unwrap();
-		let disclosure = compute_selective_disclosure(TlvStream::new(&invoice_bytes), &included_types).unwrap();
+		let disclosure =
+			compute_selective_disclosure(TlvStream::new(&invoice_bytes), &included_types).unwrap();
 
 		let unsigned = UnsignedPayerProof {
 			invoice_signature,
@@ -1161,7 +1166,8 @@ mod tests {
 		included.insert(10);
 		included.insert(40);
 
-		let disclosure = compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
+		let disclosure =
+			compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
 		// Per spec example, omitted_markers should be [11, 12, 41, 42]
 		assert_eq!(disclosure.omitted_markers, vec![11, 12, 41, 42]);
@@ -1183,7 +1189,8 @@ mod tests {
 		let mut included = BTreeSet::new();
 		included.insert(10);
 
-		let disclosure = compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
+		let disclosure =
+			compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
 		// After included type 10, omitted types 20 and 30 get markers 11 and 12
 		assert_eq!(disclosure.omitted_markers, vec![11, 12]);
@@ -1201,7 +1208,8 @@ mod tests {
 		included.insert(10);
 		included.insert(20);
 
-		let disclosure = compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
+		let disclosure =
+			compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
 		// Only TLV 0 is omitted (implicit), so no markers needed
 		assert!(disclosure.omitted_markers.is_empty());

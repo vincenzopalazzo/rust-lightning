@@ -1031,7 +1031,8 @@ mod tests {
 		included.insert(40);
 
 		// Compute selective disclosure
-		let disclosure = super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
+		let disclosure =
+			super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
 		// Verify markers match spec example
 		assert_eq!(disclosure.omitted_markers, vec![11, 12, 41, 42]);
@@ -1040,9 +1041,8 @@ mod tests {
 		assert_eq!(disclosure.leaf_hashes.len(), 2);
 
 		// Collect included records for reconstruction
-		let included_records: Vec<super::TlvRecord<'_>> = TlvStream::new(&tlv_bytes)
-			.filter(|r| included.contains(&r.r#type))
-			.collect();
+		let included_records: Vec<super::TlvRecord<'_>> =
+			TlvStream::new(&tlv_bytes).filter(|r| included.contains(&r.r#type)).collect();
 
 		// Reconstruct merkle root
 		let reconstructed = super::reconstruct_merkle_root(
@@ -1089,7 +1089,8 @@ mod tests {
 		included.insert(10);
 		included.insert(40);
 
-		let disclosure = super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
+		let disclosure =
+			super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
 		// We should have 4 missing hashes for omitted types:
 		// - type 0 (single leaf)
@@ -1106,9 +1107,8 @@ mod tests {
 		);
 
 		// Verify the round-trip still works with the correct ordering
-		let included_records: Vec<super::TlvRecord<'_>> = TlvStream::new(&tlv_bytes)
-			.filter(|r| included.contains(&r.r#type))
-			.collect();
+		let included_records: Vec<super::TlvRecord<'_>> =
+			TlvStream::new(&tlv_bytes).filter(|r| included.contains(&r.r#type)).collect();
 
 		let reconstructed = super::reconstruct_merkle_root(
 			&included_records,
@@ -1134,11 +1134,11 @@ mod tests {
 		let mut included = BTreeSet::new();
 		included.insert(10);
 
-		let disclosure = super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
+		let disclosure =
+			super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
-		let included_records: Vec<super::TlvRecord<'_>> = TlvStream::new(&tlv_bytes)
-			.filter(|r| included.contains(&r.r#type))
-			.collect();
+		let included_records: Vec<super::TlvRecord<'_>> =
+			TlvStream::new(&tlv_bytes).filter(|r| included.contains(&r.r#type)).collect();
 
 		// Try with empty missing_hashes (should fail)
 		let result = super::reconstruct_merkle_root(
