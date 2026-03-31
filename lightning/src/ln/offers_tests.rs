@@ -2771,7 +2771,7 @@ fn creates_and_verifies_payer_proof_after_offer_payment() {
 		.include_offer_description()
 		.include_invoice_amount()
 		.include_invoice_created_at()
-		.build(None)
+		.build_and_sign(None)
 		.unwrap();
 
 	// Check proof contents match the original payment
@@ -2887,7 +2887,7 @@ fn creates_payer_proof_with_note_and_selective_disclosure() {
 	let minimal_proof = invoice.payer_proof_builder_derived(
 		payment_preimage, &expanded_key, payer_nonce, payment_id, &secp_ctx,
 	).unwrap()
-		.build(None)
+		.build_and_sign(None)
 		.unwrap();
 	// --- Test 5: Proof with selective disclosure and payer note ---
 	let proof_with_note = invoice.payer_proof_builder_derived(
@@ -2897,7 +2897,7 @@ fn creates_payer_proof_with_note_and_selective_disclosure() {
 		.include_offer_issuer()
 		.include_invoice_amount()
 		.include_invoice_created_at()
-		.build(Some("Paid for coffee"))
+		.build_and_sign(Some("Paid for coffee"))
 		.unwrap();
 	assert_eq!(proof_with_note.payer_note().map(|p| p.0), Some("Paid for coffee"));
 

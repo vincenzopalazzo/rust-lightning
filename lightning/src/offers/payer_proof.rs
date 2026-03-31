@@ -35,7 +35,9 @@ use crate::offers::offer::{OFFER_DESCRIPTION_TYPE, OFFER_ISSUER_TYPE};
 use crate::offers::parse::Bech32Encode;
 use crate::offers::payer::PAYER_METADATA_TYPE;
 use crate::types::payment::{PaymentHash, PaymentPreimage};
-use crate::util::ser::{BigSize, HighZeroBytesDroppedBigSize, Readable, Writeable};
+use crate::util::ser::{
+	BigSize, HighZeroBytesDroppedBigSize, LengthReadable, Readable, WithoutLength, Writeable,
+};
 use lightning_types::string::PrintableString;
 
 use bitcoin::hashes::{sha256, Hash, HashEngine};
@@ -208,10 +210,9 @@ impl<'a> PayerProofBuilder<'a, DerivedSigningKey> {
 	/// invoice requests created with `deriving_signing_pubkey`. Fails early if key
 	/// derivation fails.
 	///
-	/// The `nonce` and `payment_id` must be the same ones used when creating the original
-	/// invoice request (available from [`OffersContext::OutboundPaymentForOffer`]).
+	/// The `nonce` and `payment_id` are available from [`Event::PaymentSent`].
 	///
-	/// [`OffersContext::OutboundPaymentForOffer`]: crate::blinded_path::message::OffersContext::OutboundPaymentForOffer
+	/// [`Event::PaymentSent`]: crate::events::Event::PaymentSent
 	pub(super) fn new_derived<T: secp256k1::Signing>(
 		invoice: &'a Bolt12Invoice, preimage: PaymentPreimage, expanded_key: &ExpandedKey,
 		nonce: Nonce, payment_id: PaymentId, secp_ctx: &Secp256k1<T>,
@@ -241,8 +242,8 @@ impl<'a> PayerProofBuilder<'a, DerivedSigningKey> {
 		Ok(Self { invoice, preimage, included_types, signing_strategy: DerivedSigningKey(keys) })
 	}
 
-	/// Builds a signed [`PayerProof`] using the keypair derived at construction time.
-	pub fn build(self, note: Option<&str>) -> Result<PayerProof, PayerProofError> {
+	/// Builds and signs a [`PayerProof`] using the keypair derived at construction time.
+	pub fn build_and_sign(self, note: Option<&str>) -> Result<PayerProof, PayerProofError> {
 		let secp_ctx = Secp256k1::signing_only();
 		let keys = self.signing_strategy.0;
 		let unsigned = self.build_unsigned()?;
@@ -384,7 +385,8 @@ impl UnsignedPayerProof<'_> {
 	}
 
 	fn serialize_payer_proof(&self, payer_signature: &Signature, note: Option<&str>) -> Vec<u8> {
-		let mut bytes = Vec::with_capacity(self.invoice_bytes.len());
+		const PAYER_PROOF_ALLOCATION_SIZE: usize = 512;
+		let mut bytes = Vec::with_capacity(PAYER_PROOF_ALLOCATION_SIZE);
 
 		// Preserve TLV ordering by emitting included invoice records below the
 		// payer-proof range first, then payer-proof TLVs (240..=250), then any
@@ -397,7 +399,7 @@ impl UnsignedPayerProof<'_> {
 		}
 
 		BigSize(TLV_SIGNATURE).write(&mut bytes).expect("Vec write should not fail");
-		BigSize(SCHNORR_SIGNATURE_SIZE as u64)
+		BigSize(self.invoice_signature.serialized_length() as u64)
 			.write(&mut bytes)
 			.expect("Vec write should not fail");
 		self.invoice_signature.write(&mut bytes).expect("Vec write should not fail");
@@ -423,25 +425,27 @@ impl UnsignedPayerProof<'_> {
 		}
 
 		if !self.disclosure.missing_hashes.is_empty() {
-			let len = self.disclosure.missing_hashes.len() * 32;
 			BigSize(TLV_MISSING_HASHES).write(&mut bytes).expect("Vec write should not fail");
-			BigSize(len as u64).write(&mut bytes).expect("Vec write should not fail");
-			for hash in &self.disclosure.missing_hashes {
-				hash.as_byte_array().write(&mut bytes).expect("Vec write should not fail");
-			}
+			BigSize(WithoutLength(&self.disclosure.missing_hashes).serialized_length() as u64)
+				.write(&mut bytes)
+				.expect("Vec write should not fail");
+			WithoutLength(&self.disclosure.missing_hashes)
+				.write(&mut bytes)
+				.expect("Vec write should not fail");
 		}
 
 		if !self.disclosure.leaf_hashes.is_empty() {
-			let len = self.disclosure.leaf_hashes.len() * 32;
 			BigSize(TLV_LEAF_HASHES).write(&mut bytes).expect("Vec write should not fail");
-			BigSize(len as u64).write(&mut bytes).expect("Vec write should not fail");
-			for hash in &self.disclosure.leaf_hashes {
-				hash.as_byte_array().write(&mut bytes).expect("Vec write should not fail");
-			}
+			BigSize(WithoutLength(&self.disclosure.leaf_hashes).serialized_length() as u64)
+				.write(&mut bytes)
+				.expect("Vec write should not fail");
+			WithoutLength(&self.disclosure.leaf_hashes)
+				.write(&mut bytes)
+				.expect("Vec write should not fail");
 		}
 
 		let note_bytes = note.map(|n| n.as_bytes()).unwrap_or(&[]);
-		let payer_sig_len = SCHNORR_SIGNATURE_SIZE + note_bytes.len();
+		let payer_sig_len = payer_signature.serialized_length() + note_bytes.len();
 		BigSize(TLV_PAYER_SIGNATURE).write(&mut bytes).expect("Vec write should not fail");
 		BigSize(payer_sig_len as u64).write(&mut bytes).expect("Vec write should not fail");
 		payer_signature.write(&mut bytes).expect("Vec write should not fail");
@@ -681,24 +685,16 @@ impl TryFrom<Vec<u8>> for PayerProof {
 					}
 				},
 				TLV_MISSING_HASHES => {
-					if record.value_bytes.len() % 32 != 0 {
-						return Err(Bolt12ParseError::Decode(DecodeError::InvalidValue));
-					}
-					let mut cursor = io::Cursor::new(record.value_bytes);
-					while (cursor.position() as usize) < record.value_bytes.len() {
-						let hash_bytes: [u8; 32] = Readable::read(&mut cursor)?;
-						missing_hashes.push(sha256::Hash::from_byte_array(hash_bytes));
-					}
+					let WithoutLength(hashes) = LengthReadable::read_from_fixed_length_buffer(
+						&mut &record.value_bytes[..],
+					)?;
+					missing_hashes = hashes;
 				},
 				TLV_LEAF_HASHES => {
-					if record.value_bytes.len() % 32 != 0 {
-						return Err(Bolt12ParseError::Decode(DecodeError::InvalidValue));
-					}
-					let mut cursor = io::Cursor::new(record.value_bytes);
-					while (cursor.position() as usize) < record.value_bytes.len() {
-						let hash_bytes: [u8; 32] = Readable::read(&mut cursor)?;
-						leaf_hashes.push(sha256::Hash::from_byte_array(hash_bytes));
-					}
+					let WithoutLength(hashes) = LengthReadable::read_from_fixed_length_buffer(
+						&mut &record.value_bytes[..],
+					)?;
+					leaf_hashes = hashes;
 				},
 				TLV_PAYER_SIGNATURE => {
 					if record.value_bytes.len() < SCHNORR_SIGNATURE_SIZE {
@@ -1628,7 +1624,7 @@ mod tests {
 		let proof = invoice
 			.payer_proof_builder_derived(preimage, &expanded_key, nonce, payment_id, &secp_ctx)
 			.unwrap()
-			.build(Some("refund"))
+			.build_and_sign(Some("refund"))
 			.unwrap();
 		let parsed = PayerProof::try_from(proof.bytes().to_vec()).unwrap();
 

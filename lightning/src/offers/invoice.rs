@@ -1056,11 +1056,10 @@ impl Bolt12Invoice {
 	/// Creates a [`PayerProofBuilder`] with a pre-derived signing keypair.
 	///
 	/// This eagerly derives the payer signing key, failing early if derivation fails.
-	/// The `nonce` and `payment_id` must be the same ones used when creating the original
-	/// invoice request (available from [`OffersContext::OutboundPaymentForOffer`]).
+	/// The `nonce` and `payment_id` are available from [`Event::PaymentSent`].
 	///
 	/// [`PayerProofBuilder`]: crate::offers::payer_proof::PayerProofBuilder
-	/// [`OffersContext::OutboundPaymentForOffer`]: crate::blinded_path::message::OffersContext::OutboundPaymentForOffer
+	/// [`Event::PaymentSent`]: crate::events::Event::PaymentSent
 	pub fn payer_proof_builder_derived<T: secp256k1::Signing>(
 		&self, preimage: PaymentPreimage, expanded_key: &ExpandedKey, nonce: Nonce,
 		payment_id: PaymentId, secp_ctx: &Secp256k1<T>,

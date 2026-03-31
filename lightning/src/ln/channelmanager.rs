@@ -5495,7 +5495,7 @@ impl<
 							first_hop_htlc_msat: htlc_msat,
 							payment_id,
 							bolt12_invoice: bolt12_invoice.cloned(),
-							payment_nonce: payment_nonce.copied(),
+							payment_nonce,
 						};
 						let send_res = chan.send_htlc_and_commit(
 							htlc_msat,

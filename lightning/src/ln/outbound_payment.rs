@@ -941,7 +941,7 @@ pub(super) struct SendAlongPathArgs<'a> {
 	pub keysend_preimage: &'a Option<PaymentPreimage>,
 	pub invoice_request: Option<&'a InvoiceRequest>,
 	pub bolt12_invoice: Option<&'a PaidBolt12Invoice>,
-	pub payment_nonce: Option<&'a Nonce>,
+	pub payment_nonce: Option<Nonce>,
 	pub session_priv_bytes: [u8; 32],
 	pub hold_htlc_at_next_hop: bool,
 }
@@ -1229,7 +1229,7 @@ impl OutboundPayments {
 
 		let result = self.pay_route_internal(
 			&route, payment_hash, &recipient_onion, keysend_preimage, invoice_request, Some(&bolt12_invoice),
-			payment_nonce.as_ref(), payment_id,
+			payment_nonce, payment_id,
 			&onion_session_privs, hold_htlcs_at_next_hop, node_signer,
 			best_block_height, &send_payment_along_path
 		);
@@ -1774,7 +1774,7 @@ impl OutboundPayments {
 			}
 		};
 		let res = self.pay_route_internal(&route, payment_hash, &recipient_onion, keysend_preimage,
-			invoice_request.as_ref(), bolt12_invoice.as_ref(), payment_nonce.as_ref(),
+			invoice_request.as_ref(), bolt12_invoice.as_ref(), payment_nonce,
 			payment_id,
 			&onion_session_privs, false, node_signer, best_block_height, &send_payment_along_path);
 		log_info!(logger, "Result retrying payment id {}: {:?}", &payment_id, res);
@@ -2182,7 +2182,7 @@ impl OutboundPayments {
 	fn pay_route_internal<NS: NodeSigner, F>(
 		&self, route: &Route, payment_hash: PaymentHash, recipient_onion: &RecipientOnionFields,
 		keysend_preimage: Option<PaymentPreimage>, invoice_request: Option<&InvoiceRequest>, bolt12_invoice: Option<&PaidBolt12Invoice>,
-		payment_nonce: Option<&Nonce>,
+		payment_nonce: Option<Nonce>,
 		payment_id: PaymentId, onion_session_privs: &Vec<[u8; 32]>,
 		hold_htlcs_at_next_hop: bool, node_signer: &NS, best_block_height: u32, send_payment_along_path: &F
 	) -> Result<(), PaymentSendFailure>

@@ -737,7 +737,7 @@ fn reconstruct_positions(included_types: &[u64], omitted_markers: &[u64]) -> Vec
 
 #[cfg(test)]
 mod tests {
-	use super::{TlvStream, SIGNATURE_TYPES};
+	use super::{TlvRecord, TlvStream, SIGNATURE_TYPES};
 
 	use crate::ln::channelmanager::PaymentId;
 	use crate::ln::inbound_payment::ExpandedKey;
@@ -1041,7 +1041,7 @@ mod tests {
 		assert_eq!(disclosure.leaf_hashes.len(), 2);
 
 		// Collect included records for reconstruction
-		let included_records: Vec<super::TlvRecord<'_>> =
+		let included_records: Vec<TlvRecord<'_>> =
 			TlvStream::new(&tlv_bytes).filter(|r| included.contains(&r.r#type)).collect();
 
 		// Reconstruct merkle root
@@ -1107,7 +1107,7 @@ mod tests {
 		);
 
 		// Verify the round-trip still works with the correct ordering
-		let included_records: Vec<super::TlvRecord<'_>> =
+		let included_records: Vec<TlvRecord<'_>> =
 			TlvStream::new(&tlv_bytes).filter(|r| included.contains(&r.r#type)).collect();
 
 		let reconstructed = super::reconstruct_merkle_root(
@@ -1137,7 +1137,7 @@ mod tests {
 		let disclosure =
 			super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
-		let included_records: Vec<super::TlvRecord<'_>> =
+		let included_records: Vec<TlvRecord<'_>> =
 			TlvStream::new(&tlv_bytes).filter(|r| included.contains(&r.r#type)).collect();
 
 		// Try with empty missing_hashes (should fail)
