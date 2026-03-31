@@ -19,7 +19,6 @@
 
 use alloc::collections::BTreeSet;
 
-use crate::io;
 use crate::ln::channelmanager::PaymentId;
 use crate::ln::inbound_payment::ExpandedKey;
 use crate::offers::invoice::{
@@ -411,17 +410,13 @@ impl UnsignedPayerProof<'_> {
 		self.preimage.write(&mut bytes).expect("Vec write should not fail");
 
 		if !self.disclosure.omitted_markers.is_empty() {
-			let omitted_len: u64 = self
-				.disclosure
-				.omitted_markers
-				.iter()
-				.map(|m| BigSize(*m).serialized_length() as u64)
-				.sum();
+			let markers: Vec<BigSize> =
+				self.disclosure.omitted_markers.iter().map(|m| BigSize(*m)).collect();
 			BigSize(PAYER_PROOF_OMITTED_TLVS_TYPE).write(&mut bytes).expect("Vec write should not fail");
-			BigSize(omitted_len).write(&mut bytes).expect("Vec write should not fail");
-			for marker in &self.disclosure.omitted_markers {
-				BigSize(*marker).write(&mut bytes).expect("Vec write should not fail");
-			}
+			BigSize(WithoutLength(&markers).serialized_length() as u64)
+				.write(&mut bytes)
+				.expect("Vec write should not fail");
+			WithoutLength(&markers).write(&mut bytes).expect("Vec write should not fail");
 		}
 
 		if !self.disclosure.missing_hashes.is_empty() {
@@ -663,11 +658,11 @@ impl TryFrom<Vec<u8>> for PayerProof {
 					preimage = Some(record.read_value()?);
 				},
 				PAYER_PROOF_OMITTED_TLVS_TYPE => {
-					let mut cursor = io::Cursor::new(record.value_bytes);
-					while (cursor.position() as usize) < record.value_bytes.len() {
-						let marker: BigSize = Readable::read(&mut cursor)?;
-						omitted_markers.push(marker.0);
-					}
+					let WithoutLength(markers): WithoutLength<Vec<BigSize>> =
+						LengthReadable::read_from_fixed_length_buffer(
+							&mut &record.value_bytes[..],
+						)?;
+					omitted_markers = markers.into_iter().map(|m| m.0).collect();
 				},
 				PAYER_PROOF_MISSING_HASHES_TYPE => {
 					let WithoutLength(hashes) = LengthReadable::read_from_fixed_length_buffer(
@@ -685,14 +680,15 @@ impl TryFrom<Vec<u8>> for PayerProof {
 					if record.value_bytes.len() < SCHNORR_SIGNATURE_SIZE {
 						return Err(Bolt12ParseError::Decode(DecodeError::InvalidValue));
 					}
-					let mut cursor = io::Cursor::new(record.value_bytes);
-					payer_signature = Some(Readable::read(&mut cursor)?);
+					payer_signature = Some(Readable::read(
+						&mut &record.value_bytes[..SCHNORR_SIGNATURE_SIZE],
+					)?);
 					if record.value_bytes.len() > SCHNORR_SIGNATURE_SIZE {
-						let note_bytes = &record.value_bytes[SCHNORR_SIGNATURE_SIZE..];
-						payer_signature_note = Some(
-							String::from_utf8(note_bytes.to_vec())
-								.map_err(|_| DecodeError::InvalidValue)?,
-						);
+						let WithoutLength(note): WithoutLength<String> =
+							LengthReadable::read_from_fixed_length_buffer(
+								&mut &record.value_bytes[SCHNORR_SIGNATURE_SIZE..],
+							)?;
+						payer_signature_note = Some(note);
 					}
 				},
 				_ => {

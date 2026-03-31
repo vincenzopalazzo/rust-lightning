@@ -2775,11 +2775,11 @@ fn creates_and_verifies_payer_proof_after_offer_payment() {
 		.unwrap();
 
 	// Check proof contents match the original payment
-	assert_eq!(proof.preimage(), payment_preimage);
+	assert_eq!(proof.payment_preimage(), payment_preimage);
 	assert_eq!(proof.payment_hash(), invoice.payment_hash());
 	assert_eq!(proof.payer_id(), invoice.payer_signing_pubkey());
 	assert_eq!(proof.issuer_signing_pubkey(), invoice.signing_pubkey());
-	assert!(proof.payer_note().is_none());
+	assert!(proof.payer_signature_note().is_none());
 
 	// --- Serialization Round-Trip ---
 	// The proof can be serialized to a bech32 string (lnp...) for sharing.
@@ -2788,7 +2788,7 @@ fn creates_and_verifies_payer_proof_after_offer_payment() {
 
 	// Round-trip through TLV bytes: re-parse the raw bytes (verification happens at parse time).
 	let decoded = PayerProof::try_from(proof.bytes().to_vec()).unwrap();
-	assert_eq!(decoded.preimage(), proof.preimage());
+	assert_eq!(decoded.payment_preimage(), proof.payment_preimage());
 	assert_eq!(decoded.payment_hash(), proof.payment_hash());
 	assert_eq!(decoded.payer_id(), proof.payer_id());
 	assert_eq!(decoded.issuer_signing_pubkey(), proof.issuer_signing_pubkey());
@@ -2899,10 +2899,10 @@ fn creates_payer_proof_with_note_and_selective_disclosure() {
 		.include_invoice_created_at()
 		.build_and_sign(Some("Paid for coffee"))
 		.unwrap();
-	assert_eq!(proof_with_note.payer_note().map(|p| p.0), Some("Paid for coffee"));
+	assert_eq!(proof_with_note.payer_signature_note().map(|p| p.0), Some("Paid for coffee"));
 
 	// Both proofs should verify and have the same core fields
-	assert_eq!(minimal_proof.preimage(), proof_with_note.preimage());
+	assert_eq!(minimal_proof.payment_preimage(), proof_with_note.payment_preimage());
 	assert_eq!(minimal_proof.payment_hash(), proof_with_note.payment_hash());
 	assert_eq!(minimal_proof.payer_id(), proof_with_note.payer_id());
 	assert_eq!(minimal_proof.issuer_signing_pubkey(), proof_with_note.issuer_signing_pubkey());
@@ -2915,6 +2915,6 @@ fn creates_payer_proof_with_note_and_selective_disclosure() {
 	assert!(encoded.starts_with("lnp1"));
 
 	let decoded = PayerProof::try_from(proof_with_note.bytes().to_vec()).unwrap();
-	assert_eq!(decoded.payer_note().map(|p| p.0), Some("Paid for coffee"));
-	assert_eq!(decoded.preimage(), payment_preimage);
+	assert_eq!(decoded.payer_signature_note().map(|p| p.0), Some("Paid for coffee"));
+	assert_eq!(decoded.payment_preimage(), payment_preimage);
 }
