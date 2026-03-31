@@ -234,6 +234,38 @@ impl<'a> TlvStream<'a> {
 		Self { data: io::Cursor::new(data) }
 	}
 
+	/// Validates that the byte slice is a well-formed TLV stream.
+	///
+	/// [`TlvStream::new`] assumes well-formed input and will panic on malformed BigSize
+	/// values or out-of-bounds lengths. This method validates the framing first,
+	/// returning `false` instead of panicking on untrusted input.
+	pub fn is_valid(data: &[u8]) -> bool {
+		let mut cursor = io::Cursor::new(data);
+		while (cursor.position() as usize) < data.len() {
+			let _type: BigSize = match Readable::read(&mut cursor) {
+				Ok(t) => t,
+				Err(_) => return false,
+			};
+			let length: BigSize = match Readable::read(&mut cursor) {
+				Ok(l) => l,
+				Err(_) => return false,
+			};
+			let end = match cursor.position().checked_add(length.0) {
+				Some(e) => e,
+				None => return false,
+			};
+			let end_usize = match usize::try_from(end) {
+				Ok(e) => e,
+				Err(_) => return false,
+			};
+			if end_usize > data.len() {
+				return false;
+			}
+			cursor.set_position(end);
+		}
+		true
+	}
+
 	pub fn range<T>(self, types: T) -> impl core::iter::Iterator<Item = TlvRecord<'a>>
 	where
 		T: core::ops::RangeBounds<u64> + Clone,
