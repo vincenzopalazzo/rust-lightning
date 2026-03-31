@@ -410,13 +410,17 @@ impl UnsignedPayerProof<'_> {
 		self.preimage.write(&mut bytes).expect("Vec write should not fail");
 
 		if !self.disclosure.omitted_markers.is_empty() {
-			let markers: Vec<BigSize> =
-				self.disclosure.omitted_markers.iter().map(|m| BigSize(*m)).collect();
+			let omitted_len: u64 = self
+				.disclosure
+				.omitted_markers
+				.iter()
+				.map(|m| BigSize(*m).serialized_length() as u64)
+				.sum();
 			BigSize(PAYER_PROOF_OMITTED_TLVS_TYPE).write(&mut bytes).expect("Vec write should not fail");
-			BigSize(WithoutLength(&markers).serialized_length() as u64)
-				.write(&mut bytes)
-				.expect("Vec write should not fail");
-			WithoutLength(&markers).write(&mut bytes).expect("Vec write should not fail");
+			BigSize(omitted_len).write(&mut bytes).expect("Vec write should not fail");
+			for marker in &self.disclosure.omitted_markers {
+				BigSize(*marker).write(&mut bytes).expect("Vec write should not fail");
+			}
 		}
 
 		if !self.disclosure.missing_hashes.is_empty() {
@@ -658,11 +662,16 @@ impl TryFrom<Vec<u8>> for PayerProof {
 					preimage = Some(record.read_value()?);
 				},
 				PAYER_PROOF_OMITTED_TLVS_TYPE => {
+					// Read as BigSize per spec (`[...*bigsize:missing]`), then
+					// convert to u64 for internal use in marker logic.
 					let WithoutLength(markers): WithoutLength<Vec<BigSize>> =
 						LengthReadable::read_from_fixed_length_buffer(
 							&mut &record.value_bytes[..],
 						)?;
-					omitted_markers = markers.into_iter().map(|m| m.0).collect();
+					omitted_markers.reserve(markers.len());
+					for m in markers {
+						omitted_markers.push(m.0);
+					}
 				},
 				PAYER_PROOF_MISSING_HASHES_TYPE => {
 					let WithoutLength(hashes) = LengthReadable::read_from_fixed_length_buffer(
