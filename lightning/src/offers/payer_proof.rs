@@ -1797,4 +1797,257 @@ mod tests {
 		assert_eq!(parsed.payment_hash(), payment_hash);
 		assert_eq!(parsed.payer_note().map(|note| note.to_string()), Some("refund".to_string()));
 	}
+
+	// Minimal JSON value type for parsing the payer proof test vectors without external deps.
+	enum Json {
+		Str(String),
+		Num(u64),
+		Bool(bool),
+		Arr(Vec<Json>),
+		Obj(std::collections::BTreeMap<String, Json>),
+	}
+
+	impl Json {
+		fn parse(s: &str) -> Self {
+			Self::parse_val(&mut s.chars().peekable())
+		}
+
+		fn skip_ws(it: &mut std::iter::Peekable<std::str::Chars>) {
+			while matches!(it.peek(), Some(' ' | '\n' | '\r' | '\t')) {
+				it.next();
+			}
+		}
+
+		fn parse_val(it: &mut std::iter::Peekable<std::str::Chars>) -> Self {
+			Self::skip_ws(it);
+			match it.peek().copied() {
+				Some('"') => Json::Str(Self::parse_str(it)),
+				Some('{') => Json::Obj(Self::parse_obj(it)),
+				Some('[') => Json::Arr(Self::parse_arr(it)),
+				Some('t') => {
+					for _ in 0..4 { it.next(); }
+					Json::Bool(true)
+				},
+				Some('f') => {
+					for _ in 0..5 { it.next(); }
+					Json::Bool(false)
+				},
+				Some('0'..='9') => Json::Num(Self::parse_num(it)),
+				c => panic!("unexpected char {:?}", c),
+			}
+		}
+
+		fn parse_str(it: &mut std::iter::Peekable<std::str::Chars>) -> String {
+			it.next(); // consume '"'
+			let mut s = String::new();
+			loop {
+				match it.next() {
+					Some('"') => break,
+					Some('\\') => match it.next() {
+						Some('"') => s.push('"'),
+						Some('\\') => s.push('\\'),
+						Some('n') => s.push('\n'),
+						Some(c) => { s.push('\\'); s.push(c); },
+						None => panic!("unterminated escape"),
+					},
+					Some(c) => s.push(c),
+					None => panic!("unterminated string"),
+				}
+			}
+			s
+		}
+
+		fn parse_num(it: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
+			let mut n = String::new();
+			while matches!(it.peek(), Some('0'..='9')) {
+				n.push(it.next().unwrap());
+			}
+			n.parse().unwrap()
+		}
+
+		fn parse_arr(it: &mut std::iter::Peekable<std::str::Chars>) -> Vec<Json> {
+			it.next(); // consume '['
+			let mut arr = Vec::new();
+			loop {
+				Self::skip_ws(it);
+				if it.peek() == Some(&']') { it.next(); break; }
+				arr.push(Self::parse_val(it));
+				Self::skip_ws(it);
+				match it.peek().copied() {
+					Some(',') => { it.next(); },
+					Some(']') => { it.next(); break; },
+					c => panic!("expected , or ] got {:?}", c),
+				}
+			}
+			arr
+		}
+
+		fn parse_obj(it: &mut std::iter::Peekable<std::str::Chars>) -> std::collections::BTreeMap<String, Json> {
+			it.next(); // consume '{'
+			let mut map = std::collections::BTreeMap::new();
+			loop {
+				Self::skip_ws(it);
+				if it.peek() == Some(&'}') { it.next(); break; }
+				let key = Self::parse_str(it);
+				Self::skip_ws(it);
+				assert_eq!(it.next(), Some(':'));
+				let val = Self::parse_val(it);
+				map.insert(key, val);
+				Self::skip_ws(it);
+				match it.peek().copied() {
+					Some(',') => { it.next(); },
+					Some('}') => { it.next(); break; },
+					c => panic!("expected , or }} got {:?}", c),
+				}
+			}
+			map
+		}
+
+		fn as_str(&self) -> &str {
+			match self { Json::Str(s) => s, _ => panic!("not a string") }
+		}
+		fn as_u64(&self) -> u64 {
+			match self { Json::Num(n) => *n, _ => panic!("not a number") }
+		}
+		fn as_bool(&self) -> bool {
+			match self { Json::Bool(b) => *b, _ => panic!("not a bool") }
+		}
+		fn as_arr(&self) -> &[Json] {
+			match self { Json::Arr(a) => a, _ => panic!("not an array") }
+		}
+		fn get(&self, key: &str) -> &Json {
+			match self {
+				Json::Obj(m) => m.get(key).unwrap_or_else(|| panic!("key {:?} not found", key)),
+				_ => panic!("not an object"),
+			}
+		}
+	}
+
+	fn hex_decode(s: &str) -> Vec<u8> {
+		(0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+	}
+
+	fn hex_encode(b: &[u8]) -> String {
+		b.iter().map(|x| format!("{:02x}", x)).collect()
+	}
+
+	#[test]
+	fn check_against_c_vectors() {
+		// Reads ../bolts/bolt12/payer-proof-test.json and checks that the Rust
+		// implementation produces matching results.
+		let json_str = match std::fs::read_to_string("../bolts/bolt12/payer-proof-test.json") {
+			Ok(s) => s,
+			Err(_) => {
+				println!(
+					"Skipping check_against_c_vectors: \
+					../bolts/bolt12/payer-proof-test.json not found"
+				);
+				return;
+			},
+		};
+
+		let json = Json::parse(&json_str);
+		let payer_secret = hex_decode(json.get("payer_secret").as_str());
+		let secp_ctx = Secp256k1::new();
+		let payer_keys = Keypair::from_secret_key(
+			&secp_ctx,
+			&SecretKey::from_slice(&payer_secret).unwrap(),
+		);
+
+		for vector in json.get("valid_vectors").as_arr() {
+			let name = vector.get("name").as_str();
+			let input = vector.get("input");
+			let working = vector.get("working");
+			let result = vector.get("result");
+
+			let invoice = Bolt12Invoice::try_from(hex_decode(input.get("invoice_hex").as_str()))
+				.unwrap_or_else(|e| panic!("{}: failed to parse invoice: {:?}", name, e));
+
+			let preimage = PaymentPreimage(
+				hex_decode(input.get("preimage").as_str()).try_into().unwrap(),
+			);
+
+			let note_str = input.get("note").as_str().to_string();
+			let payer_note = if note_str.is_empty() { None } else { Some(note_str) };
+
+			// Build with the same included fields as the C vector.
+			// PayerProofBuilder always starts with payer_id, payment_hash, node_id.
+			let mut builder = PayerProofBuilder::new(&invoice, preimage)
+				.unwrap_or_else(|e| panic!("{}: builder failed: {:?}", name, e));
+			for field in input.get("invoice_fields").as_arr() {
+				if field.get("included").as_bool() {
+					let typ = field.get("type").as_u64();
+					if typ != INVOICE_REQUEST_PAYER_ID_TYPE
+						&& typ != INVOICE_PAYMENT_HASH_TYPE
+						&& typ != INVOICE_NODE_ID_TYPE
+					{
+						builder = builder.include_type(typ).unwrap_or_else(|e| {
+							panic!("{}: include_type({}) failed: {:?}", name, typ, e)
+						});
+					}
+				}
+			}
+
+			let unsigned = builder
+				.build(payer_note)
+				.unwrap_or_else(|e| panic!("{}: build failed: {:?}", name, e));
+
+			// Compare leaf_hashes
+			let exp_leaves: Vec<String> =
+				working.get("leaf_hashes").as_arr().iter().map(|h| h.as_str().to_string()).collect();
+			let got_leaves: Vec<String> =
+				unsigned.disclosure.leaf_hashes.iter().map(|h| hex_encode(h.as_ref())).collect();
+			assert_eq!(got_leaves, exp_leaves, "{}: leaf_hashes mismatch", name);
+
+			// Compare omitted_tlvs markers
+			let exp_omitted: Vec<u64> =
+				working.get("omitted_tlvs").as_arr().iter().map(|v| v.as_u64()).collect();
+			assert_eq!(
+				unsigned.disclosure.omitted_markers, exp_omitted,
+				"{}: omitted_tlvs mismatch", name
+			);
+
+			// Compare missing_hashes
+			let exp_missing: Vec<String> = working
+				.get("missing_hashes")
+				.as_arr()
+				.iter()
+				.map(|h| h.as_str().to_string())
+				.collect();
+			let got_missing: Vec<String> =
+				unsigned.disclosure.missing_hashes.iter().map(|h| hex_encode(h.as_ref())).collect();
+			assert_eq!(got_missing, exp_missing, "{}: missing_hashes mismatch", name);
+
+			// Compare merkle root
+			let exp_root = working.get("proof_merkle_root").as_str();
+			let got_root = hex_encode(unsigned.disclosure.merkle_root.as_ref());
+			assert_eq!(got_root, exp_root, "{}: proof_merkle_root mismatch", name);
+
+			// Sign and compare bech32
+			let proof = unsigned
+				.sign(|p: &UnsignedPayerProof| {
+					Ok(secp_ctx.sign_schnorr_no_aux_rand(p.as_ref().as_digest(), &payer_keys))
+				})
+				.unwrap_or_else(|e| panic!("{}: sign failed: {:?}", name, e));
+
+			// Compare proof TLV fields one by one for precise divergence detection
+			let exp_fields = result.get("proof_fields").as_arr();
+			let got_fields: Vec<(u64, String)> = TlvStream::new(proof.bytes())
+				.map(|r| (r.r#type, hex_encode(r.value_bytes)))
+				.collect();
+			for (i, exp_field) in exp_fields.iter().enumerate() {
+				let exp_type = exp_field.get("type").as_u64();
+				let exp_hex = exp_field.get("hex").as_str();
+				assert!(i < got_fields.len(), "{}: proof_fields[{}] missing (expected type={})", name, i, exp_type);
+				let (got_type, ref got_hex) = got_fields[i];
+				assert_eq!(got_type, exp_type, "{}: proof_fields[{}] type mismatch", name, i);
+				assert_eq!(got_hex.as_str(), exp_hex, "{}: proof_fields[{}] (type={}) hex mismatch", name, i, exp_type);
+			}
+			assert_eq!(got_fields.len(), exp_fields.len(), "{}: proof_fields count mismatch", name);
+
+			let exp_bech32 = result.get("bech32").as_str();
+			let got_bech32 = proof.to_string();
+			assert_eq!(got_bech32, exp_bech32, "{}: bech32 mismatch", name);
+		}
+	}
 }
