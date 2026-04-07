@@ -421,46 +421,62 @@ fn compute_omitted_markers(tlv_data: &[TlvMerkleData]) -> Vec<u64> {
 	markers
 }
 
-/// Build merkle tree recursively (DFS, left-to-right) and collect missing_hashes.
+/// Task for iterative post-order DFS over the implicit merkle tree.
+enum DfsTask {
+	/// Descend into a subtree covering the range [start..start+len).
+	Descend { start: usize, len: usize },
+	/// Combine two child hashes after both subtrees have been processed.
+	Combine,
+}
+
+/// Build merkle tree iteratively (DFS, left-to-right) and collect missing_hashes.
 ///
-/// Per the spec: "When you need to combine two hashes where one side is entirely
-/// omitted and the other is not, append that hash to `missing_hashes`."
-/// Traversal is recursive left-before-right, so missing_hashes are appended in
-/// DFS order — NOT sorted by TLV type.
+/// Per the spec, missing_hashes are in depth-first left-to-right order.
+/// Uses an explicit stack to simulate post-order DFS without recursion,
+/// matching the iterative style used by `root_hash()`.
 fn build_tree_with_disclosure(
 	tlv_data: &[TlvMerkleData], branch_tag: &sha256::HashEngine,
 ) -> (sha256::Hash, Vec<sha256::Hash>) {
 	debug_assert!(!tlv_data.is_empty(), "TLV stream must contain at least one record");
+
 	let mut missing_hashes = Vec::new();
-	let root = build_tree_dfs(tlv_data, branch_tag, &mut missing_hashes);
+	// Each entry: (hash, has_included_leaf_in_subtree)
+	let mut hash_stack: Vec<(sha256::Hash, bool)> = Vec::new();
+	let mut task_stack: Vec<DfsTask> = vec![DfsTask::Descend { start: 0, len: tlv_data.len() }];
+
+	while let Some(task) = task_stack.pop() {
+		match task {
+			DfsTask::Descend { start, len } => {
+				if len == 1 {
+					hash_stack.push((tlv_data[start].per_tlv_hash, tlv_data[start].is_included));
+				} else {
+					let mid = len.next_power_of_two() / 2;
+					// Push combine first (processed after both children).
+					task_stack.push(DfsTask::Combine);
+					// Push right then left so left is processed first (LIFO).
+					task_stack.push(DfsTask::Descend { start: start + mid, len: len - mid });
+					task_stack.push(DfsTask::Descend { start, len: mid });
+				}
+			},
+			DfsTask::Combine => {
+				let (right_hash, right_incl) = hash_stack.pop().unwrap();
+				let (left_hash, left_incl) = hash_stack.pop().unwrap();
+
+				if left_incl && !right_incl {
+					missing_hashes.push(right_hash);
+				} else if !left_incl && right_incl {
+					missing_hashes.push(left_hash);
+				}
+
+				let combined =
+					tagged_branch_hash_from_engine(branch_tag.clone(), left_hash, right_hash);
+				hash_stack.push((combined, left_incl || right_incl));
+			},
+		}
+	}
+
+	let (root, _) = hash_stack.pop().unwrap();
 	(root, missing_hashes)
-}
-
-/// Recursive DFS helper for [`build_tree_with_disclosure`].
-fn build_tree_dfs(
-	data: &[TlvMerkleData], branch_tag: &sha256::HashEngine,
-	missing: &mut Vec<sha256::Hash>,
-) -> sha256::Hash {
-	if data.len() == 1 {
-		return data[0].per_tlv_hash;
-	}
-	let mid = data.len().next_power_of_two() / 2;
-	let (left_data, right_data) = data.split_at(mid);
-
-	let left_has_included = left_data.iter().any(|d| d.is_included);
-	let right_has_included = right_data.iter().any(|d| d.is_included);
-
-	let left_hash = build_tree_dfs(left_data, branch_tag, missing);
-	let right_hash = build_tree_dfs(right_data, branch_tag, missing);
-
-	// After processing both subtrees, append the omitted side's hash (DFS order).
-	if left_has_included && !right_has_included {
-		missing.push(right_hash);
-	} else if !left_has_included && right_has_included {
-		missing.push(left_hash);
-	}
-
-	tagged_branch_hash_from_engine(branch_tag.clone(), left_hash, right_hash)
 }
 
 /// Reconstruct merkle root from selective disclosure data.
@@ -527,57 +543,71 @@ pub(super) fn reconstruct_merkle_root(
 		}
 	}
 
-	// Single-pass DFS reconstruction: consume missing_hashes in DFS order.
-	let mut missing_idx = 0;
-	let result = reconstruct_dfs(&hashes, &branch_tag, missing_hashes, &mut missing_idx)?;
+	// Single-pass iterative DFS reconstruction: consume missing_hashes in DFS order.
+	// result_stack holds Option<hash>: Some = subtree has included leaves, None = all omitted.
+	let mut result_stack: Vec<Option<sha256::Hash>> = Vec::new();
+	let mut task_stack: Vec<DfsTask> = vec![DfsTask::Descend { start: 0, len: num_nodes }];
+	let mut missing_idx: usize = 0;
+
+	while let Some(task) = task_stack.pop() {
+		match task {
+			DfsTask::Descend { start, len } => {
+				if len == 1 {
+					result_stack.push(hashes[start]);
+				} else {
+					let mid = len.next_power_of_two() / 2;
+					task_stack.push(DfsTask::Combine);
+					task_stack.push(DfsTask::Descend { start: start + mid, len: len - mid });
+					task_stack.push(DfsTask::Descend { start, len: mid });
+				}
+			},
+			DfsTask::Combine => {
+				let right = result_stack.pop().unwrap();
+				let left = result_stack.pop().unwrap();
+
+				match (left, right) {
+					(None, None) => result_stack.push(None),
+					(Some(l), None) => {
+						if missing_idx >= missing_hashes.len() {
+							return Err(SelectiveDisclosureError::InsufficientMissingHashes);
+						}
+						let r = missing_hashes[missing_idx];
+						missing_idx += 1;
+						result_stack.push(Some(tagged_branch_hash_from_engine(
+							branch_tag.clone(),
+							l,
+							r,
+						)));
+					},
+					(None, Some(r)) => {
+						if missing_idx >= missing_hashes.len() {
+							return Err(SelectiveDisclosureError::InsufficientMissingHashes);
+						}
+						let l = missing_hashes[missing_idx];
+						missing_idx += 1;
+						result_stack.push(Some(tagged_branch_hash_from_engine(
+							branch_tag.clone(),
+							l,
+							r,
+						)));
+					},
+					(Some(l), Some(r)) => {
+						result_stack.push(Some(tagged_branch_hash_from_engine(
+							branch_tag.clone(),
+							l,
+							r,
+						)));
+					},
+				}
+			},
+		}
+	}
 
 	if missing_idx != missing_hashes.len() {
 		return Err(SelectiveDisclosureError::InsufficientMissingHashes);
 	}
 
-	result.ok_or(SelectiveDisclosureError::InsufficientMissingHashes)
-}
-
-/// Recursive DFS helper for [`reconstruct_merkle_root`].
-///
-/// Returns `Some(hash)` if any leaf in this subtree is included, `None` if all
-/// are omitted.  When one side is `None` (entirely omitted) and the other is
-/// `Some`, pops the next hash from `missing_hashes` to fill in the omitted side.
-fn reconstruct_dfs(
-	hashes: &[Option<sha256::Hash>], branch_tag: &sha256::HashEngine,
-	missing_hashes: &[sha256::Hash], missing_idx: &mut usize,
-) -> Result<Option<sha256::Hash>, SelectiveDisclosureError> {
-	if hashes.len() == 1 {
-		return Ok(hashes[0]);
-	}
-	let mid = hashes.len().next_power_of_two() / 2;
-	let (left, right) = hashes.split_at(mid);
-
-	let left_result = reconstruct_dfs(left, branch_tag, missing_hashes, missing_idx)?;
-	let right_result = reconstruct_dfs(right, branch_tag, missing_hashes, missing_idx)?;
-
-	match (left_result, right_result) {
-		(None, None) => Ok(None),
-		(Some(l), None) => {
-			if *missing_idx >= missing_hashes.len() {
-				return Err(SelectiveDisclosureError::InsufficientMissingHashes);
-			}
-			let r = missing_hashes[*missing_idx];
-			*missing_idx += 1;
-			Ok(Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r)))
-		},
-		(None, Some(r)) => {
-			if *missing_idx >= missing_hashes.len() {
-				return Err(SelectiveDisclosureError::InsufficientMissingHashes);
-			}
-			let l = missing_hashes[*missing_idx];
-			*missing_idx += 1;
-			Ok(Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r)))
-		},
-		(Some(l), Some(r)) => {
-			Ok(Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r)))
-		},
-	}
+	result_stack.pop().unwrap().ok_or(SelectiveDisclosureError::InsufficientMissingHashes)
 }
 
 fn validate_omitted_markers(markers: &[u64]) -> Result<(), SelectiveDisclosureError> {
