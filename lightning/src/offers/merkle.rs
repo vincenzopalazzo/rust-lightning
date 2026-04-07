@@ -421,62 +421,54 @@ fn compute_omitted_markers(tlv_data: &[TlvMerkleData]) -> Vec<u64> {
 	markers
 }
 
-/// Task for iterative post-order DFS over the implicit merkle tree.
-enum DfsTask {
-	/// Descend into a subtree covering the range [start..start+len).
-	Descend { start: usize, len: usize },
-	/// Combine two child hashes after both subtrees have been processed.
-	Combine,
-}
-
-/// Build merkle tree iteratively (DFS, left-to-right) and collect missing_hashes.
+/// Build merkle tree and collect missing_hashes for omitted subtrees.
 ///
 /// Per the spec, missing_hashes are in depth-first left-to-right order.
-/// Uses an explicit stack to simulate post-order DFS without recursion,
-/// matching the iterative style used by `root_hash()`.
+/// For a type-sorted TLV stream this is equivalent to ascending position order,
+/// so we collect during the level-by-level pass and sort by position at the end.
+/// The in-place combination matches the pattern used by `root_hash()`.
 fn build_tree_with_disclosure(
 	tlv_data: &[TlvMerkleData], branch_tag: &sha256::HashEngine,
 ) -> (sha256::Hash, Vec<sha256::Hash>) {
-	debug_assert!(!tlv_data.is_empty(), "TLV stream must contain at least one record");
+	let num_nodes = tlv_data.len();
+	debug_assert!(num_nodes > 0, "TLV stream must contain at least one record");
 
-	let mut missing_hashes = Vec::new();
-	// Each entry: (hash, has_included_leaf_in_subtree)
-	let mut hash_stack: Vec<(sha256::Hash, bool)> = Vec::new();
-	let mut task_stack: Vec<DfsTask> = vec![DfsTask::Descend { start: 0, len: tlv_data.len() }];
+	let mut hashes: Vec<sha256::Hash> = tlv_data.iter().map(|d| d.per_tlv_hash).collect();
+	let mut included: Vec<bool> = tlv_data.iter().map(|d| d.is_included).collect();
+	let mut missing_with_pos: Vec<(usize, sha256::Hash)> = Vec::new();
 
-	while let Some(task) = task_stack.pop() {
-		match task {
-			DfsTask::Descend { start, len } => {
-				if len == 1 {
-					hash_stack.push((tlv_data[start].per_tlv_hash, tlv_data[start].is_included));
-				} else {
-					let mid = len.next_power_of_two() / 2;
-					// Push combine first (processed after both children).
-					task_stack.push(DfsTask::Combine);
-					// Push right then left so left is processed first (LIFO).
-					task_stack.push(DfsTask::Descend { start: start + mid, len: len - mid });
-					task_stack.push(DfsTask::Descend { start, len: mid });
-				}
-			},
-			DfsTask::Combine => {
-				let (right_hash, right_incl) = hash_stack.pop().unwrap();
-				let (left_hash, left_incl) = hash_stack.pop().unwrap();
+	for level in 0.. {
+		let step = 2 << level;
+		let offset = step / 2;
+		if offset >= num_nodes {
+			break;
+		}
 
-				if left_incl && !right_incl {
-					missing_hashes.push(right_hash);
-				} else if !left_incl && right_incl {
-					missing_hashes.push(left_hash);
-				}
+		let left_positions = (0..num_nodes).step_by(step);
+		let right_positions = (offset..num_nodes).step_by(step);
+		for (left, right) in left_positions.zip(right_positions) {
+			let left_incl = included[left];
+			let right_incl = included[right];
 
-				let combined =
-					tagged_branch_hash_from_engine(branch_tag.clone(), left_hash, right_hash);
-				hash_stack.push((combined, left_incl || right_incl));
-			},
+			if left_incl && !right_incl {
+				missing_with_pos.push((right, hashes[right]));
+			} else if !left_incl && right_incl {
+				missing_with_pos.push((left, hashes[left]));
+			}
+
+			hashes[left] =
+				tagged_branch_hash_from_engine(branch_tag.clone(), hashes[left], hashes[right]);
+			included[left] = left_incl || right_incl;
 		}
 	}
 
-	let (root, _) = hash_stack.pop().unwrap();
-	(root, missing_hashes)
+	// Sort by position to produce DFS left-to-right order. For a type-sorted TLV
+	// stream, position order and DFS post-order are equivalent because the tree's
+	// leftmost leaf always has the smallest position.
+	missing_with_pos.sort_by_key(|(pos, _)| *pos);
+	let missing_hashes = missing_with_pos.into_iter().map(|(_, h)| h).collect();
+
+	(hashes[0], missing_hashes)
 }
 
 /// Reconstruct merkle root from selective disclosure data.
@@ -543,71 +535,68 @@ pub(super) fn reconstruct_merkle_root(
 		}
 	}
 
-	// Single-pass iterative DFS reconstruction: consume missing_hashes in DFS order.
-	// result_stack holds Option<hash>: Some = subtree has included leaves, None = all omitted.
-	let mut result_stack: Vec<Option<sha256::Hash>> = Vec::new();
-	let mut task_stack: Vec<DfsTask> = vec![DfsTask::Descend { start: 0, len: num_nodes }];
-	let mut missing_idx: usize = 0;
+	// First pass: walk the tree level-by-level to discover which positions need
+	// missing hashes. We track inclusion in a parallel bool vec and collect
+	// (position, tree_index) pairs for the omitted sides.
+	let mut included: Vec<bool> = hashes.iter().map(|h| h.is_some()).collect();
+	let mut needs_hash: Vec<(usize, usize)> = Vec::new();
 
-	while let Some(task) = task_stack.pop() {
-		match task {
-			DfsTask::Descend { start, len } => {
-				if len == 1 {
-					result_stack.push(hashes[start]);
-				} else {
-					let mid = len.next_power_of_two() / 2;
-					task_stack.push(DfsTask::Combine);
-					task_stack.push(DfsTask::Descend { start: start + mid, len: len - mid });
-					task_stack.push(DfsTask::Descend { start, len: mid });
-				}
-			},
-			DfsTask::Combine => {
-				let right = result_stack.pop().unwrap();
-				let left = result_stack.pop().unwrap();
+	for level in 0.. {
+		let step = 2 << level;
+		let offset = step / 2;
+		if offset >= num_nodes {
+			break;
+		}
 
-				match (left, right) {
-					(None, None) => result_stack.push(None),
-					(Some(l), None) => {
-						if missing_idx >= missing_hashes.len() {
-							return Err(SelectiveDisclosureError::InsufficientMissingHashes);
-						}
-						let r = missing_hashes[missing_idx];
-						missing_idx += 1;
-						result_stack.push(Some(tagged_branch_hash_from_engine(
-							branch_tag.clone(),
-							l,
-							r,
-						)));
-					},
-					(None, Some(r)) => {
-						if missing_idx >= missing_hashes.len() {
-							return Err(SelectiveDisclosureError::InsufficientMissingHashes);
-						}
-						let l = missing_hashes[missing_idx];
-						missing_idx += 1;
-						result_stack.push(Some(tagged_branch_hash_from_engine(
-							branch_tag.clone(),
-							l,
-							r,
-						)));
-					},
-					(Some(l), Some(r)) => {
-						result_stack.push(Some(tagged_branch_hash_from_engine(
-							branch_tag.clone(),
-							l,
-							r,
-						)));
-					},
-				}
-			},
+		let left_positions = (0..num_nodes).step_by(step);
+		let right_positions = (offset..num_nodes).step_by(step);
+		for (left, right) in left_positions.zip(right_positions) {
+			match (included[left], included[right]) {
+				(true, false) => needs_hash.push((right, right)),
+				(false, true) => {
+					needs_hash.push((left, left));
+					included[left] = true;
+				},
+				_ => {},
+			}
 		}
 	}
 
-	if missing_idx != missing_hashes.len() {
+	// Sort by position to match DFS left-to-right order.
+	needs_hash.sort_by_key(|(pos, _)| *pos);
+
+	if needs_hash.len() != missing_hashes.len() {
 		return Err(SelectiveDisclosureError::InsufficientMissingHashes);
 	}
 
-	result_stack.pop().unwrap().ok_or(SelectiveDisclosureError::InsufficientMissingHashes)
+	// Place missing hashes into the nodes array.
+	for (i, &(_, tree_pos)) in needs_hash.iter().enumerate() {
+		hashes[tree_pos] = Some(missing_hashes[i]);
+	}
+
+	// Second pass: combine hashes up the tree in place.
+	for level in 0.. {
+		let step = 2 << level;
+		let offset = step / 2;
+		if offset >= num_nodes {
+			break;
+		}
+
+		let left_positions = (0..num_nodes).step_by(step);
+		let right_positions = (offset..num_nodes).step_by(step);
+		for (left, right) in left_positions.zip(right_positions) {
+			match (hashes[left], hashes[right]) {
+				(Some(l), Some(r)) => {
+					hashes[left] =
+						Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r));
+				},
+				(Some(_), None) => {},
+				(None, _) => {},
+			}
+		}
+	}
+
+	hashes[0].ok_or(SelectiveDisclosureError::InsufficientMissingHashes)
 }
 
 fn validate_omitted_markers(markers: &[u64]) -> Result<(), SelectiveDisclosureError> {
