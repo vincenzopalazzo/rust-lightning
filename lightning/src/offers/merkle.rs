@@ -421,98 +421,54 @@ fn compute_omitted_markers<'a>(
 		.flatten()
 }
 
-/// A node in the merkle tree during selective disclosure processing.
-struct TreeNode {
-	hash: Option<sha256::Hash>,
-	included: bool,
-	min_type: u64,
-}
-
-/// Build merkle tree and collect missing_hashes for omitted subtrees.
+/// Build merkle tree recursively (DFS, left-to-right) and collect missing_hashes.
 ///
-/// Returns hashes sorted by ascending TLV type as required by the spec. For internal
-/// nodes, the type used for ordering is the minimum TLV type in that subtree.
+/// Per the spec, missing_hashes are in depth-first left-to-right order.
 ///
-/// Uses `n` tree nodes (one per TLV) rather than `2n`, since the per-TLV hashes
-/// already combine leaf and nonce. The tree traversal starts at level 0 to pair
-/// adjacent per-TLV hashes, matching the structure of `root_hash()`.
+/// Note: a level-by-level approach (as used by `root_hash()`) cannot produce
+/// DFS-ordered missing_hashes because it processes all subtrees at each depth
+/// simultaneously rather than completing each subtree before the next.
 fn build_tree_with_disclosure(
 	tlv_data: &[TlvMerkleData], branch_tag: &sha256::HashEngine,
 ) -> (sha256::Hash, Vec<sha256::Hash>) {
-	let num_nodes = tlv_data.len();
-	debug_assert!(num_nodes > 0, "TLV stream must contain at least one record");
+	debug_assert!(!tlv_data.is_empty(), "TLV stream must contain at least one record");
 
-	let num_omitted = tlv_data.iter().filter(|d| !d.is_included).count();
+	let mut missing_hashes = Vec::new();
+	let (root, _) = build_tree_dfs(tlv_data, branch_tag, &mut missing_hashes);
+	(root, missing_hashes)
+}
 
-	let mut nodes: Vec<TreeNode> = tlv_data
-		.iter()
-		.map(|data| TreeNode {
-			hash: Some(data.per_tlv_hash),
-			included: data.is_included,
-			min_type: data.tlv_type,
-		})
-		.collect();
-
-	let mut missing_with_types: Vec<(u64, sha256::Hash)> = Vec::with_capacity(num_omitted);
-
-	for level in 0.. {
-		let step = 2 << level;
-		let offset = step / 2;
-		if offset >= num_nodes {
-			break;
-		}
-
-		for (left_pos, right_pos) in
-			(0..num_nodes).step_by(step).zip((offset..num_nodes).step_by(step))
-		{
-			let left_hash = nodes[left_pos].hash;
-			let right_hash = nodes[right_pos].hash;
-			let left_incl = nodes[left_pos].included;
-			let right_incl = nodes[right_pos].included;
-			let right_min_type = nodes[right_pos].min_type;
-
-			match (left_hash, right_hash) {
-				(Some(l), Some(r)) => {
-					if left_incl != right_incl {
-						let (missing_type, missing_hash) = if right_incl {
-							(nodes[left_pos].min_type, l)
-						} else {
-							(right_min_type, r)
-						};
-						missing_with_types.push((missing_type, missing_hash));
-					}
-					nodes[left_pos].hash =
-						Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r));
-					nodes[left_pos].included |= left_incl || right_incl;
-					nodes[left_pos].min_type =
-						core::cmp::min(nodes[left_pos].min_type, right_min_type);
-				},
-				(Some(_), None) => {},
-				_ => unreachable!("Invalid state in merkle tree construction"),
-			}
-		}
+fn build_tree_dfs(
+	tlv_data: &[TlvMerkleData], branch_tag: &sha256::HashEngine,
+	missing_hashes: &mut Vec<sha256::Hash>,
+) -> (sha256::Hash, bool) {
+	if tlv_data.len() == 1 {
+		return (tlv_data[0].per_tlv_hash, tlv_data[0].is_included);
 	}
 
-	missing_with_types.sort_by_key(|(min_type, _)| *min_type);
-	let missing_hashes: Vec<sha256::Hash> =
-		missing_with_types.into_iter().map(|(_, h)| h).collect();
+	let mid = tlv_data.len().next_power_of_two() / 2;
+	let (left_data, right_data) = tlv_data.split_at(mid);
+	let (left_hash, left_incl) = build_tree_dfs(left_data, branch_tag, missing_hashes);
+	let (right_hash, right_incl) = build_tree_dfs(right_data, branch_tag, missing_hashes);
 
-	(nodes[0].hash.expect("Tree should have a root"), missing_hashes)
+	if left_incl && !right_incl {
+		missing_hashes.push(right_hash);
+	} else if !left_incl && right_incl {
+		missing_hashes.push(left_hash);
+	}
+
+	let combined = tagged_branch_hash_from_engine(branch_tag.clone(), left_hash, right_hash);
+	(combined, left_incl || right_incl)
 }
 
 /// Reconstruct merkle root from selective disclosure data.
 ///
-/// The `missing_hashes` must be in ascending type order per spec.
-///
-/// Uses `n` tree nodes (one per TLV position) rather than `2n`, since per-TLV
-/// hashes already combine leaf and nonce. Two passes over the tree determine
-/// where missing hashes are needed and then combine all hashes to the root.
+/// `missing_hashes` must be in DFS (left-to-right recursive traversal) order,
+/// matching the order produced by [`build_tree_with_disclosure`].
 pub(super) fn reconstruct_merkle_root(
 	included_records: &[TlvRecord<'_>], leaf_hashes: &[sha256::Hash], omitted_markers: &[u64],
 	missing_hashes: &[sha256::Hash],
 ) -> Result<sha256::Hash, SelectiveDisclosureError> {
-	// Callers are expected to validate omitted_markers before calling this function
-	// (e.g., via validate_omitted_markers_for_parsing). Debug-assert for safety.
 	debug_assert!(validate_omitted_markers(omitted_markers).is_ok());
 
 	if included_records.len() != leaf_hashes.len() {
@@ -522,135 +478,96 @@ pub(super) fn reconstruct_merkle_root(
 	let leaf_tag = tagged_hash_engine(sha256::Hash::hash("LnLeaf".as_bytes()));
 	let branch_tag = tagged_hash_engine(sha256::Hash::hash("LnBranch".as_bytes()));
 
-	// Build TreeNode vec directly by interleaving included/omitted positions,
-	// eliminating the intermediate Vec<bool> from reconstruct_positions_from_records.
+	// Build per-position hash array: Some(hash) for included positions, None for omitted.
+	// TLV0 is always at position 0 (implicitly omitted).
 	let num_nodes = 1 + included_records.len() + omitted_markers.len();
-	let mut nodes: Vec<TreeNode> = Vec::with_capacity(num_nodes);
-
-	// TLV0 is always omitted
-	nodes.push(TreeNode { hash: None, included: false, min_type: 0 });
+	let mut hashes: Vec<Option<sha256::Hash>> = Vec::with_capacity(num_nodes);
+	hashes.push(None); // TLV0 always omitted
 
 	let mut inc_idx = 0;
 	let mut mrk_idx = 0;
 	let mut prev_marker: u64 = 0;
-	let mut node_idx: u64 = 1;
 
 	while inc_idx < included_records.len() || mrk_idx < omitted_markers.len() {
 		if mrk_idx >= omitted_markers.len() {
-			// No more markers, remaining positions are included
 			let record = &included_records[inc_idx];
 			let leaf_hash = tagged_hash_from_engine(leaf_tag.clone(), record.record_bytes);
 			let nonce_hash = leaf_hashes[inc_idx];
-			let hash = tagged_branch_hash_from_engine(branch_tag.clone(), leaf_hash, nonce_hash);
-			nodes.push(TreeNode { hash: Some(hash), included: true, min_type: node_idx });
+			hashes.push(Some(tagged_branch_hash_from_engine(
+				branch_tag.clone(),
+				leaf_hash,
+				nonce_hash,
+			)));
 			inc_idx += 1;
 		} else if inc_idx >= included_records.len() {
-			// No more included types, remaining positions are omitted
-			nodes.push(TreeNode { hash: None, included: false, min_type: node_idx });
+			hashes.push(None);
 			prev_marker = omitted_markers[mrk_idx];
 			mrk_idx += 1;
 		} else {
 			let marker = omitted_markers[mrk_idx];
 			let inc_type = included_records[inc_idx].r#type;
-
 			if marker == prev_marker + 1 {
-				// Continuation of current run -> omitted position
-				nodes.push(TreeNode { hash: None, included: false, min_type: node_idx });
+				hashes.push(None);
 				prev_marker = marker;
 				mrk_idx += 1;
 			} else {
-				// Jump detected -> included position comes first
 				let record = &included_records[inc_idx];
 				let leaf_hash = tagged_hash_from_engine(leaf_tag.clone(), record.record_bytes);
 				let nonce_hash = leaf_hashes[inc_idx];
-				let hash =
-					tagged_branch_hash_from_engine(branch_tag.clone(), leaf_hash, nonce_hash);
-				nodes.push(TreeNode { hash: Some(hash), included: true, min_type: node_idx });
+				hashes.push(Some(tagged_branch_hash_from_engine(
+					branch_tag.clone(),
+					leaf_hash,
+					nonce_hash,
+				)));
 				prev_marker = inc_type;
 				inc_idx += 1;
 			}
 		}
-		node_idx += 1;
 	}
 
-	// First pass: walk the tree to discover which positions need missing hashes.
-	// We mutate nodes[].included and nodes[].min_type directly since the second
-	// pass only reads nodes[].hash, making this safe without a separate allocation.
-	let num_omitted = omitted_markers.len() + 1; // +1 for implicit TLV0
-	let mut needs_hash: Vec<(u64, usize)> = Vec::with_capacity(num_omitted);
+	let mut missing_idx: usize = 0;
+	let root = reconstruct_merkle_root_dfs(&hashes, &branch_tag, missing_hashes, &mut missing_idx)?;
 
-	for level in 0.. {
-		let step = 2 << level;
-		let offset = step / 2;
-		if offset >= num_nodes {
-			break;
-		}
-
-		for left_pos in (0..num_nodes).step_by(step) {
-			let right_pos = left_pos + offset;
-			if right_pos >= num_nodes {
-				continue;
-			}
-
-			let r_min = nodes[right_pos].min_type;
-
-			match (nodes[left_pos].included, nodes[right_pos].included) {
-				(true, false) => {
-					needs_hash.push((r_min, right_pos));
-					nodes[left_pos].min_type = core::cmp::min(nodes[left_pos].min_type, r_min);
-				},
-				(false, true) => {
-					needs_hash.push((nodes[left_pos].min_type, left_pos));
-					nodes[left_pos].included = true;
-					nodes[left_pos].min_type = core::cmp::min(nodes[left_pos].min_type, r_min);
-				},
-				(true, true) => {
-					nodes[left_pos].min_type = core::cmp::min(nodes[left_pos].min_type, r_min);
-				},
-				(false, false) => {
-					nodes[left_pos].min_type = core::cmp::min(nodes[left_pos].min_type, r_min);
-				},
-			}
-		}
-	}
-
-	needs_hash.sort_by_key(|(min_pos, _)| *min_pos);
-
-	if needs_hash.len() != missing_hashes.len() {
+	if missing_idx != missing_hashes.len() {
 		return Err(SelectiveDisclosureError::InsufficientMissingHashes);
 	}
 
-	// Place missing hashes directly into the nodes array.
-	for (i, &(_, tree_pos)) in needs_hash.iter().enumerate() {
-		nodes[tree_pos].hash = Some(missing_hashes[i]);
+	root.ok_or(SelectiveDisclosureError::InsufficientMissingHashes)
+}
+
+fn reconstruct_merkle_root_dfs(
+	hashes: &[Option<sha256::Hash>], branch_tag: &sha256::HashEngine,
+	missing_hashes: &[sha256::Hash], missing_idx: &mut usize,
+) -> Result<Option<sha256::Hash>, SelectiveDisclosureError> {
+	if hashes.len() == 1 {
+		return Ok(hashes[0]);
 	}
 
-	// Second pass: combine hashes up the tree.
-	for level in 0.. {
-		let step = 2 << level;
-		let offset = step / 2;
-		if offset >= num_nodes {
-			break;
-		}
+	let mid = hashes.len().next_power_of_two() / 2;
+	let (left_hashes, right_hashes) = hashes.split_at(mid);
+	let left = reconstruct_merkle_root_dfs(left_hashes, branch_tag, missing_hashes, missing_idx)?;
+	let right = reconstruct_merkle_root_dfs(right_hashes, branch_tag, missing_hashes, missing_idx)?;
 
-		for left_pos in (0..num_nodes).step_by(step) {
-			let right_pos = left_pos + offset;
-			if right_pos >= num_nodes {
-				continue;
+	match (left, right) {
+		(None, None) => Ok(None),
+		(Some(l), None) => {
+			if *missing_idx >= missing_hashes.len() {
+				return Err(SelectiveDisclosureError::InsufficientMissingHashes);
 			}
-
-			match (nodes[left_pos].hash, nodes[right_pos].hash) {
-				(Some(l), Some(r)) => {
-					nodes[left_pos].hash =
-						Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r));
-				},
-				(Some(_), None) => {},
-				(None, _) => {},
-			};
-		}
+			let r = missing_hashes[*missing_idx];
+			*missing_idx += 1;
+			Ok(Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r)))
+		},
+		(None, Some(r)) => {
+			if *missing_idx >= missing_hashes.len() {
+				return Err(SelectiveDisclosureError::InsufficientMissingHashes);
+			}
+			let l = missing_hashes[*missing_idx];
+			*missing_idx += 1;
+			Ok(Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r)))
+		},
+		(Some(l), Some(r)) => Ok(Some(tagged_branch_hash_from_engine(branch_tag.clone(), l, r))),
 	}
-
-	nodes[0].hash.ok_or(SelectiveDisclosureError::InsufficientMissingHashes)
 }
 
 fn validate_omitted_markers(markers: &[u64]) -> Result<(), SelectiveDisclosureError> {
@@ -1057,21 +974,18 @@ mod tests {
 		assert_eq!(reconstructed, disclosure.merkle_root);
 	}
 
-	/// Test that missing_hashes are in ascending type order per spec.
+	/// Test that the synthetic 7-node example still requires four missing hashes.
 	///
-	/// Per spec: "MUST include the minimal set of merkle hashes of missing merkle
-	/// leaves or nodes in `missing_hashes`, in ascending type order."
-	///
-	/// For the spec example with TLVs [0(o), 10(I), 20(o), 30(o), 40(I), 50(o), 60(o)]:
+	/// For the synthetic tree with TLVs [0(o), 10(I), 20(o), 30(o), 40(I), 50(o), 60(o)]:
 	/// - hash(0) covers type 0
-	/// - hash(B(20,30)) covers types 20-30 (min=20)
+	/// - hash(B(20,30)) covers types 20-30
 	/// - hash(50) covers type 50
 	/// - hash(60) covers type 60
 	///
-	/// Expected order: [type 0, type 20, type 50, type 60]
-	/// This means 4 missing_hashes in this order.
+	/// This still needs 4 missing hashes. The DFS-ordering fix changes the order
+	/// they are emitted and consumed in, but not the count for this tree shape.
 	#[test]
-	fn test_missing_hashes_ascending_type_order() {
+	fn test_missing_hashes_for_synthetic_tree() {
 		use alloc::collections::BTreeSet;
 
 		// Build TLV stream: 0, 10, 20, 30, 40, 50, 60
@@ -1092,14 +1006,11 @@ mod tests {
 		let disclosure =
 			super::compute_selective_disclosure(TlvStream::new(&tlv_bytes), &included).unwrap();
 
-		// We should have 4 missing hashes for omitted types:
+		// We should still have 4 missing hashes for omitted types:
 		// - type 0 (single leaf)
-		// - types 20+30 (combined branch, min_type=20)
+		// - types 20+30 (combined branch)
 		// - type 50 (single leaf)
 		// - type 60 (single leaf)
-		//
-		// The spec example only shows 3, but that appears to be incomplete
-		// (missing hash for type 60). Our implementation should produce 4.
 		assert_eq!(
 			disclosure.missing_hashes.len(),
 			4,
