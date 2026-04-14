@@ -22,7 +22,7 @@ use crate::blinded_path::message::{
 };
 use crate::blinded_path::payment::{
 	AsyncBolt12OfferContext, BlindedPaymentPath, Bolt12OfferContext, Bolt12RefundContext,
-	PaymentConstraints, PaymentContext, ReceiveTlvs,
+	DelegatedBolt12OfferContext, PaymentConstraints, PaymentContext, ReceiveTlvs,
 };
 use crate::chain::channelmonitor::LATENCY_GRACE_PERIOD_BLOCKS;
 
@@ -43,9 +43,10 @@ use crate::offers::invoice_request::{
 };
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Amount, DerivedMetadata, ExplicitMetadata, Offer, OfferBuilder};
-use crate::offers::signer;
 use crate::offers::parse::Bolt12SemanticError;
+use crate::offers::payment_token::decrypt_payment_token_payload_with_secret_key;
 use crate::offers::refund::{Refund, RefundBuilder};
+use crate::offers::signer;
 use crate::offers::static_invoice::{StaticInvoice, StaticInvoiceBuilder};
 use crate::onion_message::async_payments::{
 	AsyncPaymentsMessage, HeldHtlcAvailable, OfferPaths, OfferPathsRequest, ServeStaticInvoice,
@@ -434,6 +435,46 @@ pub enum HeldHtlcReplyPath {
 }
 
 impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
+	/// Verifies the encrypted payment token on a delegated invoice request.
+	///
+	/// 1. The offer carries an `encrypted_payment_token`
+	/// 2. The token can be decrypted by the merchant's derived delegated-offer key
+	/// 3. The committed `amount_msats` matches the offer's amount
+	/// 4. The committed description matches the offer's description
+	fn verify_delegated_payment_token(
+		&self, invoice_request: &InvoiceRequestVerifiedFromOffer,
+	) -> Result<(), ()> {
+		let secret_key = match invoice_request {
+			InvoiceRequestVerifiedFromOffer::DerivedKeys(req) => req.keys.0.secret_key(),
+			InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => return Err(()),
+		};
+
+		let encrypted_token = match invoice_request.encrypted_payment_token() {
+			Some(token) => token,
+			None => return Err(()),
+		};
+
+		let payload = decrypt_payment_token_payload_with_secret_key(&secret_key, encrypted_token)
+			.map_err(|_| ())?;
+
+		// Verify the committed amount matches the offer's amount
+		let offer_amount = match invoice_request.amount() {
+			Some(crate::offers::offer::Amount::Bitcoin { amount_msats }) => amount_msats,
+			_ => return Err(()),
+		};
+		if payload.amount_msats != offer_amount {
+			return Err(());
+		}
+
+		// Verify the committed description matches the offer's description.
+		let offer_description =
+			invoice_request.description().map(|description| description.to_string());
+		if Some(payload.description.as_str()) != offer_description.as_deref() {
+			return Err(());
+		}
+
+		Ok(())
+	}
 	/// Verifies an [`InvoiceRequest`] using the provided [`OffersContext`] or the [`InvoiceRequest::metadata`].
 	///
 	/// - If an [`OffersContext::InvoiceRequest`] with a `nonce` is provided, verification is performed using recipient context data.
@@ -473,6 +514,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 			Some(OffersContext::DelegatedInvoiceRequest { nonce }) => {
 				let invoice_request =
 					invoice_request.verify_for_delegation(nonce, expanded_key)?;
+				self.verify_delegated_payment_token(&invoice_request)?;
 				return Ok(InvreqResponseInstructions::SendInvoice(invoice_request));
 			},
 			_ => return Err(()),
@@ -1030,10 +1072,22 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 
 		let (payment_hash, payment_secret) = get_payment_info(amount_msats, relative_expiry)?;
 
-		let context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
-			offer_id: invoice_request.offer_id,
-			invoice_request: invoice_request.fields(),
-		});
+		let notification_paths = invoice_request.notification_paths();
+		let encrypted_token = invoice_request.encrypted_payment_token();
+
+		let context = if !notification_paths.is_empty() || encrypted_token.is_some() {
+			PaymentContext::DelegatedBolt12Offer(DelegatedBolt12OfferContext {
+				offer_id: invoice_request.offer_id,
+				invoice_request: invoice_request.fields(),
+				encrypted_payment_token: encrypted_token.cloned().unwrap_or_default(),
+				notification_paths: notification_paths.to_vec(),
+			})
+		} else {
+			PaymentContext::Bolt12Offer(Bolt12OfferContext {
+				offer_id: invoice_request.offer_id,
+				invoice_request: invoice_request.fields(),
+			})
+		};
 
 		let payment_paths = self
 			.create_blinded_payment_paths(

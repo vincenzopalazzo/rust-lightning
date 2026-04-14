@@ -15,6 +15,8 @@
 #[macro_use]
 pub mod offer;
 pub mod flow;
+pub mod payment_token;
+pub mod pos_delegation;
 
 pub mod async_receive_offer_cache;
 pub mod invoice;

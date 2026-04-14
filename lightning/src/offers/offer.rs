@@ -416,8 +416,9 @@ macro_rules! offer_builder_methods { (
 
 	/// Sets the encrypted payment token for PoS delegation.
 	///
-	/// This token contains an encrypted order ID that allows the merchant to identify which
-	/// order was paid. This is an experimental feature for PoS delegation.
+	/// This token contains the merchant-readable validation payload used to
+	/// verify delegated invoice requests. This is an experimental feature for
+	/// PoS delegation.
 	///
 	/// Successive calls to this method will override the previous setting.
 	pub fn encrypted_payment_token($($self_mut)* $self: $self_type, token: Vec<u8>) -> $return_type {
@@ -738,6 +739,22 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 	pub fn issuer_signing_pubkey(&$self) -> Option<bitcoin::secp256k1::PublicKey> {
 		$contents.issuer_signing_pubkey()
 	}
+
+	/// Returns the notification paths to the PoS for delegated offers.
+	///
+	/// These paths are used to notify the PoS when a payment is received for a
+	/// delegated offer. Returns an empty slice if no notification paths are set.
+	pub fn notification_paths(&$self) -> &[$crate::blinded_path::message::BlindedMessagePath] {
+		$contents.notification_paths()
+	}
+
+	/// Returns the encrypted payment token for delegated offers, if any.
+	///
+	/// This token contains the merchant-readable validation payload used to
+	/// verify delegated invoice requests.
+	pub fn encrypted_payment_token(&$self) -> Option<&Vec<u8>> {
+		$contents.encrypted_payment_token()
+	}
 } }
 
 impl Offer {
@@ -780,25 +797,6 @@ impl Offer {
 		self.contents.expects_quantity()
 	}
 
-	/// Returns the notification paths to the PoS for delegated offers.
-	///
-	/// These paths are used to notify the PoS when a payment is received for a
-	/// delegated offer. This is an experimental feature for PoS delegation.
-	///
-	/// Returns an empty slice if no notification paths are set.
-	pub fn notification_paths(&self) -> &[BlindedMessagePath] {
-		self.contents.notification_paths()
-	}
-
-	/// Returns the encrypted payment token for delegated offers, if any.
-	///
-	/// This token contains an encrypted order ID that allows the merchant to
-	/// notify the PoS about payment completion. This is an experimental feature
-	/// for PoS delegation.
-	pub fn encrypted_payment_token(&self) -> Option<&Vec<u8>> {
-		self.contents.encrypted_payment_token()
-	}
-
 	pub(super) fn tlv_stream_iter<'a>(
 		bytes: &'a [u8],
 	) -> impl core::iter::Iterator<Item = TlvRecord<'a>> {
@@ -838,9 +836,7 @@ impl Offer {
 	///     .build();
 	/// ```
 	pub fn modify(self) -> OfferModifier {
-		OfferModifier {
-			contents: self.contents,
-		}
+		OfferModifier { contents: self.contents }
 	}
 }
 
@@ -879,9 +875,8 @@ impl OfferModifier {
 
 	/// Sets the encrypted payment token.
 	///
-	/// The payment token contains an encrypted order ID that allows the merchant
-	/// to associate received payments with specific orders and notify the appropriate
-	/// PoS device.
+	/// The payment token contains the merchant-readable validation payload for
+	/// a delegated offer.
 	pub fn encrypted_payment_token(mut self, token: Vec<u8>) -> Self {
 		self.contents.encrypted_payment_token = Some(token);
 		self
@@ -915,6 +910,42 @@ impl OfferModifier {
 		self
 	}
 
+	/// Atomically sets the amount, description, notification paths, and a committed
+	/// encrypted payment token for a PoS order.
+	///
+	/// This is the recommended way for a PoS device to modify a template offer,
+	/// because it ensures the encrypted token always commits to the exact amount
+	/// and description set on the offer. Using this method prevents accidental
+	/// mismatches between the token and the offer fields.
+	///
+	/// # Arguments
+	/// * `amount_msats` - The price to charge
+	/// * `description` - The order description presented to the payer
+	/// * `notification_paths` - Blinded paths the merchant uses to notify this PoS
+	/// * `entropy` - Random bytes for encryption (at least 32 bytes)
+	pub fn with_pos_order(
+		mut self, amount_msats: u64, description: String,
+		notification_paths: Vec<BlindedMessagePath>, entropy: &[u8],
+	) -> Self {
+		use crate::offers::payment_token::{
+			encrypt_payment_token_payload_to_pubkey, PaymentTokenPayload,
+		};
+
+		let payload = PaymentTokenPayload { amount_msats, description: description.clone() };
+		let issuer_signing_pubkey = self
+			.contents
+			.issuer_signing_pubkey()
+			.expect("PoS order templates must include an issuer signing pubkey");
+		let encrypted_token =
+			encrypt_payment_token_payload_to_pubkey(&issuer_signing_pubkey, &payload, entropy);
+
+		self.contents.amount = Some(Amount::Bitcoin { amount_msats });
+		self.contents.description = Some(description);
+		self.contents.notification_paths = Some(notification_paths);
+		self.contents.encrypted_payment_token = Some(encrypted_token);
+		self
+	}
+
 	/// Builds the modified [`Offer`].
 	///
 	/// This re-serializes the offer with the modifications applied.
@@ -923,11 +954,7 @@ impl OfferModifier {
 		self.contents.write(&mut bytes).expect("writing to Vec should not fail");
 
 		let id = OfferId::from_valid_bolt12_tlv_stream(&bytes);
-		Offer {
-			bytes,
-			contents: self.contents,
-			id,
-		}
+		Offer { bytes, contents: self.contents, id }
 	}
 }
 
@@ -1106,9 +1133,9 @@ impl OfferContents {
 
 	/// Returns the encrypted payment token for delegated offers, if any.
 	///
-	/// This token contains an encrypted order ID that allows the merchant to
-	/// notify the PoS about payment completion. This is an experimental feature
-	/// for PoS delegation.
+	/// This token contains the merchant-readable validation payload used during
+	/// delegated invoice-request verification. This is an experimental feature for
+	/// PoS delegation.
 	pub fn encrypted_payment_token(&self) -> Option<&Vec<u8>> {
 		self.encrypted_payment_token.as_ref()
 	}
@@ -1646,7 +1673,11 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef { notification_paths: None, encrypted_payment_token: None, experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					encrypted_payment_token: None,
+					experimental_foo: None
+				},
 			),
 		);
 
@@ -2506,9 +2537,7 @@ mod tests {
 		let notification_path = BlindedMessagePath::from_blinded_path(
 			pubkey(40),
 			pubkey(41),
-			vec![
-				BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
-			],
+			vec![BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] }],
 		);
 
 		let encrypted_token = vec![0xAB, 0xCD, 0xEF];
@@ -2534,10 +2563,7 @@ mod tests {
 
 	#[test]
 	fn parses_offer_without_pos_delegation_fields() {
-		let offer = OfferBuilder::new(pubkey(42))
-			.description("test".to_string())
-			.build()
-			.unwrap();
+		let offer = OfferBuilder::new(pubkey(42)).description("test".to_string()).build().unwrap();
 
 		// Serialize and parse
 		let mut encoded_offer = Vec::new();
@@ -2552,10 +2578,8 @@ mod tests {
 	#[test]
 	fn modifies_template_offer_for_pos_delegation() {
 		// Merchant creates a template offer with a generic description
-		let template_offer = OfferBuilder::new(pubkey(42))
-			.description("Coffee shop".to_string())
-			.build()
-			.unwrap();
+		let template_offer =
+			OfferBuilder::new(pubkey(42)).description("Coffee shop".to_string()).build().unwrap();
 
 		assert!(template_offer.notification_paths().is_empty());
 		assert!(template_offer.encrypted_payment_token().is_none());
@@ -2565,9 +2589,7 @@ mod tests {
 		let pos_notification_path = BlindedMessagePath::from_blinded_path(
 			pubkey(50),
 			pubkey(51),
-			vec![
-				BlindedHop { blinded_node_id: pubkey(52), encrypted_payload: vec![0; 52] },
-			],
+			vec![BlindedHop { blinded_node_id: pubkey(52), encrypted_payload: vec![0; 52] }],
 		);
 
 		// PoS creates an encrypted payment token containing order info
@@ -2613,9 +2635,7 @@ mod tests {
 		let notification_path = BlindedMessagePath::from_blinded_path(
 			pubkey(40),
 			pubkey(41),
-			vec![
-				BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
-			],
+			vec![BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] }],
 		);
 
 		// Create offer with PoS delegation fields
@@ -2645,11 +2665,90 @@ mod tests {
 	}
 
 	#[test]
-	fn modifies_offer_adds_multiple_notification_paths() {
-		let template_offer = OfferBuilder::new(pubkey(42))
-			.description("test".to_string())
+	fn with_pos_order_sets_all_fields_atomically() {
+		use crate::offers::payment_token::decrypt_payment_token_payload_with_secret_key;
+		use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+		let secp_ctx = Secp256k1::new();
+		let merchant_secret_key = SecretKey::from_slice(&[42u8; 32]).unwrap();
+		let merchant_pubkey = PublicKey::from_secret_key(&secp_ctx, &merchant_secret_key);
+
+		let template_offer = OfferBuilder::new(merchant_pubkey)
+			.description("Coffee shop".to_string())
 			.build()
 			.unwrap();
+
+		let amount_msats = 5_000_000;
+		let description = "Large Latte - Order #42".to_string();
+		let entropy = [1u8; 32];
+
+		let pos_path = BlindedMessagePath::from_blinded_path(
+			pubkey(50),
+			pubkey(51),
+			vec![BlindedHop { blinded_node_id: pubkey(52), encrypted_payload: vec![0; 52] }],
+		);
+
+		let modified_offer = template_offer
+			.modify()
+			.with_pos_order(amount_msats, description.clone(), vec![pos_path.clone()], &entropy)
+			.build();
+
+		// Verify the offer has all fields set
+		assert_eq!(modified_offer.amount(), Some(Amount::Bitcoin { amount_msats: 5_000_000 }));
+		assert_eq!(modified_offer.description().map(|d| d.to_string()), Some(description.clone()));
+		assert_eq!(modified_offer.notification_paths().len(), 1);
+		assert_eq!(modified_offer.notification_paths()[0], pos_path);
+		assert!(modified_offer.encrypted_payment_token().is_some());
+
+		// Verify the token decrypts to a valid payload
+		let token = modified_offer.encrypted_payment_token().unwrap();
+		let payload =
+			decrypt_payment_token_payload_with_secret_key(&merchant_secret_key, token).unwrap();
+
+		assert_eq!(payload.amount_msats, amount_msats);
+		assert_eq!(payload.description, description);
+	}
+
+	#[test]
+	fn with_pos_order_roundtrips_through_serialization() {
+		use crate::offers::payment_token::decrypt_payment_token_payload_with_secret_key;
+		use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+		let secp_ctx = Secp256k1::new();
+		let merchant_secret_key = SecretKey::from_slice(&[43u8; 32]).unwrap();
+		let merchant_pubkey = PublicKey::from_secret_key(&secp_ctx, &merchant_secret_key);
+
+		let template_offer =
+			OfferBuilder::new(merchant_pubkey).description("test".to_string()).build().unwrap();
+
+		let pos_path = BlindedMessagePath::from_blinded_path(
+			pubkey(50),
+			pubkey(51),
+			vec![BlindedHop { blinded_node_id: pubkey(52), encrypted_payload: vec![0; 52] }],
+		);
+
+		let offer = template_offer
+			.modify()
+			.with_pos_order(10_000, "Espresso".to_string(), vec![pos_path.clone()], &[2u8; 32])
+			.build();
+
+		// Serialize and parse
+		let mut encoded = Vec::new();
+		offer.write(&mut encoded).unwrap();
+		let parsed = Offer::try_from(encoded).unwrap();
+
+		// Verify the parsed offer's token can still be decrypted
+		let token = parsed.encrypted_payment_token().unwrap();
+		let payload =
+			decrypt_payment_token_payload_with_secret_key(&merchant_secret_key, token).unwrap();
+		assert_eq!(payload.amount_msats, 10_000);
+		assert_eq!(payload.description, "Espresso");
+	}
+
+	#[test]
+	fn modifies_offer_adds_multiple_notification_paths() {
+		let template_offer =
+			OfferBuilder::new(pubkey(42)).description("test".to_string()).build().unwrap();
 
 		let path1 = BlindedMessagePath::from_blinded_path(
 			pubkey(50),
