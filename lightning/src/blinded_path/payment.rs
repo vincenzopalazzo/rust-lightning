@@ -12,6 +12,7 @@
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
 
+use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::utils::{self, BlindedPathWithPadding};
 use crate::blinded_path::{BlindedHop, BlindedPath, IntroductionNode, NodeIdLookUp};
 use crate::crypto::streams::{ChaChaTriPolyReadAdapter, TriPolyAADUsed};
@@ -571,6 +572,14 @@ pub enum PaymentContext {
 	///
 	/// [`Refund`]: crate::offers::refund::Refund
 	Bolt12Refund(Bolt12RefundContext),
+
+	/// The payment was made for a PoS-delegated BOLT 12 [`Offer`].
+	///
+	/// This variant includes additional context for notifying the PoS device
+	/// when the payment is received.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	DelegatedBolt12Offer(DelegatedBolt12OfferContext),
 }
 
 // Used when writing PaymentContext in Event::PaymentClaimable to avoid cloning.
@@ -613,6 +622,42 @@ pub struct AsyncBolt12OfferContext {
 /// [`Refund`]: crate::offers::refund::Refund
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bolt12RefundContext {}
+
+/// The context of a payment made for a PoS-delegated BOLT 12 [`Offer`].
+///
+/// This context includes the information needed to notify the PoS device
+/// when the payment is received, including the encrypted payment token
+/// and the blinded paths to reach the PoS.
+///
+/// [`Offer`]: crate::offers::offer::Offer
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedBolt12OfferContext {
+	/// The identifier of the [`Offer`].
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	pub offer_id: OfferId,
+
+	/// Fields from an [`InvoiceRequest`] sent for a [`Bolt12Invoice`].
+	///
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	/// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
+	pub invoice_request: InvoiceRequestFields,
+
+	/// The encrypted payment token for PoS notification.
+	///
+	/// This token is encrypted by the PoS using a shared secret with the merchant.
+	/// When the merchant receives the payment, they can decrypt this token to
+	/// identify the order and notify the PoS.
+	pub encrypted_payment_token: Vec<u8>,
+
+	/// Blinded paths to the PoS for sending payment notifications.
+	///
+	/// The merchant uses these paths to send a [`PaymentNotification`] message
+	/// to the PoS when the payment is received.
+	///
+	/// [`PaymentNotification`]: crate::onion_message::pos_notification::PaymentNotification
+	pub notification_paths: Vec<BlindedMessagePath>,
+}
 
 impl TryFrom<CounterpartyForwardingInfo> for PaymentRelay {
 	type Error = ();
@@ -1010,6 +1055,7 @@ impl_writeable_tlv_based_enum_legacy!(PaymentContext,
 	(1, Bolt12Offer),
 	(2, Bolt12Refund),
 	(3, AsyncBolt12Offer),
+	(4, DelegatedBolt12Offer),
 );
 
 impl<'a> Writeable for PaymentContextRef<'a> {
@@ -1039,6 +1085,13 @@ impl_writeable_tlv_based!(AsyncBolt12OfferContext, {
 });
 
 impl_writeable_tlv_based!(Bolt12RefundContext, {});
+
+impl_writeable_tlv_based!(DelegatedBolt12OfferContext, {
+	(0, offer_id, required),
+	(2, invoice_request, required),
+	(4, encrypted_payment_token, required_vec),
+	(6, notification_paths, required_vec),
+});
 
 #[cfg(test)]
 mod tests {
@@ -1321,5 +1374,94 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(blinded_payinfo.htlc_maximum_msat, 3997);
+	}
+
+	#[test]
+	fn delegated_bolt12_offer_context_serialization() {
+		use crate::blinded_path::message::BlindedMessagePath;
+		use crate::blinded_path::payment::DelegatedBolt12OfferContext;
+		use crate::blinded_path::BlindedHop;
+		use crate::offers::invoice_request::InvoiceRequestFields;
+		use crate::offers::offer::OfferId;
+		use crate::util::ser::{Readable, Writeable};
+
+		let dummy_pk = PublicKey::from_slice(&[2; 33]).unwrap();
+
+		// Create a notification path
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			dummy_pk,
+			dummy_pk,
+			vec![BlindedHop { blinded_node_id: dummy_pk, encrypted_payload: vec![0; 32] }],
+		);
+
+		let context = DelegatedBolt12OfferContext {
+			offer_id: OfferId([42u8; 32]),
+			invoice_request: InvoiceRequestFields {
+				payer_signing_pubkey: dummy_pk,
+				quantity: Some(1),
+				payer_note_truncated: None,
+				human_readable_name: None,
+			},
+			encrypted_payment_token: vec![0xDE, 0xAD, 0xBE, 0xEF],
+			notification_paths: vec![notification_path],
+		};
+
+		// Serialize
+		let mut serialized = Vec::new();
+		context.write(&mut serialized).unwrap();
+
+		// Deserialize
+		let mut reader = crate::io::Cursor::new(&serialized);
+		let deserialized: DelegatedBolt12OfferContext = Readable::read(&mut reader).unwrap();
+
+		assert_eq!(context.offer_id, deserialized.offer_id);
+		assert_eq!(context.encrypted_payment_token, deserialized.encrypted_payment_token);
+		assert_eq!(context.notification_paths.len(), deserialized.notification_paths.len());
+	}
+
+	#[test]
+	fn payment_context_delegated_bolt12_offer_serialization() {
+		use crate::blinded_path::message::BlindedMessagePath;
+		use crate::blinded_path::payment::{DelegatedBolt12OfferContext, PaymentContext};
+		use crate::blinded_path::BlindedHop;
+		use crate::offers::invoice_request::InvoiceRequestFields;
+		use crate::offers::offer::OfferId;
+		use crate::util::ser::{Readable, Writeable};
+
+		let dummy_pk = PublicKey::from_slice(&[2; 33]).unwrap();
+
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			dummy_pk,
+			dummy_pk,
+			vec![BlindedHop { blinded_node_id: dummy_pk, encrypted_payload: vec![0; 32] }],
+		);
+
+		let context = PaymentContext::DelegatedBolt12Offer(DelegatedBolt12OfferContext {
+			offer_id: OfferId([42u8; 32]),
+			invoice_request: InvoiceRequestFields {
+				payer_signing_pubkey: dummy_pk,
+				quantity: Some(1),
+				payer_note_truncated: None,
+				human_readable_name: None,
+			},
+			encrypted_payment_token: vec![1, 2, 3, 4],
+			notification_paths: vec![notification_path],
+		});
+
+		// Serialize
+		let mut serialized = Vec::new();
+		context.write(&mut serialized).unwrap();
+
+		// Deserialize
+		let mut reader = crate::io::Cursor::new(&serialized);
+		let deserialized: PaymentContext = Readable::read(&mut reader).unwrap();
+
+		match deserialized {
+			PaymentContext::DelegatedBolt12Offer(ctx) => {
+				assert_eq!(ctx.encrypted_payment_token, vec![1, 2, 3, 4]);
+				assert_eq!(ctx.notification_paths.len(), 1);
+			},
+			_ => panic!("Expected DelegatedBolt12Offer variant"),
+		}
 	}
 }

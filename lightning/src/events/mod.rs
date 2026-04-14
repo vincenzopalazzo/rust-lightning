@@ -221,6 +221,18 @@ impl PaymentPurpose {
 				debug_assert!(false);
 				Err(())
 			},
+			Some(PaymentContext::DelegatedBolt12Offer(context)) => {
+				// For delegated offers, we treat it as a regular Bolt12 offer payment
+				// but the caller should extract notification info from the full context.
+				Ok(PaymentPurpose::Bolt12OfferPayment {
+					payment_preimage,
+					payment_secret,
+					payment_context: Bolt12OfferContext {
+						offer_id: context.offer_id,
+						invoice_request: context.invoice_request,
+					},
+				})
+			},
 		}
 	}
 }
