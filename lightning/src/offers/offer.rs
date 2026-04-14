@@ -247,6 +247,8 @@ macro_rules! offer_explicit_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(signing_pubkey),
+					notification_paths: None,
+					encrypted_payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -301,6 +303,8 @@ macro_rules! offer_derived_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(node_id),
+					notification_paths: None,
+					encrypted_payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -395,6 +399,29 @@ macro_rules! offer_builder_methods { (
 	/// Successive calls to this method will override the previous setting.
 	pub fn supported_quantity($($self_mut)* $self: $self_type, quantity: Quantity) -> $return_type {
 		$self.offer.supported_quantity = quantity;
+		$return_value
+	}
+
+	/// Adds a notification blinded path to [`Offer::notification_paths`] for PoS delegation.
+	///
+	/// These paths are used to notify the PoS when a payment is received for a delegated offer.
+	/// This is an experimental feature for PoS delegation.
+	///
+	/// Successive calls to this method will add another notification path. Caller is responsible
+	/// for not adding duplicate paths.
+	pub fn notification_path($($self_mut)* $self: $self_type, path: BlindedMessagePath) -> $return_type {
+		$self.offer.notification_paths.get_or_insert_with(Vec::new).push(path);
+		$return_value
+	}
+
+	/// Sets the encrypted payment token for PoS delegation.
+	///
+	/// This token contains an encrypted order ID that allows the merchant to identify which
+	/// order was paid. This is an experimental feature for PoS delegation.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn encrypted_payment_token($($self_mut)* $self: $self_type, token: Vec<u8>) -> $return_type {
+		$self.offer.encrypted_payment_token = Some(token);
 		$return_value
 	}
 
@@ -632,6 +659,9 @@ pub(super) struct OfferContents {
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
 	issuer_signing_pubkey: Option<PublicKey>,
+	// Experimental fields for PoS delegation (experimental TLV range)
+	notification_paths: Option<Vec<BlindedMessagePath>>,
+	encrypted_payment_token: Option<Vec<u8>>,
 	#[cfg(test)]
 	experimental_foo: Option<u64>,
 }
@@ -750,6 +780,25 @@ impl Offer {
 		self.contents.expects_quantity()
 	}
 
+	/// Returns the notification paths to the PoS for delegated offers.
+	///
+	/// These paths are used to notify the PoS when a payment is received for a
+	/// delegated offer. This is an experimental feature for PoS delegation.
+	///
+	/// Returns an empty slice if no notification paths are set.
+	pub fn notification_paths(&self) -> &[BlindedMessagePath] {
+		self.contents.notification_paths()
+	}
+
+	/// Returns the encrypted payment token for delegated offers, if any.
+	///
+	/// This token contains an encrypted order ID that allows the merchant to
+	/// notify the PoS about payment completion. This is an experimental feature
+	/// for PoS delegation.
+	pub fn encrypted_payment_token(&self) -> Option<&Vec<u8>> {
+		self.contents.encrypted_payment_token()
+	}
+
 	pub(super) fn tlv_stream_iter<'a>(
 		bytes: &'a [u8],
 	) -> impl core::iter::Iterator<Item = TlvRecord<'a>> {
@@ -762,6 +811,123 @@ impl Offer {
 		&self, nonce: Nonce, key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
 		self.contents.verify_using_recipient_data(&self.bytes, nonce, key, secp_ctx)
+	}
+
+	/// Creates an [`OfferModifier`] from this offer for modifying certain fields.
+	///
+	/// This is useful for PoS delegation where a merchant creates a template offer
+	/// and a PoS device modifies it with order-specific data (e.g., notification paths
+	/// and payment tokens) before presenting it to a customer.
+	///
+	/// Since offers are not signed, modifications don't invalidate them. The modified
+	/// offer can be serialized and used directly.
+	///
+	/// # Example
+	///
+	/// ```ignore
+	/// use lightning::offers::offer::Offer;
+	///
+	/// // Merchant creates a template offer
+	/// let template_offer = create_offer();
+	///
+	/// // PoS modifies the template with order-specific data
+	/// let modified_offer = template_offer
+	///     .modify()
+	///     .notification_path(pos_blinded_path)
+	///     .encrypted_payment_token(encrypted_order_id)
+	///     .build();
+	/// ```
+	pub fn modify(self) -> OfferModifier {
+		OfferModifier {
+			contents: self.contents,
+		}
+	}
+}
+
+/// A builder for modifying an existing [`Offer`].
+///
+/// This is used for PoS delegation where a merchant creates a template offer
+/// and a PoS device modifies it with order-specific data before presenting
+/// it to a customer.
+///
+/// Created via [`Offer::modify`].
+///
+/// Since offers are not signed, modifications don't invalidate them.
+#[derive(Clone, Debug)]
+pub struct OfferModifier {
+	contents: OfferContents,
+}
+
+impl OfferModifier {
+	/// Adds a notification path to the offer.
+	///
+	/// Notification paths are used by the merchant to notify the PoS when a payment
+	/// is received for this offer. Multiple paths can be added for redundancy.
+	pub fn notification_path(mut self, path: BlindedMessagePath) -> Self {
+		self.contents.notification_paths.get_or_insert_with(Vec::new).push(path);
+		self
+	}
+
+	/// Clears all existing notification paths.
+	///
+	/// This can be useful when the PoS wants to replace all notification paths
+	/// from a template offer.
+	pub fn clear_notification_paths(mut self) -> Self {
+		self.contents.notification_paths = None;
+		self
+	}
+
+	/// Sets the encrypted payment token.
+	///
+	/// The payment token contains an encrypted order ID that allows the merchant
+	/// to associate received payments with specific orders and notify the appropriate
+	/// PoS device.
+	pub fn encrypted_payment_token(mut self, token: Vec<u8>) -> Self {
+		self.contents.encrypted_payment_token = Some(token);
+		self
+	}
+
+	/// Clears the encrypted payment token.
+	pub fn clear_encrypted_payment_token(mut self) -> Self {
+		self.contents.encrypted_payment_token = None;
+		self
+	}
+
+	/// Sets the offer amount in millisatoshis.
+	///
+	/// This allows the PoS to set the price for a specific order.
+	pub fn amount_msats(mut self, amount_msats: u64) -> Self {
+		self.contents.amount = Some(Amount::Bitcoin { amount_msats });
+		self
+	}
+
+	/// Clears the offer amount.
+	pub fn clear_amount(mut self) -> Self {
+		self.contents.amount = None;
+		self
+	}
+
+	/// Sets the offer description.
+	///
+	/// This allows the PoS to customize the description for a specific order.
+	pub fn description(mut self, description: String) -> Self {
+		self.contents.description = Some(description);
+		self
+	}
+
+	/// Builds the modified [`Offer`].
+	///
+	/// This re-serializes the offer with the modifications applied.
+	pub fn build(self) -> Offer {
+		let mut bytes = Vec::new();
+		self.contents.write(&mut bytes).expect("writing to Vec should not fail");
+
+		let id = OfferId::from_valid_bolt12_tlv_stream(&bytes);
+		Offer {
+			bytes,
+			contents: self.contents,
+			id,
+		}
 	}
 }
 
@@ -930,6 +1096,23 @@ impl OfferContents {
 		self.paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
 	}
 
+	/// Returns the notification paths to the PoS for delegated offers, if any.
+	///
+	/// These paths are used to notify the PoS when a payment is received for a
+	/// delegated offer. This is an experimental feature for PoS delegation.
+	pub fn notification_paths(&self) -> &[BlindedMessagePath] {
+		self.notification_paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
+	}
+
+	/// Returns the encrypted payment token for delegated offers, if any.
+	///
+	/// This token contains an encrypted order ID that allows the merchant to
+	/// notify the PoS about payment completion. This is an experimental feature
+	/// for PoS delegation.
+	pub fn encrypted_payment_token(&self) -> Option<&Vec<u8>> {
+		self.encrypted_payment_token.as_ref()
+	}
+
 	pub(super) fn check_amount_msats_for_quantity(
 		&self, amount_msats: Option<u64>, quantity: Option<u64>,
 	) -> Result<(), Bolt12SemanticError> {
@@ -1075,6 +1258,8 @@ impl OfferContents {
 		};
 
 		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			notification_paths: self.notification_paths.as_ref(),
+			encrypted_payment_token: self.encrypted_payment_token.as_ref(),
 			#[cfg(test)]
 			experimental_foo: self.experimental_foo,
 		};
@@ -1231,18 +1416,28 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 /// Valid type range for experimental offer TLV records.
 pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
 
+/// TLV type for notification paths to PoS in delegated offers (experimental).
+const OFFER_NOTIFICATION_PATHS_TYPE: u64 = 1_000_000_000;
+
+/// TLV type for encrypted payment token in delegated offers (experimental).
+const OFFER_ENCRYPTED_PAYMENT_TOKEN_TYPE: u64 = 1_000_000_004;
+
 #[cfg(not(test))]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATHS_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_ENCRYPTED_PAYMENT_TOKEN_TYPE, encrypted_payment_token: (Vec<u8>, WithoutLength)),
 });
 
 #[cfg(test)]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATHS_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_ENCRYPTED_PAYMENT_TOKEN_TYPE, encrypted_payment_token: (Vec<u8>, WithoutLength)),
 	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
 });
 
 type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
 
-type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef);
+type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef<'a>);
 
 impl CursorReadable for FullOfferTlvStream {
 	fn read<R: AsRef<[u8]>>(r: &mut io::Cursor<R>) -> Result<Self, DecodeError> {
@@ -1297,6 +1492,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 				issuer_id,
 			},
 			ExperimentalOfferTlvStream {
+				notification_paths,
+				encrypted_payment_token,
 				#[cfg(test)]
 				experimental_foo,
 			},
@@ -1353,6 +1550,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 			paths,
 			supported_quantity,
 			issuer_signing_pubkey,
+			notification_paths,
+			encrypted_payment_token,
 			#[cfg(test)]
 			experimental_foo,
 		})
@@ -1447,7 +1646,7 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef { notification_paths: None, encrypted_payment_token: None, experimental_foo: None },
 			),
 		);
 
@@ -2237,7 +2436,8 @@ mod tests {
 
 		let mut encoded_offer = Vec::new();
 		offer.write(&mut encoded_offer).unwrap();
-		BigSize(EXPERIMENTAL_OFFER_TYPES.start).write(&mut encoded_offer).unwrap();
+		// Use start + 2 since notification_paths is at start + 0
+		BigSize(EXPERIMENTAL_OFFER_TYPES.start + 2).write(&mut encoded_offer).unwrap();
 		BigSize(32).write(&mut encoded_offer).unwrap();
 		[42u8; 32].write(&mut encoded_offer).unwrap();
 
@@ -2274,6 +2474,204 @@ mod tests {
 			Ok(_) => panic!("expected error"),
 			Err(e) => assert_eq!(e, Bolt12ParseError::Decode(DecodeError::InvalidValue)),
 		}
+	}
+
+	#[test]
+	fn builds_offer_with_pos_delegation_fields() {
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] },
+			],
+		);
+
+		let encrypted_token = vec![1, 2, 3, 4, 5];
+
+		let offer = OfferBuilder::new(pubkey(42))
+			.description("test".to_string())
+			.notification_path(notification_path.clone())
+			.encrypted_payment_token(encrypted_token.clone())
+			.build()
+			.unwrap();
+
+		assert_eq!(offer.notification_paths().len(), 1);
+		assert_eq!(offer.notification_paths()[0], notification_path);
+		assert_eq!(offer.encrypted_payment_token(), Some(&encrypted_token));
+	}
+
+	#[test]
+	fn parses_offer_with_pos_delegation_fields() {
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
+			],
+		);
+
+		let encrypted_token = vec![0xAB, 0xCD, 0xEF];
+
+		let offer = OfferBuilder::new(pubkey(42))
+			.description("test".to_string())
+			.notification_path(notification_path.clone())
+			.encrypted_payment_token(encrypted_token.clone())
+			.build()
+			.unwrap();
+
+		// Serialize and parse
+		let mut encoded_offer = Vec::new();
+		offer.write(&mut encoded_offer).unwrap();
+
+		let parsed_offer = Offer::try_from(encoded_offer).unwrap();
+
+		assert_eq!(parsed_offer.notification_paths().len(), 1);
+		assert_eq!(parsed_offer.notification_paths()[0], notification_path);
+		assert_eq!(parsed_offer.encrypted_payment_token(), Some(&encrypted_token));
+		assert_eq!(parsed_offer.issuer_signing_pubkey(), Some(pubkey(42)));
+	}
+
+	#[test]
+	fn parses_offer_without_pos_delegation_fields() {
+		let offer = OfferBuilder::new(pubkey(42))
+			.description("test".to_string())
+			.build()
+			.unwrap();
+
+		// Serialize and parse
+		let mut encoded_offer = Vec::new();
+		offer.write(&mut encoded_offer).unwrap();
+
+		let parsed_offer = Offer::try_from(encoded_offer).unwrap();
+
+		assert!(parsed_offer.notification_paths().is_empty());
+		assert!(parsed_offer.encrypted_payment_token().is_none());
+	}
+
+	#[test]
+	fn modifies_template_offer_for_pos_delegation() {
+		// Merchant creates a template offer with a generic description
+		let template_offer = OfferBuilder::new(pubkey(42))
+			.description("Coffee shop".to_string())
+			.build()
+			.unwrap();
+
+		assert!(template_offer.notification_paths().is_empty());
+		assert!(template_offer.encrypted_payment_token().is_none());
+		assert_eq!(template_offer.amount(), None);
+
+		// PoS creates notification path for receiving payment notifications
+		let pos_notification_path = BlindedMessagePath::from_blinded_path(
+			pubkey(50),
+			pubkey(51),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(52), encrypted_payload: vec![0; 52] },
+			],
+		);
+
+		// PoS creates an encrypted payment token containing order info
+		let encrypted_order_token = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+		// PoS modifies the template offer with order-specific data
+		let modified_offer = template_offer
+			.modify()
+			.notification_path(pos_notification_path.clone())
+			.encrypted_payment_token(encrypted_order_token.clone())
+			.amount_msats(5_000_000) // $5 coffee
+			.description("Large Latte - Order #42".to_string())
+			.build();
+
+		// Verify the modified offer has all the PoS-specific data
+		assert_eq!(modified_offer.notification_paths().len(), 1);
+		assert_eq!(modified_offer.notification_paths()[0], pos_notification_path);
+		assert_eq!(modified_offer.encrypted_payment_token(), Some(&encrypted_order_token));
+		assert_eq!(modified_offer.amount(), Some(Amount::Bitcoin { amount_msats: 5_000_000 }));
+		assert_eq!(
+			modified_offer.description().map(|d| d.to_string()),
+			Some("Large Latte - Order #42".to_string())
+		);
+
+		// The signing pubkey remains from the original template (merchant's pubkey)
+		assert_eq!(modified_offer.issuer_signing_pubkey(), Some(pubkey(42)));
+
+		// Verify the offer can be serialized and parsed correctly
+		let mut encoded_offer = Vec::new();
+		modified_offer.write(&mut encoded_offer).unwrap();
+
+		let parsed_offer = Offer::try_from(encoded_offer).unwrap();
+
+		assert_eq!(parsed_offer.notification_paths().len(), 1);
+		assert_eq!(parsed_offer.notification_paths()[0], pos_notification_path);
+		assert_eq!(parsed_offer.encrypted_payment_token(), Some(&encrypted_order_token));
+		assert_eq!(parsed_offer.amount(), Some(Amount::Bitcoin { amount_msats: 5_000_000 }));
+		assert_eq!(parsed_offer.issuer_signing_pubkey(), Some(pubkey(42)));
+	}
+
+	#[test]
+	fn modifies_offer_with_clear_methods() {
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
+			],
+		);
+
+		// Create offer with PoS delegation fields
+		let offer = OfferBuilder::new(pubkey(42))
+			.description("test".to_string())
+			.amount_msats(1000)
+			.notification_path(notification_path)
+			.encrypted_payment_token(vec![1, 2, 3])
+			.build()
+			.unwrap();
+
+		assert_eq!(offer.notification_paths().len(), 1);
+		assert!(offer.encrypted_payment_token().is_some());
+		assert!(offer.amount().is_some());
+
+		// Clear all the fields
+		let cleared_offer = offer
+			.modify()
+			.clear_notification_paths()
+			.clear_encrypted_payment_token()
+			.clear_amount()
+			.build();
+
+		assert!(cleared_offer.notification_paths().is_empty());
+		assert!(cleared_offer.encrypted_payment_token().is_none());
+		assert!(cleared_offer.amount().is_none());
+	}
+
+	#[test]
+	fn modifies_offer_adds_multiple_notification_paths() {
+		let template_offer = OfferBuilder::new(pubkey(42))
+			.description("test".to_string())
+			.build()
+			.unwrap();
+
+		let path1 = BlindedMessagePath::from_blinded_path(
+			pubkey(50),
+			pubkey(51),
+			vec![BlindedHop { blinded_node_id: pubkey(52), encrypted_payload: vec![0; 52] }],
+		);
+		let path2 = BlindedMessagePath::from_blinded_path(
+			pubkey(60),
+			pubkey(61),
+			vec![BlindedHop { blinded_node_id: pubkey(62), encrypted_payload: vec![0; 62] }],
+		);
+
+		// Add multiple notification paths for redundancy
+		let modified_offer = template_offer
+			.modify()
+			.notification_path(path1.clone())
+			.notification_path(path2.clone())
+			.build();
+
+		assert_eq!(modified_offer.notification_paths().len(), 2);
+		assert_eq!(modified_offer.notification_paths()[0], path1);
+		assert_eq!(modified_offer.notification_paths()[1], path2);
 	}
 }
 
