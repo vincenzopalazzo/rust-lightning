@@ -3722,6 +3722,22 @@ pub fn do_pass_along_path<'a, 'b, 'c>(args: PassAlongPathArgs) -> Option<Event> 
 									onion_fields.as_ref().unwrap().payment_secret
 								);
 							},
+							PaymentPurpose::DelegatedBolt12OfferPayment {
+								payment_preimage,
+								payment_secret,
+								..
+							} => {
+								if let Some(preimage) = expected_preimage {
+									assert_eq!(preimage, payment_preimage.unwrap());
+								}
+								if let Some(secret) = our_payment_secret {
+									assert_eq!(secret, *payment_secret);
+								}
+								assert_eq!(
+									Some(*payment_secret),
+									onion_fields.as_ref().unwrap().payment_secret
+								);
+							},
 							PaymentPurpose::SpontaneousPayment(payment_preimage) => {
 								assert_eq!(expected_preimage.unwrap(), *payment_preimage);
 								assert_eq!(
@@ -3996,7 +4012,8 @@ pub fn pass_claimed_payment_along_route(args: ClaimAlongRouteArgs) -> u64 {
 				PaymentPurpose::SpontaneousPayment(preimage)
 				| PaymentPurpose::Bolt11InvoicePayment { payment_preimage: Some(preimage), .. }
 				| PaymentPurpose::Bolt12OfferPayment { payment_preimage: Some(preimage), .. }
-				| PaymentPurpose::Bolt12RefundPayment { payment_preimage: Some(preimage), .. },
+				| PaymentPurpose::Bolt12RefundPayment { payment_preimage: Some(preimage), .. }
+				| PaymentPurpose::DelegatedBolt12OfferPayment { payment_preimage: Some(preimage), .. },
 			amount_msat,
 			ref htlcs,
 			ref onion_fields,
@@ -4013,7 +4030,8 @@ pub fn pass_claimed_payment_along_route(args: ClaimAlongRouteArgs) -> u64 {
 			purpose:
 				PaymentPurpose::Bolt11InvoicePayment { .. }
 				| PaymentPurpose::Bolt12OfferPayment { .. }
-				| PaymentPurpose::Bolt12RefundPayment { .. },
+				| PaymentPurpose::Bolt12RefundPayment { .. }
+				| PaymentPurpose::DelegatedBolt12OfferPayment { .. },
 			payment_hash,
 			amount_msat,
 			ref htlcs,
