@@ -95,7 +95,9 @@ use crate::ln::outbound_payment::{
 };
 use crate::ln::types::ChannelId;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
-use crate::offers::flow::{HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow};
+use crate::offers::flow::{
+	HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow, PendingPosNotification,
+};
 use crate::offers::invoice::{Bolt12Invoice, UnsignedBolt12Invoice};
 use crate::offers::invoice_error::InvoiceError;
 use crate::offers::invoice_request::{InvoiceRequest, InvoiceRequestVerifiedFromOffer};
@@ -113,6 +115,9 @@ use crate::onion_message::messenger::{
 	MessageRouter, MessageSendInstructions, Responder, ResponseInstruction,
 };
 use crate::onion_message::offers::{OffersMessage, OffersMessageHandler};
+use crate::onion_message::pos_notification::{
+	PaymentAck, PaymentNack, PaymentNotification, PosNotificationHandler, PosNotificationMessage,
+};
 use crate::routing::gossip::NodeId;
 use crate::routing::router::{
 	BlindedTail, FixedRouter, InFlightHtlcs, Path, Payee, PaymentParameters, Route,
@@ -9090,6 +9095,7 @@ impl<
 				.remove_stale_payments(duration_since_epoch, &self.pending_events);
 
 			self.check_refresh_async_receive_offer_cache(true);
+			self.flow.requeue_pending_pos_notifications();
 
 			if self.check_free_holding_cells() {
 				// While we try to ensure we clear holding cells immediately, its possible we miss
@@ -10445,6 +10451,25 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						durable_preimage_channel,
 					}) = payment
 					{
+						if let events::PaymentPurpose::DelegatedBolt12OfferPayment {
+							payment_preimage: Some(preimage),
+							payment_context,
+							encrypted_payment_token,
+							notification_paths,
+							..
+						} = &purpose
+						{
+							let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+							self.flow.queue_pos_payment_notification_with_invoice_data(
+								encrypted_payment_token.clone(),
+								Some(payment_context.offer_id),
+								Some(amount_msat),
+								Some(payment_hash),
+								*preimage,
+								notification_paths,
+							);
+						}
+
 						let event = events::Event::PaymentClaimed {
 							payment_hash,
 							purpose,
@@ -17500,6 +17525,39 @@ impl<
 		R: Router,
 		MR: MessageRouter,
 		L: Logger,
+	> PosNotificationHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+{
+	fn handle_payment_notification(
+		&self, _message: PaymentNotification, _responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)> {
+		None
+	}
+
+	fn handle_payment_ack(&self, message: PaymentAck) {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		self.flow.resolve_pending_pos_notification(&message.encrypted_payment_token);
+	}
+
+	fn handle_payment_nack(&self, message: PaymentNack) {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		self.flow.resolve_pending_pos_notification(&message.encrypted_payment_token);
+	}
+
+	fn release_pending_messages(&self) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		self.flow.release_pending_pos_notification_messages()
+	}
+}
+
+impl<
+		M: chain::Watch<SP::EcdsaSigner>,
+		T: BroadcasterInterface,
+		ES: EntropySource,
+		NS: NodeSigner,
+		SP: SignerProvider,
+		F: FeeEstimator,
+		R: Router,
+		MR: MessageRouter,
+		L: Logger,
 	> NodeIdLookUp for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
 {
 	fn next_node_id(&self, short_channel_id: u64) -> Option<PublicKey> {
@@ -18251,6 +18309,7 @@ impl<
 		if our_pending_intercepts.len() != 0 {
 			pending_intercepted_htlcs = Some(our_pending_intercepts);
 		}
+		let pending_pos_notifications = self.flow.pending_pos_notifications();
 
 		let mut pending_claiming_payments = Some(&claimable_payments.pending_claiming_payments);
 		if pending_claiming_payments.as_ref().unwrap().is_empty() {
@@ -18291,6 +18350,7 @@ impl<
 			(19, peer_storage_dir, optional_vec),
 			(21, WithoutLength(&self.flow.writeable_async_receive_offer_cache()), required),
 			(23, self.best_block.read().unwrap().previous_blocks, required),
+			(25, pending_pos_notifications, optional_vec),
 		});
 
 		// Remove the SpliceFailed and DiscardFunding events added earlier.
@@ -18377,6 +18437,7 @@ pub(super) struct ChannelManagerData<SP: SignerProvider> {
 	in_flight_monitor_updates: HashMap<(PublicKey, ChannelId), Vec<ChannelMonitorUpdate>>,
 	peer_storage_dir: Vec<(PublicKey, Vec<u8>)>,
 	async_receive_offer_cache: AsyncReceiveOfferCache,
+	pending_pos_notifications: Vec<PendingPosNotification>,
 	// Marked `_legacy` because in versions > 0.2 we are taking steps to remove the requirement of
 	// regularly persisting the `ChannelManager` and instead rebuild the set of HTLC forwards from
 	// `Channel{Monitor}` data.
@@ -18568,6 +18629,7 @@ impl<'a, ES: EntropySource, SP: SignerProvider, L: Logger>
 		let mut inbound_payment_id_secret = None;
 		let mut peer_storage_dir: Option<Vec<(PublicKey, Vec<u8>)>> = None;
 		let mut async_receive_offer_cache: AsyncReceiveOfferCache = AsyncReceiveOfferCache::new();
+		let mut pending_pos_notifications = None;
 		let mut best_block_previous_blocks = None;
 		read_tlv_fields!(reader, {
 			(1, pending_outbound_payments_no_retry, option),
@@ -18588,6 +18650,7 @@ impl<'a, ES: EntropySource, SP: SignerProvider, L: Logger>
 			(19, peer_storage_dir, optional_vec),
 			(21, async_receive_offer_cache, (default_value, async_receive_offer_cache)),
 			(23, best_block_previous_blocks, option),
+			(25, pending_pos_notifications, optional_vec),
 		});
 
 		// Merge legacy pending_outbound_payments fields into a single HashMap.
@@ -18708,6 +18771,7 @@ impl<'a, ES: EntropySource, SP: SignerProvider, L: Logger>
 			in_flight_monitor_updates: in_flight_monitor_updates.unwrap_or_default(),
 			peer_storage_dir: peer_storage_dir.unwrap_or_default(),
 			async_receive_offer_cache,
+			pending_pos_notifications: pending_pos_notifications.unwrap_or_default(),
 			version,
 		})
 	}
@@ -19009,6 +19073,7 @@ impl<
 			mut in_flight_monitor_updates,
 			peer_storage_dir,
 			async_receive_offer_cache,
+			pending_pos_notifications,
 			version: _version,
 		} = data;
 
@@ -19981,6 +20046,20 @@ impl<
 			}
 		}
 
+		let flow = OffersMessageFlow::new(
+			chain_hash,
+			best_block,
+			our_network_pubkey,
+			highest_seen_timestamp,
+			expanded_inbound_key,
+			args.node_signer.get_receive_auth_key(),
+			secp_ctx.clone(),
+			args.message_router,
+			args.logger.clone(),
+		)
+		.with_async_payments_offers_cache(async_receive_offer_cache)
+		.with_pending_pos_notifications(pending_pos_notifications);
+
 		let mut outbound_scid_aliases = new_hash_set();
 		for (_peer_node_id, peer_state_mutex) in per_peer_state.iter_mut() {
 			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
@@ -20194,19 +20273,6 @@ impl<
 				}
 			}
 		}
-
-		let flow = OffersMessageFlow::new(
-			chain_hash,
-			best_block,
-			our_network_pubkey,
-			highest_seen_timestamp,
-			expanded_inbound_key,
-			args.node_signer.get_receive_auth_key(),
-			secp_ctx.clone(),
-			args.message_router,
-			args.logger.clone(),
-		)
-		.with_async_payments_offers_cache(async_receive_offer_cache);
 
 		let channel_manager = ChannelManager {
 			chain_hash,

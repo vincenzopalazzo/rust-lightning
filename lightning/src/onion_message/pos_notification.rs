@@ -26,6 +26,9 @@
 //! // Merchant creates a payment notification
 //! let notification = PaymentNotification {
 //!     encrypted_payment_token: encrypted_token.clone(),
+//!     offer_id: None,
+//!     amount_msat: None,
+//!     payment_hash: None,
 //!     preimage: payment_preimage,
 //! };
 //!
@@ -35,11 +38,13 @@
 
 use crate::io;
 use crate::ln::msgs::DecodeError;
+use crate::offers::offer::OfferId;
 use crate::onion_message::messenger::{MessageSendInstructions, Responder, ResponseInstruction};
 use crate::onion_message::packet::OnionMessageContents;
 use crate::prelude::*;
-use crate::types::payment::PaymentPreimage;
+use crate::types::payment::{PaymentHash, PaymentPreimage};
 use crate::util::ser::{Readable, ReadableArgs, Writeable, Writer};
+use core::ops::Deref;
 
 // TLV record types for PoS notification messages (experimental range).
 // Using 1_000_000_1xx range for PoS notification messages.
@@ -80,6 +85,26 @@ pub trait PosNotificationHandler {
 	}
 }
 
+impl<T: PosNotificationHandler + ?Sized, R: Deref<Target = T>> PosNotificationHandler for R {
+	fn handle_payment_notification(
+		&self, message: PaymentNotification, responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)> {
+		self.deref().handle_payment_notification(message, responder)
+	}
+
+	fn handle_payment_ack(&self, message: PaymentAck) {
+		self.deref().handle_payment_ack(message)
+	}
+
+	fn handle_payment_nack(&self, message: PaymentNack) {
+		self.deref().handle_payment_nack(message)
+	}
+
+	fn release_pending_messages(&self) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		self.deref().release_pending_messages()
+	}
+}
+
 /// Possible PoS notification messages sent and received via an [`OnionMessage`].
 ///
 /// [`OnionMessage`]: crate::ln::msgs::OnionMessage
@@ -99,14 +124,25 @@ pub enum PosNotificationMessage {
 ///
 /// Sent via onion message using the `notification_paths` from the offer.
 /// Upon receiving this message, the PoS should verify the payment token
-/// matches a known order and update the order status accordingly.
+/// matches a known order and update the order status accordingly. When available,
+/// the merchant also includes enough invoice data for the PoS to verify the
+/// payment against the original delegated offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaymentNotification {
 	/// The encrypted payment token from the offer.
 	///
-	/// The PoS should decrypt this using the shared secret to recover
-	/// the order ID and verify it matches a pending order.
+	/// This is returned verbatim so the PoS can correlate the notification with
+	/// the token it embedded in the delegated offer.
 	pub encrypted_payment_token: Vec<u8>,
+
+	/// The identifier of the delegated offer that was paid, if available.
+	pub offer_id: Option<OfferId>,
+
+	/// The amount that was ultimately paid for the delegated offer, if available.
+	pub amount_msat: Option<u64>,
+
+	/// The payment hash associated with the paid invoice, if available.
+	pub payment_hash: Option<PaymentHash>,
 
 	/// The payment preimage proving the payment was made.
 	///
@@ -233,7 +269,10 @@ impl OnionMessageContents for PaymentNack {
 
 impl_writeable_tlv_based!(PaymentNotification, {
 	(0, encrypted_payment_token, required_vec),
-	(2, preimage, required),
+	(2, offer_id, option),
+	(4, amount_msat, option),
+	(6, payment_hash, option),
+	(8, preimage, required),
 });
 
 impl_writeable_tlv_based!(PaymentAck, {
@@ -286,6 +325,9 @@ mod tests {
 		let preimage = PaymentPreimage([42u8; 32]);
 		let msg = PaymentNotification {
 			encrypted_payment_token: vec![1, 2, 3, 4, 5],
+			offer_id: Some(OfferId([1; 32])),
+			amount_msat: Some(42_000),
+			payment_hash: Some(PaymentHash([2; 32])),
 			preimage,
 		};
 		test_roundtrip(msg);
@@ -294,14 +336,26 @@ mod tests {
 	#[test]
 	fn payment_notification_empty_token() {
 		let preimage = PaymentPreimage([0u8; 32]);
-		let msg = PaymentNotification { encrypted_payment_token: vec![], preimage };
+		let msg = PaymentNotification {
+			encrypted_payment_token: vec![],
+			offer_id: None,
+			amount_msat: None,
+			payment_hash: None,
+			preimage,
+		};
 		test_roundtrip(msg);
 	}
 
 	#[test]
 	fn payment_notification_large_token() {
 		let preimage = PaymentPreimage([255u8; 32]);
-		let msg = PaymentNotification { encrypted_payment_token: vec![0xAB; 1024], preimage };
+		let msg = PaymentNotification {
+			encrypted_payment_token: vec![0xAB; 1024],
+			offer_id: Some(OfferId([3; 32])),
+			amount_msat: Some(21_000_000),
+			payment_hash: Some(PaymentHash([4; 32])),
+			preimage,
+		};
 		test_roundtrip(msg);
 	}
 
@@ -333,6 +387,9 @@ mod tests {
 		// Test PaymentNotification variant
 		let notification = PosNotificationMessage::PaymentNotification(PaymentNotification {
 			encrypted_payment_token: vec![1, 2, 3],
+			offer_id: Some(OfferId([5; 32])),
+			amount_msat: Some(5_000),
+			payment_hash: Some(PaymentHash([6; 32])),
 			preimage,
 		});
 		let mut encoded = Vec::new();
@@ -379,6 +436,9 @@ mod tests {
 
 		let notification = PosNotificationMessage::PaymentNotification(PaymentNotification {
 			encrypted_payment_token: vec![],
+			offer_id: None,
+			amount_msat: None,
+			payment_hash: None,
 			preimage,
 		});
 		assert_eq!(notification.tlv_type(), PAYMENT_NOTIFICATION_TLV_TYPE);
@@ -400,6 +460,9 @@ mod tests {
 
 		let notification = PosNotificationMessage::PaymentNotification(PaymentNotification {
 			encrypted_payment_token: vec![],
+			offer_id: None,
+			amount_msat: None,
+			payment_hash: None,
 			preimage,
 		});
 		assert_eq!(notification.msg_type(), "Payment Notification");

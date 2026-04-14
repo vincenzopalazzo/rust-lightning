@@ -10,6 +10,7 @@
 //! Provides data structures and functions for creating and managing Offers messages,
 //! facilitating communication, and handling BOLT12 messages and payments.
 
+use core::ops::Deref;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
@@ -19,6 +20,7 @@ use bitcoin::secp256k1::{self, PublicKey, Secp256k1};
 
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext,
+	PosNotificationContext,
 };
 use crate::blinded_path::payment::{
 	AsyncBolt12OfferContext, BlindedPaymentPath, Bolt12OfferContext, Bolt12RefundContext,
@@ -42,7 +44,9 @@ use crate::offers::invoice_request::{
 	InvoiceRequest, InvoiceRequestBuilder, InvoiceRequestVerifiedFromOffer, VerifiedInvoiceRequest,
 };
 use crate::offers::nonce::Nonce;
-use crate::offers::offer::{Amount, DerivedMetadata, ExplicitMetadata, Offer, OfferBuilder};
+use crate::offers::offer::{
+	Amount, DerivedMetadata, ExplicitMetadata, Offer, OfferBuilder, OfferId,
+};
 use crate::offers::parse::Bolt12SemanticError;
 use crate::offers::payment_token::decrypt_payment_token_payload_with_secret_key;
 use crate::offers::refund::{Refund, RefundBuilder};
@@ -57,10 +61,11 @@ use crate::onion_message::messenger::{
 };
 use crate::onion_message::offers::OffersMessage;
 use crate::onion_message::packet::OnionMessageContents;
+use crate::onion_message::pos_notification::{PaymentNotification, PosNotificationMessage};
 use crate::routing::router::Router;
 use crate::sign::{EntropySource, ReceiveAuthKey};
 use crate::sync::{Mutex, RwLock};
-use crate::types::payment::{PaymentHash, PaymentSecret};
+use crate::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use crate::util::logger::Logger;
 use crate::util::ser::Writeable;
 
@@ -88,6 +93,9 @@ pub struct OffersMessageFlow<MR: MessageRouter, L: Logger> {
 	pub(crate) pending_offers_messages: Mutex<Vec<(OffersMessage, MessageSendInstructions)>>,
 
 	pending_async_payments_messages: Mutex<Vec<(AsyncPaymentsMessage, MessageSendInstructions)>>,
+	pending_pos_notification_messages:
+		Mutex<Vec<(PosNotificationMessage, MessageSendInstructions)>>,
+	pending_pos_notifications: Mutex<Vec<PendingPosNotification>>,
 	async_receive_offer_cache: Mutex<AsyncReceiveOfferCache>,
 
 	logger: L,
@@ -116,6 +124,8 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 
 			pending_offers_messages: Mutex::new(Vec::new()),
 			pending_async_payments_messages: Mutex::new(Vec::new()),
+			pending_pos_notification_messages: Mutex::new(Vec::new()),
+			pending_pos_notifications: Mutex::new(Vec::new()),
 
 			async_receive_offer_cache: Mutex::new(AsyncReceiveOfferCache::new()),
 
@@ -132,6 +142,20 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		mut self, async_receive_offer_cache: AsyncReceiveOfferCache,
 	) -> Self {
 		self.async_receive_offer_cache = Mutex::new(async_receive_offer_cache);
+		self
+	}
+
+	/// Restores persisted PoS notifications that still need to be retried.
+	pub fn with_pending_pos_notifications(
+		mut self, pending_pos_notifications: Vec<PendingPosNotification>,
+	) -> Self {
+		self.pending_pos_notifications = Mutex::new(pending_pos_notifications.clone());
+		for pending_notification in pending_pos_notifications.iter() {
+			self.enqueue_pending_pos_notification_messages(
+				&pending_notification.notification,
+				&pending_notification.notification_paths,
+			);
+		}
 		self
 	}
 
@@ -434,9 +458,25 @@ pub enum HeldHtlcReplyPath {
 	},
 }
 
+/// Persisted PoS notification state for retrying best-effort delivery until an ack or nack is
+/// received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPosNotification {
+	/// The notification payload to retry.
+	pub notification: PaymentNotification,
+	/// The blinded paths over which the notification should be retried.
+	pub notification_paths: Vec<BlindedMessagePath>,
+}
+
+impl_writeable_tlv_based!(PendingPosNotification, {
+	(0, notification, required),
+	(2, notification_paths, required_vec),
+});
+
 impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	/// Verifies the encrypted payment token on a delegated invoice request.
 	///
+	/// This enforces that:
 	/// 1. The offer carries an `encrypted_payment_token`
 	/// 2. The token can be decrypted by the merchant's derived delegated-offer key
 	/// 3. The committed `amount_msats` matches the offer's amount
@@ -512,8 +552,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				});
 			},
 			Some(OffersContext::DelegatedInvoiceRequest { nonce }) => {
-				let invoice_request =
-					invoice_request.verify_for_delegation(nonce, expanded_key)?;
+				let invoice_request = invoice_request.verify_for_delegation(nonce, expanded_key)?;
 				self.verify_delegated_payment_token(&invoice_request)?;
 				return Ok(InvreqResponseInstructions::SendInvoice(invoice_request));
 			},
@@ -706,7 +745,10 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	/// [`ReceiveAuthKey`]: crate::sign::ReceiveAuthKey
 	pub fn create_delegated_offer_builder<ES: Deref>(
 		&self, entropy_source: ES, peers: Vec<MessageForwardNode>,
-	) -> Result<(OfferBuilder<'static, ExplicitMetadata, secp256k1::SignOnly>, Nonce), Bolt12SemanticError>
+	) -> Result<
+		(OfferBuilder<'static, ExplicitMetadata, secp256k1::SignOnly>, Nonce),
+		Bolt12SemanticError,
+	>
 	where
 		ES::Target: EntropySource,
 	{
@@ -1410,6 +1452,137 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		core::mem::take(&mut self.pending_async_payments_messages.lock().unwrap())
 	}
 
+	/// Gets the enqueued [`PosNotificationMessage`]s with their corresponding [`MessageSendInstructions`].
+	///
+	/// These messages should be sent to PoS devices to notify them of received payments
+	/// for delegated offers.
+	pub fn release_pending_pos_notification_messages(
+		&self,
+	) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		core::mem::take(&mut self.pending_pos_notification_messages.lock().unwrap())
+	}
+
+	/// Queues a payment notification to be sent to a PoS device.
+	///
+	/// This should be called when a payment for a delegated offer is received.
+	/// The notification will be sent via the provided notification paths.
+	///
+	/// # Arguments
+	/// * `encrypted_payment_token` - The encrypted payment token from the offer
+	/// * `preimage` - The payment preimage proving the payment was made
+	/// * `notification_paths` - Blinded paths to reach the PoS device
+	pub fn queue_pos_payment_notification(
+		&self, encrypted_payment_token: Vec<u8>, preimage: PaymentPreimage,
+		notification_paths: &[BlindedMessagePath],
+	) {
+		self.queue_pos_payment_notification_with_invoice_data(
+			encrypted_payment_token,
+			None,
+			None,
+			None,
+			preimage,
+			notification_paths,
+		);
+	}
+
+	/// Queues a payment notification including sufficient invoice data for the PoS to verify it.
+	pub fn queue_pos_payment_notification_with_invoice_data(
+		&self, encrypted_payment_token: Vec<u8>, offer_id: Option<OfferId>,
+		amount_msat: Option<u64>, payment_hash: Option<PaymentHash>, preimage: PaymentPreimage,
+		notification_paths: &[BlindedMessagePath],
+	) {
+		if notification_paths.is_empty() {
+			return;
+		}
+
+		let notification = PaymentNotification {
+			encrypted_payment_token,
+			offer_id,
+			amount_msat,
+			payment_hash,
+			preimage,
+		};
+		let pending_notification = PendingPosNotification {
+			notification: notification.clone(),
+			notification_paths: notification_paths.to_vec(),
+		};
+
+		{
+			let mut pending_pos_notifications = self.pending_pos_notifications.lock().unwrap();
+			match pending_pos_notifications.iter_mut().find(|pending| {
+				pending.notification.encrypted_payment_token
+					== pending_notification.notification.encrypted_payment_token
+			}) {
+				Some(existing_pending_notification) => {
+					*existing_pending_notification = pending_notification.clone();
+				},
+				None => pending_pos_notifications.push(pending_notification.clone()),
+			}
+		}
+
+		self.enqueue_pending_pos_notification_messages(
+			&pending_notification.notification,
+			&pending_notification.notification_paths,
+		);
+	}
+
+	/// Re-enqueues all unacknowledged PoS notifications for another best-effort delivery attempt.
+	pub fn requeue_pending_pos_notifications(&self) {
+		let pending_pos_notifications = self.pending_pos_notifications.lock().unwrap().clone();
+		for pending_notification in pending_pos_notifications.iter() {
+			self.enqueue_pending_pos_notification_messages(
+				&pending_notification.notification,
+				&pending_notification.notification_paths,
+			);
+		}
+	}
+
+	/// Resolves a pending PoS notification once the PoS acknowledges or rejects it.
+	pub fn resolve_pending_pos_notification(&self, encrypted_payment_token: &[u8]) -> bool {
+		let mut pending_pos_notifications = self.pending_pos_notifications.lock().unwrap();
+		let initial_len = pending_pos_notifications.len();
+		pending_pos_notifications.retain(|pending_notification| {
+			pending_notification.notification.encrypted_payment_token.as_slice()
+				!= encrypted_payment_token
+		});
+		let resolved = pending_pos_notifications.len() != initial_len;
+		core::mem::drop(pending_pos_notifications);
+
+		if resolved {
+			self.pending_pos_notification_messages.lock().unwrap().retain(|(message, _)| {
+				match message {
+					PosNotificationMessage::PaymentNotification(notification) => {
+						notification.encrypted_payment_token.as_slice() != encrypted_payment_token
+					},
+					_ => true,
+				}
+			});
+		}
+
+		resolved
+	}
+
+	fn enqueue_pending_pos_notification_messages(
+		&self, notification: &PaymentNotification, notification_paths: &[BlindedMessagePath],
+	) {
+		let message = PosNotificationMessage::PaymentNotification(notification.clone());
+		let mut pending_messages = self.pending_pos_notification_messages.lock().unwrap();
+		pending_messages.retain(|(pending_message, _)| match pending_message {
+			PosNotificationMessage::PaymentNotification(pending_notification) => {
+				pending_notification.encrypted_payment_token != notification.encrypted_payment_token
+			},
+			_ => true,
+		});
+
+		for path in notification_paths {
+			let destination = Destination::BlindedPath(path.clone());
+			let instructions = MessageSendInstructions::WithReplyPath {
+				destination,
+				context: MessageContext::PosNotification(PosNotificationContext {}),
+			};
+			pending_messages.push((message.clone(), instructions));
+		}
+	}
 	/// Retrieve an [`Offer`] for receiving async payments as an often-offline recipient. Will only
 	/// return an offer if [`Self::set_paths_to_static_invoice_server`] was called and we succeeded in
 	/// interactively building a [`StaticInvoice`] with the static invoice server.
@@ -1827,5 +2000,46 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	/// Get the encoded [`AsyncReceiveOfferCache`] for persistence.
 	pub fn writeable_async_receive_offer_cache(&self) -> Vec<u8> {
 		self.async_receive_offer_cache.encode()
+	}
+
+	/// Returns the persisted PoS notifications still awaiting an ack or nack.
+	pub fn pending_pos_notifications(&self) -> Vec<PendingPosNotification> {
+		self.pending_pos_notifications.lock().unwrap().clone()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{PaymentNotification, PendingPosNotification};
+	use crate::blinded_path::message::BlindedMessagePath;
+	use crate::blinded_path::BlindedHop;
+	use crate::types::payment::PaymentPreimage;
+	use crate::util::ser::{Readable, Writeable};
+	use bitcoin::secp256k1::PublicKey;
+
+	#[test]
+	fn pending_pos_notification_vec_roundtrip() {
+		let dummy_pk = PublicKey::from_slice(&[2; 33]).unwrap();
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			dummy_pk,
+			dummy_pk,
+			vec![BlindedHop { blinded_node_id: dummy_pk, encrypted_payload: vec![1; 32] }],
+		);
+		let pending_notification = PendingPosNotification {
+			notification: PaymentNotification {
+				encrypted_payment_token: vec![1, 2, 3, 4],
+				offer_id: None,
+				amount_msat: Some(42_000),
+				payment_hash: None,
+				preimage: PaymentPreimage([9u8; 32]),
+			},
+			notification_paths: vec![notification_path],
+		};
+
+		let encoded = vec![pending_notification.clone()].encode();
+		let decoded: Vec<PendingPosNotification> =
+			Readable::read(&mut crate::io::Cursor::new(&encoded)).unwrap();
+
+		assert_eq!(decoded, vec![pending_notification]);
 	}
 }

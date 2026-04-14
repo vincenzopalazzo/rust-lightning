@@ -197,6 +197,11 @@ pub enum PaymentPurpose {
 		/// [`Offer`]: crate::offers::offer::Offer
 		/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
 		payment_context: Bolt12OfferContext,
+		/// The encrypted payment token embedded by the PoS in the delegated offer.
+		///
+		/// This is surfaced so the merchant can forward it verbatim when sending a
+		/// [`PaymentNotification`] back to the PoS after the payment is claimed.
+		encrypted_payment_token: Vec<u8>,
 		/// Blinded paths to the PoS for sending payment notifications.
 		///
 		/// The merchant should use these paths to send a [`PaymentNotification`] message
@@ -267,6 +272,7 @@ impl PaymentPurpose {
 						offer_id: context.offer_id,
 						invoice_request: context.invoice_request,
 					},
+					encrypted_payment_token: context.encrypted_payment_token,
 					notification_paths: context.notification_paths,
 				})
 			},
@@ -294,6 +300,7 @@ impl_writeable_tlv_based_enum_legacy!(PaymentPurpose,
 		(2, payment_secret, required),
 		(4, payment_context, required),
 		(6, notification_paths, required_vec),
+		(8, encrypted_payment_token, optional_vec),
 	},
 	;
 	(2, SpontaneousPayment)
@@ -1958,6 +1965,8 @@ impl Writeable for Event {
 				let mut payment_secret = None;
 				let payment_preimage;
 				let mut payment_context = None;
+				let empty_encrypted_payment_token: Vec<u8> = Vec::new();
+				let encrypted_payment_token: &Vec<u8>;
 				let empty_notification_paths: Vec<BlindedMessagePath> = Vec::new();
 				let notification_paths: &Vec<BlindedMessagePath>;
 				match &purpose {
@@ -1967,6 +1976,7 @@ impl Writeable for Event {
 					} => {
 						payment_secret = Some(secret);
 						payment_preimage = *preimage;
+						encrypted_payment_token = &empty_encrypted_payment_token;
 						notification_paths = &empty_notification_paths;
 					},
 					PaymentPurpose::Bolt12OfferPayment {
@@ -1977,6 +1987,7 @@ impl Writeable for Event {
 						payment_secret = Some(secret);
 						payment_preimage = *preimage;
 						payment_context = Some(PaymentContextRef::Bolt12Offer(context));
+						encrypted_payment_token = &empty_encrypted_payment_token;
 						notification_paths = &empty_notification_paths;
 					},
 					PaymentPurpose::Bolt12RefundPayment {
@@ -1987,21 +1998,25 @@ impl Writeable for Event {
 						payment_secret = Some(secret);
 						payment_preimage = *preimage;
 						payment_context = Some(PaymentContextRef::Bolt12Refund(context));
+						encrypted_payment_token = &empty_encrypted_payment_token;
 						notification_paths = &empty_notification_paths;
 					},
 					PaymentPurpose::DelegatedBolt12OfferPayment {
 						payment_preimage: preimage,
 						payment_secret: secret,
 						payment_context: context,
+						encrypted_payment_token: token,
 						notification_paths: paths,
 					} => {
 						payment_secret = Some(secret);
 						payment_preimage = *preimage;
 						payment_context = Some(PaymentContextRef::Bolt12Offer(context));
+						encrypted_payment_token = token;
 						notification_paths = paths;
 					},
 					PaymentPurpose::SpontaneousPayment(preimage) => {
 						payment_preimage = Some(*preimage);
+						encrypted_payment_token = &empty_encrypted_payment_token;
 						notification_paths = &empty_notification_paths;
 					},
 				}
@@ -2037,6 +2052,7 @@ impl Writeable for Event {
 					(13, payment_id, option),
 					(15, *receiving_channel_ids, optional_vec),
 					(17, *notification_paths, optional_vec),
+					(19, *encrypted_payment_token, optional_vec),
 				});
 			},
 			&Event::PaymentSent {
@@ -2491,6 +2507,7 @@ impl MaybeReadable for Event {
 					let mut payment_id = None;
 					let mut receiving_channel_ids_opt = None;
 					let mut notification_paths_opt: Option<Vec<BlindedMessagePath>> = None;
+					let mut encrypted_payment_token_opt: Option<Vec<u8>> = None;
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(1, receiver_node_id, option),
@@ -2507,6 +2524,7 @@ impl MaybeReadable for Event {
 						(13, payment_id, option),
 						(15, receiving_channel_ids_opt, optional_vec),
 						(17, notification_paths_opt, optional_vec),
+						(19, encrypted_payment_token_opt, optional_vec),
 					});
 					let purpose = match payment_secret {
 						Some(secret) => {
@@ -2520,6 +2538,8 @@ impl MaybeReadable for Event {
 										payment_preimage,
 										payment_secret: secret,
 										payment_context: context,
+										encrypted_payment_token: encrypted_payment_token_opt
+											.unwrap_or_default(),
 										notification_paths: paths,
 									}
 								},
@@ -3253,3 +3273,75 @@ impl_writeable_tlv_based_enum!(PaidBolt12Invoice,
 	{0, Bolt12Invoice} => (),
 	{2, StaticInvoice} => (),
 );
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::blinded_path::{message::BlindedMessagePath, BlindedHop};
+	use crate::offers::invoice_request::InvoiceRequestFields;
+	use crate::offers::offer::OfferId;
+	use crate::util::ser::{MaybeReadable, Writeable};
+	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+	fn pubkey(seed: u8) -> PublicKey {
+		let secp_ctx = Secp256k1::new();
+		let secret = SecretKey::from_slice(&[seed; 32]).unwrap();
+		PublicKey::from_secret_key(&secp_ctx, &secret)
+	}
+
+	#[test]
+	fn payment_claimable_roundtrip_preserves_delegated_token() {
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			pubkey(1),
+			pubkey(2),
+			vec![BlindedHop { blinded_node_id: pubkey(3), encrypted_payload: vec![42; 52] }],
+		);
+		let event = Event::PaymentClaimable {
+			receiver_node_id: Some(pubkey(4)),
+			payment_hash: PaymentHash([5; 32]),
+			onion_fields: None,
+			amount_msat: 42_000,
+			counterparty_skimmed_fee_msat: 0,
+			purpose: PaymentPurpose::DelegatedBolt12OfferPayment {
+				payment_preimage: Some(PaymentPreimage([6; 32])),
+				payment_secret: PaymentSecret([7; 32]),
+				payment_context: Bolt12OfferContext {
+					offer_id: OfferId([8; 32]),
+					invoice_request: InvoiceRequestFields {
+						payer_signing_pubkey: pubkey(9),
+						quantity: Some(1),
+						payer_note_truncated: None,
+						human_readable_name: None,
+					},
+				},
+				encrypted_payment_token: vec![1, 2, 3, 4],
+				notification_paths: vec![notification_path],
+			},
+			receiving_channel_ids: Vec::new(),
+			claim_deadline: Some(100),
+			payment_id: Some(PaymentId([10; 32])),
+		};
+
+		let encoded = event.encode();
+		let mut reader = io::Cursor::new(encoded);
+		let decoded = <Event as MaybeReadable>::read(&mut reader).unwrap().unwrap();
+
+		match decoded {
+			Event::PaymentClaimable {
+				purpose:
+					PaymentPurpose::DelegatedBolt12OfferPayment {
+						encrypted_payment_token,
+						notification_paths,
+						payment_context,
+						..
+					},
+				..
+			} => {
+				assert_eq!(encrypted_payment_token, vec![1, 2, 3, 4]);
+				assert_eq!(notification_paths.len(), 1);
+				assert_eq!(payment_context.offer_id, OfferId([8; 32]));
+			},
+			_ => panic!("unexpected event variant after roundtrip"),
+		}
+	}
+}

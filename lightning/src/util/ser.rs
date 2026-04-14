@@ -1104,6 +1104,7 @@ impl_for_vec!(TxInMetadata);
 impl_for_vec!(TxOutMetadata);
 impl_for_vec!(crate::ln::our_peer_storage::PeerStorageMonitorHolder);
 impl_for_vec!(crate::blinded_path::message::BlindedMessagePath);
+impl_for_vec!(crate::offers::flow::PendingPosNotification);
 impl_writeable_for_vec!(&crate::routing::router::BlindedTail);
 impl_readable_for_vec!(crate::routing::router::BlindedTail);
 impl_for_vec!(crate::routing::router::TrampolineHop);
