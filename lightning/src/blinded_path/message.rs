@@ -483,6 +483,25 @@ pub enum OffersContext {
 		/// [`Bolt12Invoice::payment_hash`]: crate::offers::invoice::Bolt12Invoice::payment_hash
 		payment_hash: PaymentHash,
 	},
+	/// Context used by a [`BlindedMessagePath`] within a PoS-delegated [`Offer`].
+	///
+	/// This variant is intended to be received when handling an [`InvoiceRequest`] for an offer
+	/// whose signing key was derived for PoS delegation. Unlike [`OffersContext::InvoiceRequest`],
+	/// the signing key is reconstructed from only the nonce and [`ExpandedKey`], without any
+	/// dependency on the offer's TLV content. This allows a PoS device to freely modify the
+	/// offer template (adding amount, notification paths, encrypted payment tokens) without
+	/// invalidating the merchant's ability to reconstruct the signing key.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
+	DelegatedInvoiceRequest {
+		/// A nonce used for deriving the offer's signing keys via
+		/// [`derive_keys_for_delegation`].
+		///
+		/// [`derive_keys_for_delegation`]: crate::offers::signer::derive_keys_for_delegation
+		nonce: Nonce,
+	},
 }
 
 /// Contains data specific to an [`AsyncPaymentsMessage`].
@@ -664,6 +683,9 @@ impl_writeable_tlv_based_enum!(OffersContext,
 	(4, OutboundPaymentForOffer) => {
 		(0, payment_id, required),
 		(1, nonce, required),
+	},
+	(5, DelegatedInvoiceRequest) => {
+		(0, nonce, required),
 	},
 );
 

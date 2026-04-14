@@ -42,7 +42,8 @@ use crate::offers::invoice_request::{
 	InvoiceRequest, InvoiceRequestBuilder, InvoiceRequestVerifiedFromOffer, VerifiedInvoiceRequest,
 };
 use crate::offers::nonce::Nonce;
-use crate::offers::offer::{Amount, DerivedMetadata, Offer, OfferBuilder};
+use crate::offers::offer::{Amount, DerivedMetadata, ExplicitMetadata, Offer, OfferBuilder};
+use crate::offers::signer;
 use crate::offers::parse::Bolt12SemanticError;
 use crate::offers::refund::{Refund, RefundBuilder};
 use crate::offers::static_invoice::{StaticInvoice, StaticInvoiceBuilder};
@@ -469,6 +470,11 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 					invoice_request,
 				});
 			},
+			Some(OffersContext::DelegatedInvoiceRequest { nonce }) => {
+				let invoice_request =
+					invoice_request.verify_for_delegation(nonce, expanded_key)?;
+				return Ok(InvreqResponseInstructions::SendInvoice(invoice_request));
+			},
 			_ => return Err(()),
 		};
 
@@ -628,6 +634,56 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				.map_err(|_| Bolt12SemanticError::MissingPaths)
 		})
 		.map(|(builder, _)| builder)
+	}
+
+	/// Creates an [`OfferBuilder`] for a PoS-delegated offer template.
+	///
+	/// The resulting [`Offer`] uses a signing pubkey derived from a [`Nonce`] and the node's
+	/// [`ExpandedKey`], with no dependency on the offer's TLV content. This allows a PoS device
+	/// to freely modify the offer (adding amount, notification paths, encrypted payment tokens
+	/// via [`Offer::modify`]) without invalidating the merchant's ability to reconstruct the
+	/// signing key when an [`InvoiceRequest`] arrives.
+	///
+	/// The [`Nonce`] is embedded in the blinded message paths as
+	/// [`OffersContext::DelegatedInvoiceRequest`], which is authenticated by [`ReceiveAuthKey`].
+	/// When an [`InvoiceRequest`] is received through these paths,
+	/// [`Self::verify_invoice_request`] reconstructs the signing key from the nonce alone.
+	///
+	/// Returns the builder and the [`Nonce`] used for key derivation. The nonce is needed if you
+	/// want to derive the same signing key elsewhere.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the parameterized [`Router`] is unable to create a blinded path for
+	/// the offer.
+	///
+	/// This is not exported to bindings users as builder patterns don't map outside of move semantics.
+	///
+	/// [`ExpandedKey`]: crate::ln::inbound_payment::ExpandedKey
+	/// [`Offer::modify`]: crate::offers::offer::Offer::modify
+	/// [`ReceiveAuthKey`]: crate::sign::ReceiveAuthKey
+	pub fn create_delegated_offer_builder<ES: Deref>(
+		&self, entropy_source: ES, peers: Vec<MessageForwardNode>,
+	) -> Result<(OfferBuilder<'static, ExplicitMetadata, secp256k1::SignOnly>, Nonce), Bolt12SemanticError>
+	where
+		ES::Target: EntropySource,
+	{
+		let expanded_key = &self.inbound_payment_key;
+		let nonce = Nonce::from_entropy_source(&*entropy_source);
+		let keys = signer::derive_keys_for_delegation(nonce, expanded_key);
+		let context = MessageContext::Offers(OffersContext::DelegatedInvoiceRequest { nonce });
+
+		let paths = self
+			.create_blinded_paths(peers, context)
+			.map_err(|_| Bolt12SemanticError::MissingPaths)?;
+
+		let mut builder = OfferBuilder::new(keys.public_key()).chain_hash(self.chain_hash);
+
+		for path in paths.into_iter().take(1) {
+			builder = builder.path(path);
+		}
+
+		Ok((builder, nonce))
 	}
 
 	/// Create an offer for receiving async payments as an often-offline recipient.

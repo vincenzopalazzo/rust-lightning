@@ -82,7 +82,7 @@ use crate::offers::offer::{
 };
 use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
 use crate::offers::payer::{PayerContents, PayerTlvStream, PayerTlvStreamRef};
-use crate::offers::signer::{Metadata, MetadataMaterial};
+use crate::offers::signer::{self, Metadata, MetadataMaterial};
 use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::types::features::InvoiceRequestFeatures;
 use crate::types::payment::PaymentHash;
@@ -920,6 +920,50 @@ macro_rules! invoice_request_verify_method {
 		};
 
 		Ok(verified)
+	}
+
+	/// Verifies that the request was for a PoS-delegated offer by reconstructing the signing key
+	/// from the given [`Nonce`] and [`ExpandedKey`], without any dependency on the offer's TLV
+	/// content.
+	///
+	/// This is used for offers created via
+	/// [`OffersMessageFlow::create_delegated_offer_builder`] where the signing key is derived
+	/// purely from the nonce embedded in the [`OffersContext::DelegatedInvoiceRequest`] blinded
+	/// path context. Since the blinded path context is authenticated by [`ReceiveAuthKey`], the
+	/// nonce is trustworthy and no TLV-based HMAC verification is needed.
+	///
+	/// Returns the verified request with the derived signing keys.
+	///
+	/// [`OffersMessageFlow::create_delegated_offer_builder`]: crate::offers::flow::OffersMessageFlow::create_delegated_offer_builder
+	/// [`OffersContext::DelegatedInvoiceRequest`]: crate::blinded_path::message::OffersContext::DelegatedInvoiceRequest
+	/// [`ReceiveAuthKey`]: crate::sign::ReceiveAuthKey
+	pub fn verify_for_delegation(
+		$self: $self_type, nonce: Nonce, key: &ExpandedKey,
+	) -> Result<InvoiceRequestVerifiedFromOffer, ()> {
+		let signing_pubkey = match $self.contents.inner.offer.issuer_signing_pubkey() {
+			Some(pubkey) => pubkey,
+			None => return Err(()),
+		};
+
+		let keys = signer::derive_keys_for_delegation(nonce, key);
+		if keys.public_key() != signing_pubkey {
+			return Err(());
+		}
+
+		let offer_id = OfferId::from_valid_bolt12_tlv_stream(&$self.bytes);
+
+		let inner = {
+			#[cfg(not(c_bindings))]
+			{ $self }
+			#[cfg(c_bindings)]
+			{ $self.clone() }
+		};
+
+		Ok(InvoiceRequestVerifiedFromOffer::DerivedKeys(VerifiedInvoiceRequest {
+			offer_id,
+			inner,
+			keys: DerivedSigningPubkey(keys),
+		}))
 	}
 	};
 }
