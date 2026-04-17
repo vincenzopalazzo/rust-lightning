@@ -37,7 +37,7 @@ use crate::ln::outbound_payment::RecipientOnionFields;
 use crate::ln::outbound_payment::Retry;
 use crate::ln::peer_handler::IgnoringMessageHandler;
 use crate::ln::types::ChannelId;
-use crate::offers::payer_proof::Bolt12InvoiceType;
+use crate::offers::payer_proof::PaidBolt12Invoice;
 use crate::onion_message::messenger::OnionMessenger;
 use crate::routing::gossip::{NetworkGraph, NetworkUpdate, P2PGossipSync};
 use crate::routing::router::{self, PaymentParameters, Route, RouteParameters};
@@ -2986,7 +2986,7 @@ pub fn expect_payment_sent<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 	node: &H, expected_payment_preimage: PaymentPreimage,
 	expected_fee_msat_opt: Option<Option<u64>>, expect_per_path_claims: bool,
 	expect_post_ev_mon_update: bool,
-) -> (Option<Bolt12InvoiceType>, Vec<Event>) {
+) -> (Option<PaidBolt12Invoice>, Vec<Event>) {
 	if expect_post_ev_mon_update {
 		check_added_monitors(node, 0);
 	}
@@ -3013,6 +3013,7 @@ pub fn expect_payment_sent<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 			ref amount_msat,
 			ref fee_paid_msat,
 			ref bolt12_invoice,
+			..
 		} => {
 			assert_eq!(expected_payment_preimage, *payment_preimage);
 			assert_eq!(expected_payment_hash, *payment_hash);
@@ -4210,7 +4211,7 @@ pub fn pass_claimed_payment_along_route_from_ev(
 
 pub fn claim_payment_along_route(
 	args: ClaimAlongRouteArgs,
-) -> (Option<Bolt12InvoiceType>, Vec<Event>) {
+) -> (Option<PaidBolt12Invoice>, Vec<Event>) {
 	let ClaimAlongRouteArgs {
 		origin_node,
 		payment_preimage,
@@ -4232,7 +4233,7 @@ pub fn claim_payment_along_route(
 pub fn claim_payment<'a, 'b, 'c>(
 	origin_node: &Node<'a, 'b, 'c>, expected_route: &[&Node<'a, 'b, 'c>],
 	our_payment_preimage: PaymentPreimage,
-) -> Option<Bolt12InvoiceType> {
+) -> Option<PaidBolt12Invoice> {
 	claim_payment_along_route(ClaimAlongRouteArgs::new(
 		origin_node,
 		&[expected_route],

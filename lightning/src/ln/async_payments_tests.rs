@@ -42,7 +42,6 @@ use crate::offers::flow::{
 use crate::offers::invoice_request::InvoiceRequest;
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Amount, Offer};
-use crate::offers::payer_proof::Bolt12InvoiceType;
 use crate::offers::static_invoice::{
 	StaticInvoice, StaticInvoiceBuilder,
 	DEFAULT_RELATIVE_EXPIRY as STATIC_INVOICE_DEFAULT_RELATIVE_EXPIRY,
@@ -992,7 +991,7 @@ fn ignore_duplicate_invoice() {
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let (res, _) =
 		claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
-	assert_eq!(res, Some(Bolt12InvoiceType::StaticInvoice(static_invoice.clone())));
+	assert_eq!(res.as_ref().and_then(|paid| paid.static_invoice()), Some(&static_invoice));
 
 	// After paying the static invoice, check that regular invoice received from async recipient is ignored.
 	match sender.onion_messenger.peel_onion_message(&invoice_om) {
@@ -1077,7 +1076,7 @@ fn ignore_duplicate_invoice() {
 
 	// After paying invoice, check that static invoice is ignored.
 	let res = claim_payment(sender, route[0], payment_preimage);
-	assert_eq!(res, Some(Bolt12InvoiceType::Bolt12Invoice(invoice)));
+	assert_eq!(res.as_ref().and_then(|paid| paid.bolt12_invoice()), Some(&invoice));
 
 	sender.onion_messenger.handle_onion_message(always_online_node_id, &static_invoice_om);
 	let async_pmts_msgs = AsyncPaymentsMessageHandler::release_pending_messages(sender.node);
@@ -1148,7 +1147,7 @@ fn async_receive_flow_success() {
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let (res, _) =
 		claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], route, keysend_preimage));
-	assert_eq!(res, Some(Bolt12InvoiceType::StaticInvoice(static_invoice)));
+	assert_eq!(res.as_ref().and_then(|paid| paid.static_invoice()), Some(&static_invoice));
 }
 
 #[cfg_attr(feature = "std", ignore)]
@@ -2392,7 +2391,7 @@ fn refresh_static_invoices_for_used_offers() {
 	let claimable_ev = do_pass_along_path(args).unwrap();
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let res = claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
-	assert_eq!(res.0, Some(Bolt12InvoiceType::StaticInvoice(updated_invoice)));
+	assert_eq!(res.0.as_ref().and_then(|paid| paid.static_invoice()), Some(&updated_invoice));
 }
 
 #[cfg_attr(feature = "std", ignore)]
@@ -2727,7 +2726,7 @@ fn invoice_server_is_not_channel_peer() {
 	let claimable_ev = do_pass_along_path(args).unwrap();
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let res = claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
-	assert_eq!(res.0, Some(Bolt12InvoiceType::StaticInvoice(invoice)));
+	assert_eq!(res.0.as_ref().and_then(|paid| paid.static_invoice()), Some(&invoice));
 }
 
 #[test]
@@ -2970,7 +2969,7 @@ fn async_payment_e2e() {
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let (res, _) =
 		claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
-	assert_eq!(res, Some(Bolt12InvoiceType::StaticInvoice(static_invoice)));
+	assert_eq!(res.as_ref().and_then(|paid| paid.static_invoice()), Some(&static_invoice));
 }
 
 #[test]
@@ -3207,7 +3206,7 @@ fn intercepted_hold_htlc() {
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let (res, _) =
 		claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
-	assert_eq!(res, Some(Bolt12InvoiceType::StaticInvoice(static_invoice)));
+	assert_eq!(res.as_ref().and_then(|paid| paid.static_invoice()), Some(&static_invoice));
 }
 
 #[test]
@@ -3457,7 +3456,7 @@ fn release_htlc_races_htlc_onion_decode() {
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let (res, _) =
 		claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
-	assert_eq!(res, Some(Bolt12InvoiceType::StaticInvoice(static_invoice)));
+	assert_eq!(res.as_ref().and_then(|paid| paid.static_invoice()), Some(&static_invoice));
 }
 
 #[test]
@@ -3621,5 +3620,5 @@ fn async_payment_e2e_release_before_hold_registered() {
 	let keysend_preimage = extract_payment_preimage(&claimable_ev);
 	let (res, _) =
 		claim_payment_along_route(ClaimAlongRouteArgs::new(sender, route, keysend_preimage));
-	assert_eq!(res, Some(Bolt12InvoiceType::StaticInvoice(static_invoice)));
+	assert_eq!(res.as_ref().and_then(|paid| paid.static_invoice()), Some(&static_invoice));
 }
