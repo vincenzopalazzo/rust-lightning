@@ -625,7 +625,7 @@ type PartialInvoiceTlvStream =
 type PartialInvoiceTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceTlvStreamRef,
 );
 
@@ -768,7 +768,7 @@ mod tests {
 		OfferTlvStreamRef<'a>,
 		InvoiceTlvStreamRef<'a>,
 		SignatureTlvStreamRef<'a>,
-		ExperimentalOfferTlvStreamRef,
+		ExperimentalOfferTlvStreamRef<'a>,
 		ExperimentalInvoiceTlvStreamRef,
 	);
 
@@ -790,12 +790,12 @@ mod tests {
 		}
 	}
 
-	fn tlv_stream_to_bytes(
+	fn tlv_stream_to_bytes<'a>(
 		tlv_stream: &(
-			OfferTlvStreamRef,
-			InvoiceTlvStreamRef,
-			SignatureTlvStreamRef,
-			ExperimentalOfferTlvStreamRef,
+			OfferTlvStreamRef<'a>,
+			InvoiceTlvStreamRef<'a>,
+			SignatureTlvStreamRef<'a>,
+			ExperimentalOfferTlvStreamRef<'a>,
 			ExperimentalInvoiceTlvStreamRef,
 		),
 	) -> Vec<u8> {
@@ -934,7 +934,11 @@ mod tests {
 					held_htlc_available_paths: Some(&paths),
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None
+				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			)
 		);

@@ -247,6 +247,8 @@ macro_rules! offer_explicit_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(signing_pubkey),
+					notification_paths: None,
+					payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -301,6 +303,8 @@ macro_rules! offer_derived_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(node_id),
+					notification_paths: None,
+					payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -632,6 +636,8 @@ pub(super) struct OfferContents {
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
 	issuer_signing_pubkey: Option<PublicKey>,
+	notification_paths: Option<Vec<BlindedMessagePath>>,
+	payment_token: Option<Vec<u8>>,
 	#[cfg(test)]
 	experimental_foo: Option<u64>,
 }
@@ -708,6 +714,31 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 	pub fn issuer_signing_pubkey(&$self) -> Option<bitcoin::secp256k1::PublicKey> {
 		$contents.issuer_signing_pubkey()
 	}
+
+	/// Blinded paths to a point-of-sale device for delivering payment notifications when a
+	/// payment for this offer is claimed by the merchant. Set by an `OfferModifier` for
+	/// PoS-delegated payment flows; otherwise returns an empty slice.
+	///
+	/// Defined in BLIP-0056 (BOLT 12 PoS notifications). Encoded in experimental TLV record
+	/// type `1_000_000_001` (subject to change before BLIP finalization).
+	pub fn notification_paths(&$self) -> &[$crate::blinded_path::message::BlindedMessagePath] {
+		$contents.notification_paths()
+	}
+
+	/// Opaque payment token used by the merchant to correlate an incoming [`InvoiceRequest`] with
+	/// a particular order. Set by an `OfferModifier` for PoS-delegated payment flows.
+	///
+	/// The token is opaque at the wire-format level; its internal structure (e.g., a hashed
+	/// order id with a merchant signature) is defined by the merchant and is not interpreted by
+	/// this crate.
+	///
+	/// Defined in BLIP-0056 (BOLT 12 PoS notifications). Encoded in experimental TLV record
+	/// type `1_000_000_003` (subject to change before BLIP finalization).
+	///
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	pub fn payment_token(&$self) -> Option<&[u8]> {
+		$contents.payment_token()
+	}
 } }
 
 impl Offer {
@@ -762,6 +793,74 @@ impl Offer {
 		&self, nonce: Nonce, key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
 		self.contents.verify_using_recipient_data(&self.bytes, nonce, key, secp_ctx)
+	}
+
+	/// Returns an [`OfferModifier`] for adding BLIP-0056 PoS-delegation TLVs
+	/// ([`Offer::notification_paths`] and [`Offer::payment_token`]) to this offer.
+	///
+	/// Used by a point-of-sale device that holds a merchant's template offer and needs to
+	/// extend it per-order. The modifier rewrites the offer's serialized bytes and recomputes
+	/// the [`OfferId`]; the canonical (non-experimental) TLVs are preserved unchanged.
+	///
+	/// See [`OfferModifier`] for the threat model and constraints.
+	#[cfg(not(c_bindings))]
+	pub fn modify(self) -> OfferModifier {
+		OfferModifier { offer: self.contents }
+	}
+}
+
+/// Builder used by a third party (typically a point-of-sale device) to extend a merchant's
+/// template [`Offer`] with order-specific data before presenting it to a customer.
+///
+/// The merchant publishes a template offer (typically without amount, description, or
+/// per-order data) and a PoS device modifies it per order via [`Offer::modify`] to add
+/// [`Offer::notification_paths`] and [`Offer::payment_token`]. The customer scans the
+/// modified offer and pays it like any other BOLT 12 offer.
+///
+/// Modifications only set the experimental TLV fields used for PoS delegation
+/// ([`Offer::notification_paths`] and [`Offer::payment_token`]); they do not touch any
+/// merchant-signed canonical fields. With derived-metadata signing the merchant must use
+/// TLV-free signing-key derivation so the signature remains valid after PoS modification;
+/// that derivation is added in a follow-up change.
+///
+/// This is part of BLIP-0056 (BOLT 12 PoS notifications) and is experimental: TLV type
+/// numbers and field shapes may change before BLIP finalization.
+///
+/// This is not exported to bindings users as builder patterns don't map outside of move
+/// semantics.
+#[cfg(not(c_bindings))]
+pub struct OfferModifier {
+	offer: OfferContents,
+}
+
+#[cfg(not(c_bindings))]
+impl OfferModifier {
+	/// Sets [`Offer::notification_paths`] on the modified offer.
+	///
+	/// Successive calls override the previous setting.
+	pub fn notification_paths(mut self, paths: Vec<BlindedMessagePath>) -> Self {
+		self.offer.notification_paths = Some(paths);
+		self
+	}
+
+	/// Sets [`Offer::payment_token`] on the modified offer to the provided opaque bytes.
+	///
+	/// Successive calls override the previous setting.
+	pub fn payment_token(mut self, token: Vec<u8>) -> Self {
+		self.offer.payment_token = Some(token);
+		self
+	}
+
+	/// Builds the modified [`Offer`], serializing the new experimental TLV records into its
+	/// bytes and recomputing its [`OfferId`].
+	pub fn build(self) -> Offer {
+		const OFFER_ALLOCATION_SIZE: usize = 512;
+		let mut bytes = Vec::with_capacity(OFFER_ALLOCATION_SIZE);
+		self.offer.write(&mut bytes).unwrap();
+
+		let id = OfferId::from_valid_offer_tlv_stream(&bytes);
+
+		Offer { bytes, contents: self.offer, id }
 	}
 }
 
@@ -930,6 +1029,14 @@ impl OfferContents {
 		self.paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
 	}
 
+	pub fn notification_paths(&self) -> &[BlindedMessagePath] {
+		self.notification_paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
+	}
+
+	pub fn payment_token(&self) -> Option<&[u8]> {
+		self.payment_token.as_deref()
+	}
+
 	pub(super) fn check_amount_msats_for_quantity(
 		&self, amount_msats: Option<u64>, quantity: Option<u64>,
 	) -> Result<(), Bolt12SemanticError> {
@@ -1075,6 +1182,8 @@ impl OfferContents {
 		};
 
 		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			notification_paths: self.notification_paths.as_ref(),
+			payment_token: self.payment_token.as_ref(),
 			#[cfg(test)]
 			experimental_foo: self.experimental_foo,
 		};
@@ -1231,18 +1340,35 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 /// Valid type range for experimental offer TLV records.
 pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
 
+/// TLV record type for [`Offer::notification_paths`].
+///
+/// Defined in BLIP-0056 (BOLT 12 PoS notifications). Odd-numbered to remain backwards-compatible
+/// with customer wallets that have not implemented BLIP-0056 — those wallets will pass the
+/// record through as an unknown odd TLV.
+const OFFER_NOTIFICATION_PATHS_TYPE: u64 = 1_000_000_001;
+
+/// TLV record type for [`Offer::payment_token`].
+///
+/// Defined in BLIP-0056 (BOLT 12 PoS notifications). Odd-numbered for the same reason as
+/// [`OFFER_NOTIFICATION_PATHS_TYPE`].
+const OFFER_PAYMENT_TOKEN_TYPE: u64 = 1_000_000_003;
+
 #[cfg(not(test))]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATHS_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_PAYMENT_TOKEN_TYPE, payment_token: (Vec<u8>, WithoutLength)),
 });
 
 #[cfg(test)]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATHS_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_PAYMENT_TOKEN_TYPE, payment_token: (Vec<u8>, WithoutLength)),
 	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
 });
 
 type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
 
-type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef);
+type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef<'a>);
 
 impl CursorReadable for FullOfferTlvStream {
 	fn read<R: AsRef<[u8]>>(r: &mut io::Cursor<R>) -> Result<Self, DecodeError> {
@@ -1297,6 +1423,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 				issuer_id,
 			},
 			ExperimentalOfferTlvStream {
+				notification_paths,
+				payment_token,
 				#[cfg(test)]
 				experimental_foo,
 			},
@@ -1353,6 +1481,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 			paths,
 			supported_quantity,
 			issuer_signing_pubkey,
+			notification_paths,
+			payment_token,
 			#[cfg(test)]
 			experimental_foo,
 		})
@@ -1447,7 +1577,11 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None
+				},
 			),
 		);
 
@@ -1805,6 +1939,99 @@ mod tests {
 		assert_ne!(pubkey(42), pubkey(44));
 		assert_eq!(tlv_stream.0.paths, Some(&paths));
 		assert_eq!(tlv_stream.0.issuer_id, Some(&pubkey(42)));
+	}
+
+	#[test]
+	#[cfg(not(c_bindings))]
+	fn modifier_adds_pos_delegation_tlvs() {
+		let notification_paths = vec![
+			BlindedMessagePath::from_blinded_path(
+				pubkey(40),
+				pubkey(41),
+				vec![BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] }],
+			),
+			BlindedMessagePath::from_blinded_path(
+				pubkey(40),
+				pubkey(41),
+				vec![BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] }],
+			),
+		];
+		let payment_token = vec![7u8; 96];
+
+		let template = OfferBuilder::new(pubkey(42))
+			.description("coffee".into())
+			.amount_msats(20_000)
+			.build()
+			.unwrap();
+		assert_eq!(template.notification_paths(), &[][..]);
+		assert_eq!(template.payment_token(), None);
+
+		let modified = template
+			.modify()
+			.notification_paths(notification_paths.clone())
+			.payment_token(payment_token.clone())
+			.build();
+
+		assert_eq!(modified.notification_paths(), notification_paths.as_slice());
+		assert_eq!(modified.payment_token(), Some(payment_token.as_slice()));
+
+		// Canonical fields are preserved across modification.
+		assert_eq!(modified.description(), Some(PrintableString("coffee")));
+		assert_eq!(modified.amount(), Some(Amount::Bitcoin { amount_msats: 20_000 }));
+		assert_eq!(modified.issuer_signing_pubkey(), Some(pubkey(42)));
+
+		// New TLV records are present in the experimental TLV stream.
+		let tlv_stream = modified.as_tlv_stream();
+		assert_eq!(tlv_stream.1.notification_paths, Some(&notification_paths));
+		assert_eq!(tlv_stream.1.payment_token, Some(&payment_token));
+
+		// The modified offer round-trips through bech32 serialization with both fields intact.
+		let bytes = modified.to_string().parse::<Offer>().unwrap();
+		assert_eq!(bytes.notification_paths(), notification_paths.as_slice());
+		assert_eq!(bytes.payment_token(), Some(payment_token.as_slice()));
+	}
+
+	#[test]
+	#[cfg(not(c_bindings))]
+	fn modifier_overrides_successive_settings() {
+		let path_a = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] }],
+		);
+		let path_b = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] }],
+		);
+
+		let template = OfferBuilder::new(pubkey(42)).build().unwrap();
+		let modified = template
+			.modify()
+			.notification_paths(vec![path_a])
+			.notification_paths(vec![path_b.clone()])
+			.payment_token(vec![1u8; 8])
+			.payment_token(vec![2u8; 16])
+			.build();
+
+		assert_eq!(modified.notification_paths(), &[path_b][..]);
+		assert_eq!(modified.payment_token(), Some(&[2u8; 16][..]));
+	}
+
+	#[test]
+	#[cfg(not(c_bindings))]
+	fn modifier_recomputes_offer_id() {
+		let template = OfferBuilder::new(pubkey(42))
+			.description("coffee".into())
+			.amount_msats(20_000)
+			.build()
+			.unwrap();
+		let template_id = template.id();
+
+		let modified = template.modify().payment_token(vec![9u8; 32]).build();
+
+		// Adding experimental TLVs changes the serialized bytes, so the OfferId must change.
+		assert_ne!(modified.id(), template_id);
 	}
 
 	#[test]
@@ -2220,11 +2447,15 @@ mod tests {
 
 	#[test]
 	fn parses_offer_with_experimental_tlv_records() {
+		// Use an unknown odd type. The lowest few odd types in the experimental range are
+		// already claimed by BLIP-0056 PoS-delegation fields (notification_paths at
+		// EXPERIMENTAL_OFFER_TYPES.start + 1, payment_token at EXPERIMENTAL_OFFER_TYPES.start + 3),
+		// so probe at + 5 which remains unallocated.
 		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
 
 		let mut encoded_offer = Vec::new();
 		offer.write(&mut encoded_offer).unwrap();
-		BigSize(EXPERIMENTAL_OFFER_TYPES.start + 1).write(&mut encoded_offer).unwrap();
+		BigSize(EXPERIMENTAL_OFFER_TYPES.start + 5).write(&mut encoded_offer).unwrap();
 		BigSize(32).write(&mut encoded_offer).unwrap();
 		[42u8; 32].write(&mut encoded_offer).unwrap();
 
