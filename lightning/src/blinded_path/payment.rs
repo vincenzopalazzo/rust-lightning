@@ -571,12 +571,25 @@ pub enum PaymentContext {
 	///
 	/// [`Refund`]: crate::offers::refund::Refund
 	Bolt12Refund(Bolt12RefundContext),
+
+	/// The payment was made for a BLIP-0056 PoS-delegated BOLT 12 [`Offer`]: a merchant
+	/// template offer that a point-of-sale device extended with order-specific data before
+	/// presenting it to the customer.
+	///
+	/// Carries the `order_hash` and the `notification_paths` the merchant must use to deliver
+	/// the [`PaymentNotification`] back to the PoS device once the payment is claimed.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	/// [`PaymentNotification`]: crate::onion_message::pos_notification::PaymentNotification
+	DelegatedBolt12Offer(DelegatedBolt12OfferContext),
 }
 
 // Used when writing PaymentContext in Event::PaymentClaimable to avoid cloning.
 pub(crate) enum PaymentContextRef<'a> {
 	Bolt12Offer(&'a Bolt12OfferContext),
 	Bolt12Refund(&'a Bolt12RefundContext),
+	#[allow(dead_code)] // wired up by later patches in the BLIP-0056 stack
+	DelegatedBolt12Offer(&'a DelegatedBolt12OfferContext),
 }
 
 /// The context of a payment made for an invoice requested from a BOLT 12 [`Offer`].
@@ -613,6 +626,32 @@ pub struct AsyncBolt12OfferContext {
 /// [`Refund`]: crate::offers::refund::Refund
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bolt12RefundContext {}
+
+/// The context of a payment made for a BLIP-0056 PoS-delegated BOLT 12 [`Offer`].
+///
+/// Persisted alongside the payment so the merchant can re-derive everything needed to send a
+/// [`PaymentNotification`] back to the PoS device once `PaymentClaimable` fires, without having
+/// to re-read the original offer or the customer's `invoice_request`.
+///
+/// [`Offer`]: crate::offers::offer::Offer
+/// [`PaymentNotification`]: crate::onion_message::pos_notification::PaymentNotification
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedBolt12OfferContext {
+	/// 32-byte order hash matching the offer's `payment_token` TLV (added by the PoS via
+	/// [`OfferModifier`]).
+	///
+	/// The merchant uses this to look up the order in its order book and to authenticate the
+	/// notification it will send back to the PoS.
+	///
+	/// [`OfferModifier`]: crate::offers::offer::OfferModifier
+	pub order_hash: [u8; 32],
+
+	/// Blinded message paths to the PoS device, published in the offer's `notification_paths`
+	/// TLV. The merchant sends the [`PaymentNotification`] over (one of) these paths.
+	///
+	/// [`PaymentNotification`]: crate::onion_message::pos_notification::PaymentNotification
+	pub notification_paths: Vec<crate::blinded_path::message::BlindedMessagePath>,
+}
 
 impl TryFrom<CounterpartyForwardingInfo> for PaymentRelay {
 	type Error = ();
@@ -1010,6 +1049,7 @@ impl_writeable_tlv_based_enum_legacy!(PaymentContext,
 	(1, Bolt12Offer),
 	(2, Bolt12Refund),
 	(3, AsyncBolt12Offer),
+	(4, DelegatedBolt12Offer),
 );
 
 impl<'a> Writeable for PaymentContextRef<'a> {
@@ -1021,6 +1061,10 @@ impl<'a> Writeable for PaymentContextRef<'a> {
 			},
 			PaymentContextRef::Bolt12Refund(context) => {
 				2u8.write(w)?;
+				context.write(w)?;
+			},
+			PaymentContextRef::DelegatedBolt12Offer(context) => {
+				4u8.write(w)?;
 				context.write(w)?;
 			},
 		}
@@ -1039,6 +1083,11 @@ impl_writeable_tlv_based!(AsyncBolt12OfferContext, {
 });
 
 impl_writeable_tlv_based!(Bolt12RefundContext, {});
+
+impl_writeable_tlv_based!(DelegatedBolt12OfferContext, {
+	(0, order_hash, required),
+	(2, notification_paths, required_vec),
+});
 
 #[cfg(test)]
 mod tests {

@@ -221,6 +221,13 @@ impl PaymentPurpose {
 				debug_assert!(false);
 				Err(())
 			},
+			Some(PaymentContext::DelegatedBolt12Offer(_)) => {
+				// Surfacing a BLIP-0056 PoS-delegated payment as a `PaymentPurpose` requires the
+				// `DelegatedBolt12OfferPayment` variant introduced by a later patch in this stack.
+				// Until that lands, callers must not pass this variant to `from_parts`.
+				debug_assert!(false);
+				Err(())
+			},
 		}
 	}
 }
