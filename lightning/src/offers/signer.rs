@@ -321,6 +321,33 @@ pub(super) fn derive_keys(nonce: Nonce, expanded_key: &ExpandedKey) -> Keypair {
 	Keypair::from_secret_key(&secp_ctx, &privkey)
 }
 
+/// Derives a signing [`Keypair`] for a BLIP-0056 PoS-delegated offer from the given [`Nonce`] and
+/// [`ExpandedKey`].
+///
+/// Unlike [`derive_keys`] used for standard offers, the derivation here depends only on the nonce
+/// and the merchant's expanded key material — it has no dependency on offer TLV content. This
+/// allows a point-of-sale device to freely modify the merchant's template offer (adding amount,
+/// description, notification paths, payment token) without invalidating the merchant's ability to
+/// reconstruct the signing key when the customer's `invoice_request` arrives.
+///
+/// Authentication that the nonce is genuine is provided by an out-of-band channel (e.g., the
+/// reply path the merchant publishes alongside the template offer); this primitive only handles
+/// key derivation.
+///
+/// The `IV_BYTES` constant is domain-separated from [`derive_keys`] so a key derived for one
+/// purpose cannot be reused for the other.
+#[allow(dead_code)] // wired up by later patches in the BLIP-0056 stack
+pub(crate) fn derive_keys_for_delegation(nonce: Nonce, expanded_key: &ExpandedKey) -> Keypair {
+	const IV_BYTES: &[u8; IV_LEN] = b"LDK Delegation ~";
+	let mut hmac = expanded_key.hmac_for_offer();
+	hmac.input(IV_BYTES);
+	hmac.input(&nonce.0);
+
+	let secp_ctx = Secp256k1::new();
+	let privkey = SecretKey::from_slice(Hmac::from_engine(hmac).as_byte_array()).unwrap();
+	Keypair::from_secret_key(&secp_ctx, &privkey)
+}
+
 /// Verifies data given in a TLV stream was used to produce the given metadata, consisting of:
 /// - a 256-bit [`PaymentId`],
 /// - a 128-bit [`Nonce`], and possibly
