@@ -1838,8 +1838,9 @@ impl Readable for InvoiceRequestFields {
 mod tests {
 	use super::{
 		ExperimentalInvoiceRequestTlvStreamRef, InvoiceRequest, InvoiceRequestFields,
-		InvoiceRequestTlvStreamRef, UnsignedInvoiceRequest, EXPERIMENTAL_INVOICE_REQUEST_TYPES,
-		INVOICE_REQUEST_TYPES, PAYER_NOTE_LIMIT, SIGNATURE_TAG,
+		InvoiceRequestRecurrence, InvoiceRequestTlvStreamRef, PartialInvoiceRequestTlvStreamRef,
+		UnsignedInvoiceRequest, EXPERIMENTAL_INVOICE_REQUEST_TYPES, INVOICE_REQUEST_TYPES,
+		PAYER_NOTE_LIMIT, SIGNATURE_TAG,
 	};
 
 	use crate::ln::channelmanager::PaymentId;
@@ -1854,20 +1855,41 @@ mod tests {
 	#[cfg(c_bindings)]
 	use crate::offers::offer::OfferWithExplicitMetadataBuilder as OfferBuilder;
 	use crate::offers::offer::{
-		Amount, CurrencyCode, ExperimentalOfferTlvStreamRef, OfferTlvStreamRef, Quantity,
+		Amount, CurrencyCode, ExperimentalOfferTlvStreamRef, Offer, OfferTlvStreamRef, Quantity,
+		Recurrence, RecurrenceBase, RecurrenceLimit, RecurrencePeriod, RecurrenceType,
 	};
 	use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError};
 	use crate::offers::payer::PayerTlvStreamRef;
 	use crate::offers::test_utils::*;
 	use crate::types::features::{InvoiceRequestFeatures, OfferFeatures};
 	use crate::types::string::{PrintableString, UntrustedString};
-	use crate::util::ser::{BigSize, Readable, Writeable};
+	use crate::util::ser::{BigSize, FixedLengthReader, Readable, Writeable};
 	use bitcoin::constants::ChainHash;
 	use bitcoin::network::Network;
 	use bitcoin::secp256k1::{self, Keypair, Secp256k1, SecretKey};
 	use core::num::NonZeroU64;
 	#[cfg(feature = "std")]
 	use core::time::Duration;
+
+	trait ToBytes {
+		fn to_bytes(&self) -> Vec<u8>;
+	}
+
+	impl<'a> ToBytes for (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef) {
+		fn to_bytes(&self) -> Vec<u8> {
+			let mut buffer = Vec::new();
+			self.write(&mut buffer).unwrap();
+			buffer
+		}
+	}
+
+	impl<'a> ToBytes for PartialInvoiceRequestTlvStreamRef<'a> {
+		fn to_bytes(&self) -> Vec<u8> {
+			let mut buffer = Vec::new();
+			self.write(&mut buffer).unwrap();
+			buffer
+		}
+	}
 
 	#[test]
 	fn builds_invoice_request_with_defaults() {
@@ -3230,6 +3252,252 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_invoice_request_with_recurrence() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let recurrence_period = RecurrencePeriod::Months(3);
+		let recurrence_base = RecurrenceBase { proportional: false, basetime: 123_456 };
+
+		let offer = OfferBuilder::new(recipient_pubkey()).build().unwrap();
+		let mut tlv_stream = offer.as_tlv_stream();
+		tlv_stream.0.recurrence_compulsory = Some(&recurrence_period);
+		tlv_stream.0.recurrence_base = Some(&recurrence_base);
+		let offer = Offer::try_from(tlv_stream.to_bytes()).unwrap();
+
+		let (mut unsigned_invoice_request, payer_keys, _) = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.amount_msats(1000)
+			.unwrap()
+			.build_without_checks();
+		let recurrence_prev_state = vec![1, 2, 3];
+		let mut tlv_stream = unsigned_invoice_request.contents.as_tlv_stream();
+		tlv_stream.2.recurrence_counter = Some(3);
+		tlv_stream.2.recurrence_start = Some(2);
+		tlv_stream.2.recurrence_cancel = Some(&());
+		tlv_stream.2.recurrence_prev_state = Some(&recurrence_prev_state);
+		unsigned_invoice_request.bytes = tlv_stream.to_bytes();
+		unsigned_invoice_request.tagged_hash =
+			TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &unsigned_invoice_request.bytes);
+
+		let keys = payer_keys.unwrap();
+		let invoice_request = unsigned_invoice_request
+			.sign(|message: &UnsignedInvoiceRequest| {
+				Ok(secp_ctx.sign_schnorr_no_aux_rand(message.as_ref().as_digest(), &keys))
+			})
+			.unwrap();
+
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+
+		match InvoiceRequest::try_from(buffer) {
+			Ok(invoice_request) => match invoice_request.invoice_request_recurrence() {
+				Some(InvoiceRequestRecurrence::WithOfferBasetime(recurrence)) => {
+					assert_eq!(recurrence.counter(), 3);
+					assert_eq!(recurrence.start(), 2);
+					assert_eq!(recurrence.prev_state(), Some(&[1, 2, 3][..]));
+					assert!(recurrence.cancel());
+				},
+				_ => panic!("expected recurrence with offer basetime"),
+			},
+			Err(e) => panic!("error parsing invoice_request: {:?}", e),
+		}
+
+		let offer = OfferBuilder::new(recipient_pubkey()).build().unwrap();
+		let mut tlv_stream = offer.as_tlv_stream();
+		tlv_stream.0.recurrence_optional = Some(&recurrence_period);
+		let offer = Offer::try_from(tlv_stream.to_bytes()).unwrap();
+
+		let (mut unsigned_invoice_request, payer_keys, _) = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.amount_msats(1000)
+			.unwrap()
+			.build_without_checks();
+		let recurrence_prev_state = vec![4, 5, 6];
+		let mut tlv_stream = unsigned_invoice_request.contents.as_tlv_stream();
+		tlv_stream.2.recurrence_counter = Some(2);
+		tlv_stream.2.recurrence_cancel = Some(&());
+		tlv_stream.2.recurrence_prev_state = Some(&recurrence_prev_state);
+		unsigned_invoice_request.bytes = tlv_stream.to_bytes();
+		unsigned_invoice_request.tagged_hash =
+			TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &unsigned_invoice_request.bytes);
+
+		let keys = payer_keys.unwrap();
+		let invoice_request = unsigned_invoice_request
+			.sign(|message: &UnsignedInvoiceRequest| {
+				Ok(secp_ctx.sign_schnorr_no_aux_rand(message.as_ref().as_digest(), &keys))
+			})
+			.unwrap();
+
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+
+		match InvoiceRequest::try_from(buffer) {
+			Ok(invoice_request) => match invoice_request.invoice_request_recurrence() {
+				Some(InvoiceRequestRecurrence::WithoutOfferBasetime(recurrence)) => {
+					assert_eq!(recurrence.counter(), 2);
+					assert_eq!(recurrence.prev_state(), Some(&[4, 5, 6][..]));
+					assert!(recurrence.cancel());
+				},
+				_ => panic!("expected recurrence without offer basetime"),
+			},
+			Err(e) => panic!("error parsing invoice_request: {:?}", e),
+		}
+	}
+
+	#[test]
+	fn fails_parsing_invoice_request_with_invalid_recurrence() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let recurrence_period = RecurrencePeriod::Months(1);
+		let recurrence_base = RecurrenceBase { proportional: false, basetime: 123_456 };
+
+		let offer = OfferBuilder::new(recipient_pubkey()).build().unwrap();
+		let mut tlv_stream = offer.as_tlv_stream();
+		tlv_stream.0.recurrence_compulsory = Some(&recurrence_period);
+		tlv_stream.0.recurrence_base = Some(&recurrence_base);
+		let offer = Offer::try_from(tlv_stream.to_bytes()).unwrap();
+
+		let (unsigned_invoice_request, _, _) = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.amount_msats(1000)
+			.unwrap()
+			.build_without_checks();
+		let recurrence_prev_state = vec![42; 3];
+		let mut tlv_stream = unsigned_invoice_request.contents.as_tlv_stream();
+		tlv_stream.2.recurrence_counter = Some(0);
+		tlv_stream.2.recurrence_start = Some(1);
+		tlv_stream.2.recurrence_prev_state = Some(&recurrence_prev_state);
+
+		match InvoiceRequest::try_from(tlv_stream.to_bytes()) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidRecurrence)
+			),
+		}
+
+		let offer = OfferBuilder::new(recipient_pubkey()).build().unwrap();
+		let mut tlv_stream = offer.as_tlv_stream();
+		tlv_stream.0.recurrence_optional = Some(&recurrence_period);
+		let offer = Offer::try_from(tlv_stream.to_bytes()).unwrap();
+
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.amount_msats(1000)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		let mut tlv_stream = invoice_request.contents.as_tlv_stream();
+		tlv_stream.2.recurrence_counter = Some(1);
+		tlv_stream.2.recurrence_start = Some(0);
+
+		match InvoiceRequest::try_from(tlv_stream.to_bytes()) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidRecurrence)
+			),
+		}
+	}
+
+	#[test]
+	fn calculates_recurrence_period_index() {
+		let explicit_recurrence = Recurrence {
+			recurrence_type: RecurrenceType::Compulsory(Some(RecurrenceBase {
+				proportional: false,
+				basetime: 1_000,
+			})),
+			recurrence_period: RecurrencePeriod::Days(1),
+			recurrence_paywindow: None,
+			recurrence_limit: None,
+		};
+		assert_eq!(explicit_recurrence.period_index(2, Some(3)), Ok(5));
+		assert_eq!(
+			explicit_recurrence.period_index(2, None),
+			Err(Bolt12SemanticError::InvalidRecurrence)
+		);
+		assert_eq!(
+			explicit_recurrence.period_index(u32::MAX, Some(1)),
+			Err(Bolt12SemanticError::InvalidRecurrence)
+		);
+
+		let implicit_recurrence = Recurrence {
+			recurrence_type: RecurrenceType::Optional,
+			recurrence_period: RecurrencePeriod::Days(1),
+			recurrence_paywindow: None,
+			recurrence_limit: None,
+		};
+		assert_eq!(implicit_recurrence.period_index(7, None), Ok(7));
+		assert_eq!(
+			implicit_recurrence.period_index(7, Some(0)),
+			Err(Bolt12SemanticError::InvalidRecurrence)
+		);
+	}
+
+	#[test]
+	fn validates_recurrence_period_index_when_building_and_parsing() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let recurrence = Recurrence {
+			recurrence_type: RecurrenceType::Compulsory(Some(RecurrenceBase {
+				proportional: false,
+				basetime: 123_456,
+			})),
+			recurrence_period: RecurrencePeriod::Months(1),
+			recurrence_paywindow: None,
+			recurrence_limit: Some(RecurrenceLimit(5)),
+		};
+		let offer = OfferBuilder::new(recipient_pubkey())
+			.amount_msats(1_000)
+			.recurrence(recurrence)
+			.build()
+			.unwrap();
+
+		let builder = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.recurrence(2, Some(3), None, false)
+			.unwrap();
+		assert!(builder.build_and_sign().is_ok());
+
+		let builder = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, PaymentId([2; 32]))
+			.unwrap()
+			.recurrence(3, Some(3), None, false)
+			.unwrap();
+		assert_eq!(builder.build_and_sign().unwrap_err(), Bolt12SemanticError::InvalidRecurrence);
+
+		let (mut unsigned_invoice_request, _, _) = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, PaymentId([3; 32]))
+			.unwrap()
+			.build_without_checks();
+		let mut tlv_stream = unsigned_invoice_request.contents.as_tlv_stream();
+		tlv_stream.2.recurrence_counter = Some(3);
+		tlv_stream.2.recurrence_start = Some(3);
+		unsigned_invoice_request.bytes = tlv_stream.to_bytes();
+		match InvoiceRequest::try_from(unsigned_invoice_request.bytes) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidRecurrence)
+			),
+		}
+	}
+
+	#[test]
 	fn parses_invoice_request_with_experimental_tlv_records() {
 		let expanded_key = ExpandedKey::new([42; 32]);
 		let entropy = FixedEntropy {};
@@ -3440,6 +3708,49 @@ mod tests {
 			},
 			Err(_) => panic!("unexpected error"),
 		}
+	}
+
+	#[test]
+	fn invoice_request_fields_recurrence_persistence_is_backward_compatible() {
+		let fields = InvoiceRequestFields {
+			payer_signing_pubkey: recipient_pubkey(),
+			quantity: Some(2),
+			payer_note_truncated: Some(UntrustedString("note".to_owned())),
+			human_readable_name: None,
+			invoice_request_recurrence: InvoiceRequestRecurrence::new(
+				Some(4),
+				Some(3),
+				Some(vec![1, 2, 3]),
+				Some(()),
+			)
+			.unwrap(),
+		};
+
+		let mut encoded = Vec::new();
+		fields.write(&mut encoded).unwrap();
+		let decoded = InvoiceRequestFields::read(&mut encoded.as_slice()).unwrap();
+		assert_eq!(decoded, fields);
+
+		let mut reader = encoded.as_slice();
+		let stream_length = BigSize::read(&mut reader).unwrap();
+		let mut reader = FixedLengthReader::new(&mut reader, stream_length.0);
+		let mut types = Vec::new();
+		while reader.bytes_remain() {
+			let typ = BigSize::read(&mut reader).unwrap().0;
+			let value_length = BigSize::read(&mut reader).unwrap().0;
+			let mut value = FixedLengthReader::new(&mut reader, value_length);
+
+			match typ {
+				0 | 1 | 2 | 4 => {},
+				typ if typ % 2 == 1 => {
+					// Legacy readers skip unknown odd records, preserving all pre-recurrence fields.
+				},
+				_ => panic!("legacy reader encountered unknown required field {}", typ),
+			}
+			value.eat_remaining().unwrap();
+			types.push(typ);
+		}
+		assert_eq!(types, vec![0, 2, 3, 4, 5, 7, 9]);
 	}
 
 	#[test]
