@@ -233,6 +233,8 @@ pub enum Bolt12SemanticError {
 	///
 	/// [`Refund`]: super::refund::Refund
 	UnexpectedHumanReadableName,
+	/// A BLIP 42 payer offer was malformed or too large.
+	InvalidPayerOffer,
 }
 
 impl From<CheckedHrpstringError> for Bolt12ParseError {
