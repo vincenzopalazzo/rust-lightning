@@ -36,6 +36,7 @@ use crate::ln::channel_state::ChannelDetails;
 use crate::ln::channelmanager::{InterceptId, PaymentId, CLTV_FAR_FAR_AWAY};
 use crate::ln::inbound_payment;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
+use crate::offers::contacts::{compute_contact_secret, ContactSecrets};
 use crate::offers::invoice::{
 	Bolt12Invoice, DerivedSigningPubkey, ExplicitSigningPubkey, InvoiceBuilder,
 	DEFAULT_RELATIVE_EXPIRY,
@@ -607,6 +608,32 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				)
 			},
 		}
+	}
+
+	/// Computes the BLIP 42 contact secret shared between us and a contact, deterministically
+	/// derived from one of our offers and the contact's offer.
+	///
+	/// `our_offer` must have been created by this flow (e.g., via [`Self::create_offer_builder`]
+	/// or [`Self::create_compact_offer_builder`]) so that the keys behind its signing pubkey can
+	/// be re-derived. Use this when adding a contact that hasn't paid us before; when they paid
+	/// us first, use [`ContactSecrets::from_remote_secret`] with the secret they sent instead.
+	///
+	/// # Errors
+	///
+	/// Returns [`Bolt12SemanticError::InvalidMetadata`] if `our_offer` was not created by this
+	/// flow, and [`Bolt12SemanticError::MissingSigningPubkey`] if `their_offer` has neither an
+	/// issuer signing pubkey nor a blinded path.
+	pub fn compute_contact_secret(
+		&self, our_offer: &Offer, their_offer: &Offer,
+	) -> Result<ContactSecrets, Bolt12SemanticError> {
+		let expanded_key = &self.inbound_payment_key;
+		let secp_ctx = &self.secp_ctx;
+
+		let keys = our_offer
+			.derive_issuer_signing_keys(expanded_key, secp_ctx)
+			.map_err(|()| Bolt12SemanticError::InvalidMetadata)?;
+
+		compute_contact_secret(secp_ctx, &keys.secret_key(), their_offer)
 	}
 
 	/// Creates an [`OfferBuilder`] such that the [`Offer`] it builds is recognized by the
