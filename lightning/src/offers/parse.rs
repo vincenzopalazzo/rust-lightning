@@ -233,6 +233,11 @@ pub enum Bolt12SemanticError {
 	///
 	/// [`Refund`]: super::refund::Refund
 	UnexpectedHumanReadableName,
+	/// A BLIP 42 payer offer was malformed or too large.
+	InvalidPayerOffer,
+	/// The BLIP 42 contact fields on an invoice request were incomplete: revealing identity
+	/// requires a contact secret together with a payer offer.
+	InvalidPayerContact,
 }
 
 impl From<CheckedHrpstringError> for Bolt12ParseError {
