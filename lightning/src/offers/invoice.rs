@@ -124,6 +124,7 @@ use crate::io;
 use crate::ln::channelmanager::PaymentId;
 use crate::ln::inbound_payment::{ExpandedKey, IV_LEN};
 use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
+use crate::offers::contacts::INVREQ_PAYER_BIP_353_SIGNATURE_TYPE;
 use crate::offers::currency::{CurrencyConversion, NullCurrencyConversion};
 #[cfg(test)]
 use crate::offers::invoice_macros::invoice_builder_methods_test_common;
@@ -1421,7 +1422,9 @@ impl InvoiceContents {
 	/// Builds the TLV stream used for payer metadata verification and key derivation.
 	///
 	/// When `exclude_payer_id` is true, the payer signing pubkey (type 88) is excluded
-	/// from the stream, which is needed when deriving payer keys.
+	/// from the stream, which is needed when deriving payer keys. `invreq_payer_bip_353_signature`
+	/// is always excluded: it is produced after metadata is derived, analogous to the
+	/// invoice-request signature.
 	fn payer_tlv_stream(
 		bytes: &[u8], exclude_payer_id: bool,
 	) -> impl core::iter::Iterator<Item = TlvRecord<'_>> {
@@ -1437,7 +1440,9 @@ impl InvoiceContents {
 					_ => true,
 				}
 			});
-		let experimental_records = TlvStream::new(bytes).range(EXPERIMENTAL_TYPES);
+		let experimental_records = TlvStream::new(bytes)
+			.range(EXPERIMENTAL_TYPES)
+			.filter(|record| record.r#type != INVREQ_PAYER_BIP_353_SIGNATURE_TYPE);
 		offer_records.chain(invreq_records).chain(experimental_records)
 	}
 
@@ -2162,6 +2167,8 @@ mod tests {
 					experimental_bar: None,
 					invreq_contact_secret: None,
 					invreq_payer_offer: None,
+					invreq_payer_bip_353_name: None,
+					invreq_payer_bip_353_signature: None,
 				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
@@ -2269,6 +2276,8 @@ mod tests {
 					experimental_bar: None,
 					invreq_contact_secret: None,
 					invreq_payer_offer: None,
+					invreq_payer_bip_353_name: None,
+					invreq_payer_bip_353_signature: None,
 				},
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
