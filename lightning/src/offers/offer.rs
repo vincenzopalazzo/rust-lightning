@@ -765,13 +765,13 @@ impl Offer {
 	}
 
 	/// Re-derives the keys used to sign invoices for this offer, if the offer's signing pubkey
-	/// was derived from `key` (i.e., the offer was built using `deriving_signing_pubkey` with
-	/// metadata included).
+	/// was derived from `key` and `nonce` (i.e., the offer was built using
+	/// `deriving_signing_pubkey` and contains blinded paths).
 	pub(super) fn derive_issuer_signing_keys<T: secp256k1::Signing>(
-		&self, key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
+		&self, nonce: Nonce, key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<Keypair, ()> {
 		self.contents
-			.verify_using_metadata(&self.bytes, key, secp_ctx)
+			.verify_using_recipient_data(&self.bytes, nonce, key, secp_ctx)
 			.and_then(|(_, keys)| keys.ok_or(()))
 	}
 }
