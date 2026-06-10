@@ -236,7 +236,7 @@ pub enum Bolt12SemanticError {
 	/// A BLIP 42 payer offer was malformed or too large.
 	InvalidPayerOffer,
 	/// The BLIP 42 contact fields on an invoice request were incomplete: revealing identity
-	/// requires a contact secret together with a payer offer.
+	/// requires a contact secret together with either a payer offer or a BIP 353 name.
 	InvalidPayerContact,
 }
 

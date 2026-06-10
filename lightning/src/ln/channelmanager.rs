@@ -796,9 +796,12 @@ pub struct OptionalOfferPaymentParams {
 	/// identity to the recipient. To keep invoice requests small enough for the recipient to
 	/// store the contact data, the offer's encoding must not exceed [`PAYER_OFFER_MAX_BYTES`];
 	/// use a long-lived offer created via [`ChannelManager::create_compact_offer_builder`].
+	/// Offers larger than that are rejected unless [`Self::payer_bip_353`] is also set, in
+	/// which case the offer is omitted and the BIP 353 name is sent instead.
 	///
-	/// Note that to converge on the same contact secret as the recipient, this should be the
-	/// same offer used with [`ChannelManager::compute_contact_secret`].
+	/// Must be set together with [`Self::contact_secrets`]. To converge on the same contact
+	/// secret as the recipient, this should be the same offer used with
+	/// [`ChannelManager::compute_contact_secret`].
 	///
 	/// # Example
 	/// ```rust,ignore
@@ -815,6 +818,30 @@ pub struct OptionalOfferPaymentParams {
 	///
 	/// [`PAYER_OFFER_MAX_BYTES`]: crate::offers::contacts::PAYER_OFFER_MAX_BYTES
 	pub payer_offer: Option<Offer>,
+	/// Reveal our BIP 353 name instead of (or in addition to) a compact payer offer. Phoenix
+	/// and other wallets that publish a human-readable name use this so the invoice request
+	/// stays small.
+	///
+	/// Requires [`Self::contact_secrets`]. The name is signed with the key of
+	/// [`PayerBip353Params::offer`].
+	pub payer_bip_353: Option<PayerBip353Params>,
+}
+
+/// Parameters for revealing a BIP 353 name in a BLIP 42 invoice request.
+///
+/// The `offer` is the one published at `name` and is used to sign
+/// `invreq_payer_bip_353_signature`. It is not copied into the invoice request unless also
+/// provided as [`OptionalOfferPaymentParams::payer_offer`] and is at most
+/// [`PAYER_OFFER_MAX_BYTES`].
+///
+/// [`PAYER_OFFER_MAX_BYTES`]: crate::offers::contacts::PAYER_OFFER_MAX_BYTES
+pub struct PayerBip353Params {
+	/// The post-₿, pre-@ user part and domain of the BIP 353 HRN.
+	pub name: HumanReadableName,
+	/// The offer published at [`Self::name`], whose signing key proves ownership of the name.
+	pub offer: Offer,
+	/// The nonce used to create [`Self::offer`], so its signing key can be re-derived.
+	pub offer_nonce: Nonce,
 }
 
 impl Default for OptionalOfferPaymentParams {
@@ -828,6 +855,7 @@ impl Default for OptionalOfferPaymentParams {
 			retry_strategy: Retry::Attempts(3),
 			contact_secrets: None,
 			payer_offer: None,
+			payer_bip_353: None,
 		}
 	}
 }
@@ -15192,6 +15220,7 @@ impl<
 			create_pending_payment_fn,
 			optional_params.contact_secrets,
 			optional_params.payer_offer,
+			optional_params.payer_bip_353,
 		)
 	}
 
@@ -15223,6 +15252,7 @@ impl<
 			create_pending_payment_fn,
 			optional_params.contact_secrets,
 			optional_params.payer_offer,
+			optional_params.payer_bip_353,
 		)
 	}
 
@@ -15267,6 +15297,7 @@ impl<
 			create_pending_payment_fn,
 			optional_params.contact_secrets,
 			optional_params.payer_offer,
+			optional_params.payer_bip_353,
 		)
 	}
 
@@ -15293,6 +15324,7 @@ impl<
 		payer_note: Option<String>, payment_id: PaymentId,
 		human_readable_name: Option<HumanReadableName>, create_pending_payment: CPP,
 		contacts: Option<ContactSecrets>, payer_offer: Option<Offer>,
+		payer_bip_353: Option<PayerBip353Params>,
 	) -> Result<(), Bolt12SemanticError> {
 		let entropy = &self.entropy_source;
 		let nonce = Nonce::from_entropy_source(entropy);
@@ -15325,6 +15357,13 @@ impl<
 		let builder = match payer_offer {
 			None => builder,
 			Some(offer) => builder.payer_offer(&offer),
+		};
+		let builder = match payer_bip_353 {
+			None => builder,
+			Some(params) => {
+				let keys = self.flow.derive_offer_signing_keys(&params.offer, params.offer_nonce)?;
+				builder.payer_bip_353_name(params.name, keys.secret_key())
+			},
 		};
 
 		let invoice_request = builder.build_and_sign()?;

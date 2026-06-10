@@ -596,6 +596,7 @@ fn creates_and_pays_for_offer_using_two_hop_blinded_path() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -757,6 +758,7 @@ fn creates_and_pays_for_offer_using_one_hop_blinded_path() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -841,6 +843,7 @@ fn router_modifies_payment_metadata_in_blinded_path() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: Some(expected_metadata),
 	});
@@ -926,6 +929,7 @@ fn pays_for_offer_with_payment_metadata_in_invoice_request_context() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: Some(expected_metadata),
 	});
@@ -1037,6 +1041,7 @@ fn pays_for_offer_without_blinded_paths() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -1308,6 +1313,7 @@ fn creates_and_pays_for_offer_with_retry() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -1376,6 +1382,7 @@ fn pays_bolt12_invoice_asynchronously() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -1476,6 +1483,7 @@ fn creates_offer_with_blinded_path_using_unannounced_introduction_node() {
 			human_readable_name: None,
 			contact_secret: None,
 			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -2690,6 +2698,7 @@ fn creates_and_pays_for_phantom_offer() {
 				human_readable_name: None,
 				contact_secret: None,
 				payer_offer: None,
+				payer_bip_353_name: None,
 			},
 		payment_metadata: None,
 		});
