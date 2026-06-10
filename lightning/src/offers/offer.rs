@@ -84,9 +84,13 @@ use crate::ln::inbound_payment::{ExpandedKey, IV_LEN};
 use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
 use crate::offers::merkle::{TaggedHash, TlvRecord, TlvStream};
 use crate::offers::nonce::Nonce;
+use core::ops::Deref;
+
 use crate::offers::parse::{Bech32Encode, Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
+use crate::offers::payment_token::PaymentTokenPayload;
 use crate::offers::signer::{self, Metadata, MetadataMaterial};
 use crate::onion_message::dns_resolution::HumanReadableName;
+use crate::sign::EntropySource;
 use crate::types::features::OfferFeatures;
 use crate::types::string::PrintableString;
 use crate::util::ser::{
@@ -247,6 +251,8 @@ macro_rules! offer_explicit_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(signing_pubkey),
+					notification_paths: None,
+					payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -301,6 +307,8 @@ macro_rules! offer_derived_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(node_id),
+					notification_paths: None,
+					payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -360,6 +368,16 @@ macro_rules! offer_builder_methods { (
 	/// Successive calls to this method will override the previous setting.
 	pub fn absolute_expiry($($self_mut)* $self: $self_type, absolute_expiry: Duration) -> $return_type {
 		$self.offer.absolute_expiry = Some(absolute_expiry);
+		$return_value
+	}
+
+	/// Sets the `payment_notifications` feature bit on [`Offer::offer_features`], advertising
+	/// that a payment notification will be delivered to the point-of-sale device that constructed
+	/// a per-order offer from this offer when its payment is claimed.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	pub fn supports_payment_notifications($($self_mut)* $self: $self_type) -> $return_type {
+		$self.offer.features.set_payment_notifications_optional();
 		$return_value
 	}
 
@@ -632,6 +650,8 @@ pub(super) struct OfferContents {
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
 	issuer_signing_pubkey: Option<PublicKey>,
+	notification_paths: Option<Vec<BlindedMessagePath>>,
+	payment_token: Option<Vec<u8>>,
 	#[cfg(test)]
 	experimental_foo: Option<u64>,
 }
@@ -708,6 +728,22 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 	pub fn issuer_signing_pubkey(&$self) -> Option<bitcoin::secp256k1::PublicKey> {
 		$contents.issuer_signing_pubkey()
 	}
+
+	/// Blinded onion message paths to the point-of-sale device that constructed the offer, used by
+	/// the recipient to deliver a payment notification once the payment is claimed.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	pub fn notification_paths(&$self) -> &[$crate::blinded_path::message::BlindedMessagePath] {
+		$contents.notification_paths()
+	}
+
+	/// An opaque payment token sealing the order fields to the offer recipient, used to
+	/// authenticate payment notifications for point-of-sale offers.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	pub fn payment_token(&$self) -> Option<&Vec<u8>> {
+		$contents.payment_token()
+	}
 } }
 
 impl Offer {
@@ -748,6 +784,43 @@ impl Offer {
 	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
 	pub fn expects_quantity(&self) -> bool {
 		self.contents.expects_quantity()
+	}
+
+	/// Creates an [`OfferModifier`] for constructing a per-order offer from this offer, which
+	/// must be a point-of-sale offer template advertising the `payment_notifications` feature.
+	///
+	/// This is intended for a point-of-sale device that received the template from a merchant and
+	/// fills in the order amount, description, expiry, `notification_path`s, and an encrypted
+	/// `payment_token` before presenting the offer to a customer. Offers are not signed, so the
+	/// modifications do not invalidate the offer; the merchant verifies a resulting
+	/// `invoice_request` by re-deriving the template's signing keys from the blinded path it
+	/// arrived over rather than from the offer's records.
+	///
+	/// Errors if the template does not set the `payment_notifications` feature bit or if any of
+	/// the fields to be filled in are already set.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	pub fn modify(&self) -> Result<OfferModifier, Bolt12SemanticError> {
+		if !self.contents.features.supports_payment_notifications() {
+			return Err(Bolt12SemanticError::UnexpectedFeatures);
+		}
+		if self.contents.amount.is_some() {
+			return Err(Bolt12SemanticError::UnexpectedAmount);
+		}
+		if self.contents.description.is_some() {
+			return Err(Bolt12SemanticError::UnexpectedDescription);
+		}
+		if self.contents.notification_paths.is_some() {
+			return Err(Bolt12SemanticError::UnexpectedPaths);
+		}
+		if self.contents.payment_token.is_some() {
+			return Err(Bolt12SemanticError::UnexpectedPaymentToken);
+		}
+		if self.contents.issuer_signing_pubkey.is_none() {
+			return Err(Bolt12SemanticError::MissingIssuerSigningPubkey);
+		}
+
+		Ok(OfferModifier { contents: self.contents.clone() })
 	}
 
 	pub(super) fn tlv_stream_iter<'a>(
@@ -875,6 +948,83 @@ impl Hash for Offer {
 	}
 }
 
+/// Constructs a per-order offer from a point-of-sale offer template, created via
+/// [`Offer::modify`].
+///
+/// Unknown TLV records present in the original offer are not preserved by the rebuilt offer.
+///
+/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+#[derive(Clone, Debug)]
+pub struct OfferModifier {
+	contents: OfferContents,
+}
+
+impl OfferModifier {
+	/// Sets the order fields on the offer and seals them into an encrypted `payment_token`:
+	/// the amount and description are committed so the merchant can detect tampering with the
+	/// offer's cleartext fields, and `order_id` is the per-order secret the merchant relays in
+	/// its payment notification to authenticate it.
+	///
+	/// The token is encrypted to the template's signing pubkey, which only the merchant can
+	/// recover the secret key for. `order_id` must be at least
+	/// [`MIN_ORDER_ID_LEN`](crate::offers::payment_token::MIN_ORDER_ID_LEN) bytes of fresh
+	/// entropy, and `notification_paths` must terminate at the point-of-sale device with the same
+	/// order data in their message context.
+	pub fn with_pos_order<ES: Deref, T: secp256k1::Signing>(
+		mut self, amount_msats: u64, description: Option<String>, order_id: Vec<u8>,
+		notification_paths: Vec<BlindedMessagePath>, absolute_expiry: Option<Duration>,
+		entropy_source: ES, secp_ctx: &Secp256k1<T>,
+	) -> Result<Self, Bolt12SemanticError>
+	where
+		ES::Target: EntropySource,
+	{
+		debug_assert!(order_id.len() >= crate::offers::payment_token::MIN_ORDER_ID_LEN);
+		if notification_paths.is_empty() {
+			return Err(Bolt12SemanticError::MissingPaths);
+		}
+		if amount_msats > MAX_VALUE_MSAT {
+			return Err(Bolt12SemanticError::InvalidAmount);
+		}
+		// An offer with an amount must have a description per BOLT 12.
+		let description = description.unwrap_or_else(String::new);
+
+		let issuer_signing_pubkey = self
+			.contents
+			.issuer_signing_pubkey()
+			.ok_or(Bolt12SemanticError::MissingIssuerSigningPubkey)?;
+		let payload =
+			PaymentTokenPayload { amount_msats, description: Some(description.clone()), order_id };
+		let payment_token = payload.encrypt(&issuer_signing_pubkey, entropy_source, secp_ctx);
+
+		self.contents.amount = Some(Amount::Bitcoin { amount_msats });
+		self.contents.description = Some(description);
+		self.contents.notification_paths = Some(notification_paths);
+		self.contents.payment_token = Some(payment_token);
+		self.contents.absolute_expiry = absolute_expiry.or(self.contents.absolute_expiry);
+
+		Ok(self)
+	}
+
+	/// Replaces the `payment_token` without re-encrypting the committed fields, for constructing
+	/// offers whose cleartext fields do not match the token in tests.
+	#[cfg(test)]
+	pub(crate) fn payment_token_unchecked(mut self, payment_token: Vec<u8>) -> Self {
+		self.contents.payment_token = Some(payment_token);
+		self
+	}
+
+	/// Builds the per-order [`Offer`] by re-serializing the modified records.
+	pub fn build(self) -> Offer {
+		const OFFER_ALLOCATION_SIZE: usize = 1024;
+		let mut bytes = Vec::with_capacity(OFFER_ALLOCATION_SIZE);
+		self.contents.write(&mut bytes).unwrap();
+
+		let id = OfferId::from_valid_offer_tlv_stream(&bytes);
+
+		Offer { bytes, contents: self.contents, id }
+	}
+}
+
 impl OfferContents {
 	pub fn chains(&self) -> Vec<ChainHash> {
 		self.chains.as_ref().cloned().unwrap_or_else(|| vec![self.implied_chain()])
@@ -993,6 +1143,14 @@ impl OfferContents {
 		self.issuer_signing_pubkey
 	}
 
+	pub fn notification_paths(&self) -> &[BlindedMessagePath] {
+		self.notification_paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
+	}
+
+	pub fn payment_token(&self) -> Option<&Vec<u8>> {
+		self.payment_token.as_ref()
+	}
+
 	pub(super) fn verify_using_metadata<T: secp256k1::Signing>(
 		&self, bytes: &[u8], key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
@@ -1075,6 +1233,8 @@ impl OfferContents {
 		};
 
 		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			notification_paths: self.notification_paths.as_ref(),
+			payment_token: self.payment_token.as_ref(),
 			#[cfg(test)]
 			experimental_foo: self.experimental_foo,
 		};
@@ -1231,18 +1391,38 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 /// Valid type range for experimental offer TLV records.
 pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
 
+/// TLV record type for [`Offer::notification_paths`].
+///
+/// Odd so that wallets unaware of the field still accept the offer and mirror the record into the
+/// `invoice_request`, as required by [bLIP 56].
+///
+/// [bLIP 56]: https://github.com/lightning/blips/pull/56
+const OFFER_NOTIFICATION_PATHS_TYPE: u64 = 1_000_005_601;
+
+/// TLV record type for [`Offer::payment_token`].
+///
+/// Odd so that wallets unaware of the field still accept the offer and mirror the record into the
+/// `invoice_request`, as required by [bLIP 56].
+///
+/// [bLIP 56]: https://github.com/lightning/blips/pull/56
+const OFFER_PAYMENT_TOKEN_TYPE: u64 = 1_000_005_603;
+
 #[cfg(not(test))]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATHS_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_PAYMENT_TOKEN_TYPE, payment_token: (Vec<u8>, WithoutLength)),
 });
 
 #[cfg(test)]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATHS_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_PAYMENT_TOKEN_TYPE, payment_token: (Vec<u8>, WithoutLength)),
 	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
 });
 
 type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
 
-type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef);
+type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef<'a>);
 
 impl CursorReadable for FullOfferTlvStream {
 	fn read<R: AsRef<[u8]>>(r: &mut io::Cursor<R>) -> Result<Self, DecodeError> {
@@ -1297,6 +1477,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 				issuer_id,
 			},
 			ExperimentalOfferTlvStream {
+				notification_paths,
+				payment_token,
 				#[cfg(test)]
 				experimental_foo,
 			},
@@ -1353,6 +1535,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 			paths,
 			supported_quantity,
 			issuer_signing_pubkey,
+			notification_paths,
+			payment_token,
 			#[cfg(test)]
 			experimental_foo,
 		})
@@ -1447,7 +1631,11 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None,
+				},
 			),
 		);
 

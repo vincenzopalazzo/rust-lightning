@@ -321,6 +321,32 @@ pub(super) fn derive_keys(nonce: Nonce, expanded_key: &ExpandedKey) -> Keypair {
 	Keypair::from_secret_key(&secp_ctx, &privkey)
 }
 
+/// Derives a signing [`Keypair`] for a point-of-sale offer template from the given [`Nonce`] and
+/// [`ExpandedKey`].
+///
+/// Unlike the metadata-bound key derivation used for standard offers, the derivation has no
+/// dependency on the offer's TLV records. This allows a point-of-sale device to modify a template
+/// offer (adding an amount, notification paths, and a payment token) without invalidating the
+/// merchant's ability to re-derive the signing key when the corresponding `invoice_request`
+/// arrives.
+///
+/// Authentication that the nonce is genuine is provided by the [`ReceiveAuthKey`]-based
+/// authentication of the blinded message path carrying the
+/// [`OffersContext::DelegatedInvoiceRequest`].
+///
+/// [`ReceiveAuthKey`]: crate::sign::ReceiveAuthKey
+/// [`OffersContext::DelegatedInvoiceRequest`]: crate::blinded_path::message::OffersContext::DelegatedInvoiceRequest
+pub(super) fn derive_keys_for_delegation(nonce: Nonce, expanded_key: &ExpandedKey) -> Keypair {
+	const IV_BYTES: &[u8; IV_LEN] = b"LDK Delegation ~";
+	let mut hmac = expanded_key.hmac_for_offer();
+	hmac.input(IV_BYTES);
+	hmac.input(&nonce.0);
+
+	let secp_ctx = Secp256k1::new();
+	let privkey = SecretKey::from_slice(Hmac::from_engine(hmac).as_byte_array()).unwrap();
+	Keypair::from_secret_key(&secp_ctx, &privkey)
+}
+
 /// Verifies data given in a TLV stream was used to produce the given metadata, consisting of:
 /// - a 256-bit [`PaymentId`],
 /// - a 128-bit [`Nonce`], and possibly
