@@ -250,6 +250,7 @@ mod test {
 				IgnoringMessageHandler {},
 				Arc::clone(&resolver),
 				IgnoringMessageHandler {},
+				IgnoringMessageHandler {},
 			),
 			resolver_keys.get_node_id(Recipient::Node).unwrap(),
 		)
@@ -291,6 +292,7 @@ mod test {
 			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 			Arc::clone(&payer),
+			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 		));
 
@@ -363,6 +365,7 @@ mod test {
 			IgnoringMessageHandler {},
 			Arc::clone(&resolver),
 			IgnoringMessageHandler {},
+			IgnoringMessageHandler {},
 		);
 		let resolver_id = resolver_keys.get_node_id(Recipient::Node).unwrap();
 
@@ -389,6 +392,7 @@ mod test {
 			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 			Arc::clone(&payer),
+			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 		));
 

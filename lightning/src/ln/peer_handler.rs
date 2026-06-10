@@ -18,7 +18,9 @@
 use bitcoin::constants::ChainHash;
 use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
 
-use crate::blinded_path::message::{AsyncPaymentsContext, DNSResolverContext, OffersContext};
+use crate::blinded_path::message::{
+	AsyncPaymentsContext, DNSResolverContext, OffersContext, PosNotificationContext,
+};
 use crate::ln::msgs;
 use crate::ln::msgs::{
 	BaseMessageHandler, ChannelMessageHandler, Init, LightningError, MessageSendEvent,
@@ -42,6 +44,10 @@ use crate::onion_message::messenger::{
 };
 use crate::onion_message::offers::{OffersMessage, OffersMessageHandler};
 use crate::onion_message::packet::OnionMessageContents;
+use crate::onion_message::pos_notification::{
+	NotificationAck, NotificationNack, PaymentNotification, PaymentProof, PosNotificationMessage,
+	PosNotificationMessageHandler,
+};
 use crate::routing::gossip::{NodeAlias, NodeId};
 use crate::sign::{NodeSigner, Recipient};
 use crate::types::features::{InitFeatures, NodeFeatures};
@@ -274,6 +280,21 @@ impl DNSResolverMessageHandler for IgnoringMessageHandler {
 		None
 	}
 	fn handle_dnssec_proof(&self, _message: DNSSECProof, _context: DNSResolverContext) {}
+}
+impl PosNotificationMessageHandler for IgnoringMessageHandler {
+	fn handle_payment_notification(
+		&self, _message: PaymentNotification, _context: PosNotificationContext,
+		_responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)> {
+		None
+	}
+	fn handle_notification_ack(&self, _message: NotificationAck, _context: PosNotificationContext) {
+	}
+	fn handle_notification_nack(
+		&self, _message: NotificationNack, _context: PosNotificationContext,
+	) {
+	}
+	fn handle_payment_proof(&self, _message: PaymentProof, _context: PosNotificationContext) {}
 }
 impl CustomOnionMessageHandler for IgnoringMessageHandler {
 	type CustomMessage = Infallible;

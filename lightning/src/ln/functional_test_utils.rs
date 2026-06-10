@@ -534,6 +534,7 @@ type TestOnionMessenger<'chan_man, 'node_cfg, 'chan_mon_cfg> = OnionMessenger<
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	IgnoringMessageHandler,
 	IgnoringMessageHandler,
+	IgnoringMessageHandler,
 >;
 
 /// For use with [`OnionMessenger`] otherwise `test_restored_packages_retry` will fail. This is
@@ -4797,6 +4798,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(
 			&cfgs[i].message_router,
 			&chan_mgrs[i],
 			&chan_mgrs[i],
+			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
 		);
