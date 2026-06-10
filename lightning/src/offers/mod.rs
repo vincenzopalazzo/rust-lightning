@@ -25,6 +25,7 @@ pub mod merkle;
 pub mod nonce;
 pub mod parse;
 mod payer;
+pub mod payment_token;
 pub mod refund;
 pub(crate) mod signer;
 pub mod static_invoice;
