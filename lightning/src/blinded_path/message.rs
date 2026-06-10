@@ -375,6 +375,10 @@ pub enum MessageContext {
 	///
 	/// [`CustomOnionMessageHandler::CustomMessage`]: crate::onion_message::messenger::CustomOnionMessageHandler::CustomMessage
 	Custom(Vec<u8>),
+	/// Context specific to a [`PosNotificationMessage`].
+	///
+	/// [`PosNotificationMessage`]: crate::onion_message::pos_notification::PosNotificationMessage
+	PosNotification(PosNotificationContext),
 }
 
 /// Contains data specific to an [`OffersMessage`].
@@ -508,6 +512,21 @@ pub enum OffersContext {
 		///
 		/// [`Bolt12Invoice::payment_hash`]: crate::offers::invoice::Bolt12Invoice::payment_hash
 		payment_hash: PaymentHash,
+	},
+	/// Context used by a [`BlindedMessagePath`] within an [`Offer`] template handed to a
+	/// point-of-sale device for per-order offer construction.
+	///
+	/// This variant is intended to be received when handling an [`InvoiceRequest`] for an offer the
+	/// point-of-sale device derived from the template. Since the device modifies the offer's TLV
+	/// records, the offer cannot be authenticated via its metadata; instead, the signing keys are
+	/// re-derived from the nonce alone and matched against the offer's signing pubkey.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	DelegatedInvoiceRequest {
+		/// A nonce used for deriving the signing keys of the offer template independently of its TLV
+		/// records.
+		nonce: Nonce,
 	},
 }
 
@@ -665,6 +684,7 @@ impl_ser_tlv_based_enum!(MessageContext,
 	{1, Custom} => (),
 	{2, AsyncPayments} => (),
 	{3, DNSResolver} => (),
+	{4, PosNotification} => (),
 );
 
 // Note: Several TLV fields (`nonce`, `hmac`, etc.) were removed in LDK v0.2 following the
@@ -691,6 +711,9 @@ impl_ser_tlv_based_enum!(OffersContext,
 	(4, OutboundPaymentForOffer) => {
 		(0, payment_id, required),
 		(1, nonce, required),
+	},
+	(5, DelegatedInvoiceRequest) => {
+		(0, nonce, required),
 	},
 );
 
@@ -740,6 +763,59 @@ pub struct DNSResolverContext {
 impl_ser_tlv_based!(DNSResolverContext, {
 	(0, nonce, required),
 });
+
+/// Contains data specific to a [`PosNotificationMessage`].
+///
+/// [`PosNotificationMessage`]: crate::onion_message::pos_notification::PosNotificationMessage
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PosNotificationContext {
+	/// Context used by a point-of-sale device in a per-order offer's `notification_path`.
+	///
+	/// This variant is intended to be received when handling a `payment_notification` from the
+	/// merchant or a `payment_proof` from the customer. It carries the full order state so that
+	/// the device does not need to persist outstanding orders: the path-level authentication of
+	/// the blinded path guarantees the context was created by this device, and matching
+	/// [`Self::InboundOrder::order_id`] against the `order_id` relayed in the notification
+	/// authenticates the notification as merchant-originated.
+	InboundOrder {
+		/// The per-order secret also sealed into the offer's `payment_token`. Only the merchant
+		/// can recover it from the token, so a notification relaying it must have come from the
+		/// merchant.
+		order_id: Vec<u8>,
+
+		/// The amount in millisatoshis set on the per-order offer. A notification for a smaller
+		/// amount must be rejected.
+		amount_msats: u64,
+
+		/// The description set on the per-order offer, if any.
+		description: Option<String>,
+
+		/// The time as duration since the Unix epoch at which the order expires and notifications
+		/// for it should be rejected. Set from the per-order offer's `offer_absolute_expiry`.
+		order_absolute_expiry: Option<Duration>,
+	},
+	/// Context used by a merchant in the reply path of a `payment_notification`.
+	///
+	/// This variant is intended to be received when handling a `notification_ack` or
+	/// `notification_nack` from the point-of-sale device, and identifies the pending notification
+	/// being acknowledged.
+	OutboundNotification {
+		/// The payment hash of the claimed payment the notification was sent for.
+		payment_hash: PaymentHash,
+	},
+}
+
+impl_ser_tlv_based_enum!(PosNotificationContext,
+	(0, InboundOrder) => {
+		(0, order_id, required_vec),
+		(2, amount_msats, required),
+		(3, description, option),
+		(4, order_absolute_expiry, option),
+	},
+	(1, OutboundNotification) => {
+		(0, payment_hash, required),
+	},
+);
 
 /// Represents the padding round off size (in bytes) that is used
 /// to pad message blinded path's [`BlindedHop`]

@@ -82,7 +82,7 @@ use crate::offers::offer::{
 };
 use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
 use crate::offers::payer::{PayerContents, PayerTlvStream, PayerTlvStreamRef};
-use crate::offers::signer::{Metadata, MetadataMaterial};
+use crate::offers::signer::{self, Metadata, MetadataMaterial};
 use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::types::features::InvoiceRequestFeatures;
 use crate::types::payment::PaymentHash;
@@ -877,6 +877,46 @@ macro_rules! invoice_request_verify_method {
 		Ok(verified)
 	}
 
+/// Verifies that the request was for a point-of-sale offer template created using the given
+	/// key, by re-deriving the template's signing keys from the nonce included with the
+	/// [`BlindedMessagePath`] for which the request was sent through and matching them against
+	/// the offer's signing pubkey.
+	///
+	/// Unlike [`Self::verify_using_recipient_data`], the offer's TLV records are not covered by
+	/// the verification, since a point-of-sale device modifies them when constructing per-order
+	/// offers from the template. The nonce is authenticated by the blinded path itself.
+	///
+	/// [`BlindedMessagePath`]: crate::blinded_path::message::BlindedMessagePath
+	#[rustfmt::skip]
+	pub fn verify_for_delegation(
+		$self: $self_type, nonce: Nonce, key: &ExpandedKey,
+	) -> Result<InvoiceRequestVerifiedFromOffer, ()> {
+		let signing_pubkey = match $self.contents.inner.offer.issuer_signing_pubkey() {
+			Some(pubkey) => pubkey,
+			None => return Err(()),
+		};
+
+		let keys = signer::derive_keys_for_delegation(nonce, key);
+		if keys.public_key() != signing_pubkey {
+			return Err(());
+		}
+
+		let offer_id = OfferId::from_valid_bolt12_tlv_stream(&$self.bytes);
+
+		let inner = {
+			#[cfg(not(c_bindings))]
+			{ $self }
+			#[cfg(c_bindings)]
+			{ $self.clone() }
+		};
+
+		Ok(InvoiceRequestVerifiedFromOffer::DerivedKeys(VerifiedInvoiceRequest {
+			offer_id,
+			inner,
+			keys: DerivedSigningPubkey(keys),
+		}))
+	}
+
 /// Verifies that the request was for an offer created using the given key by checking a nonce
 	/// included with the [`BlindedMessagePath`] for which the request was sent through.
 	///
@@ -1321,7 +1361,7 @@ type FullInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceRequestTlvStreamRef,
 );
 
@@ -1357,7 +1397,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	PayerTlvStreamRef<'a>,
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceRequestTlvStreamRef,
 );
 
@@ -1659,7 +1699,11 @@ mod tests {
 					offer_from_hrn: None,
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None,
+				},
 				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
 			),
 		);

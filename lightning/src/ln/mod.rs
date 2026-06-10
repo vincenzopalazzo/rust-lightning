@@ -104,6 +104,9 @@ mod onion_route_tests;
 mod payment_tests;
 #[cfg(test)]
 #[allow(unused_mut)]
+mod pos_notification_tests;
+#[cfg(test)]
+#[allow(unused_mut)]
 mod priv_short_conf_tests;
 #[cfg(test)]
 mod quiescence_tests;

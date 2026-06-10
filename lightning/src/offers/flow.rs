@@ -21,6 +21,7 @@ use bitcoin::secp256k1::{self, PublicKey, Secp256k1};
 
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext,
+	PosNotificationContext,
 };
 use crate::blinded_path::payment::{
 	AsyncBolt12OfferContext, BlindedPaymentPath, Bolt12OfferContext, Bolt12RefundContext,
@@ -46,7 +47,9 @@ use crate::offers::invoice_request::{
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Amount, DerivedMetadata, Offer, OfferBuilder};
 use crate::offers::parse::Bolt12SemanticError;
+use crate::offers::payment_token::{PaymentTokenPayload, MIN_ORDER_ID_LEN};
 use crate::offers::refund::{Refund, RefundBuilder};
+use crate::offers::signer;
 use crate::offers::static_invoice::{StaticInvoice, StaticInvoiceBuilder};
 use crate::onion_message::async_payments::{
 	AsyncPaymentsMessage, HeldHtlcAvailable, OfferPaths, OfferPathsRequest, ServeStaticInvoice,
@@ -57,12 +60,15 @@ use crate::onion_message::messenger::{
 };
 use crate::onion_message::offers::OffersMessage;
 use crate::onion_message::packet::OnionMessageContents;
+use crate::onion_message::pos_notification::{
+	PaymentNotification, PaymentProof, PosNotificationMessage,
+};
 use crate::routing::router::Router;
 use crate::sign::{EntropySource, ReceiveAuthKey};
 use crate::sync::{Mutex, RwLock};
-use crate::types::payment::{PaymentHash, PaymentSecret};
+use crate::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use crate::util::logger::Logger;
-use crate::util::ser::Writeable;
+use crate::util::ser::{FixedLengthReader, LengthReadable, Readable, WithoutLength, Writeable};
 
 /// A BOLT12 offers code and flow utility provider, which facilitates
 /// BOLT12 builder generation and onion message handling.
@@ -89,6 +95,10 @@ pub struct OffersMessageFlow<MR: MessageRouter, L: Logger> {
 
 	pending_async_payments_messages: Mutex<Vec<(AsyncPaymentsMessage, MessageSendInstructions)>>,
 	async_receive_offer_cache: Mutex<AsyncReceiveOfferCache>,
+
+	pending_pos_notification_messages:
+		Mutex<Vec<(PosNotificationMessage, MessageSendInstructions)>>,
+	pending_pos_notifications: Mutex<Vec<PendingPosNotification>>,
 
 	logger: L,
 }
@@ -118,6 +128,9 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 			pending_async_payments_messages: Mutex::new(Vec::new()),
 
 			async_receive_offer_cache: Mutex::new(AsyncReceiveOfferCache::new()),
+
+			pending_pos_notification_messages: Mutex::new(Vec::new()),
+			pending_pos_notifications: Mutex::new(Vec::new()),
 
 			logger,
 		}
@@ -390,6 +403,64 @@ fn enqueue_onion_message_with_reply_paths<T: OnionMessageContents + Clone>(
 		});
 }
 
+/// The `payment_metadata` key under which the `order_id` recovered from a point-of-sale offer's
+/// `payment_token` is stored in the payment context of the offer's blinded payment paths.
+///
+/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+pub const POS_ORDER_ID_PAYMENT_METADATA_KEY: u64 = 128;
+
+/// The `payment_metadata` key under which a point-of-sale offer's `notification_path`s are stored
+/// in the payment context of the offer's blinded payment paths, serialized as a
+/// `WithoutLength<Vec<BlindedMessagePath>>`.
+///
+/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+pub const POS_NOTIFICATION_PATHS_PAYMENT_METADATA_KEY: u64 = 129;
+
+/// The `payment_metadata` key under which a point-of-sale offer's `offer_absolute_expiry` is
+/// stored in the payment context of the offer's blinded payment paths, serialized as a big-endian
+/// `u64` of seconds since the Unix epoch. Used to bound notification retries.
+///
+/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+pub const POS_ORDER_EXPIRY_PAYMENT_METADATA_KEY: u64 = 130;
+
+/// The grace period past an order's expiry during which payment notifications are still retried.
+const POS_NOTIFICATION_GRACE_PERIOD: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// How long payment notifications are retried for orders without an expiry.
+const DEFAULT_PENDING_POS_NOTIFICATION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A payment notification for a point-of-sale offer that has not been acknowledged by the
+/// point-of-sale device yet. Notifications are retried until acknowledged or until
+/// [`Self::retry_until`] has passed, since onion messages are best-effort.
+///
+/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+#[derive(Clone, Debug)]
+pub struct PendingPosNotification {
+	/// The payment hash of the claimed payment.
+	pub payment_hash: PaymentHash,
+	/// The payment preimage released when claiming the payment.
+	pub payment_preimage: PaymentPreimage,
+	/// The amount claimed, in millisatoshis.
+	pub amount_msats: u64,
+	/// The per-order secret recovered from the offer's `payment_token`.
+	pub order_id: Vec<u8>,
+	/// The blinded paths to the point-of-sale device from the offer's `notification_path`.
+	pub notification_paths: Vec<BlindedMessagePath>,
+	/// The time as duration since the Unix epoch at which retrying is abandoned. An undeliverable
+	/// notification means this node holds a payment the point-of-sale device never confirmed, so
+	/// abandonment is logged for manual reconciliation.
+	pub retry_until: Duration,
+}
+
+impl_ser_tlv_based!(PendingPosNotification, {
+	(0, payment_hash, required),
+	(2, payment_preimage, required),
+	(4, amount_msats, required),
+	(6, order_id, required_vec),
+	(8, notification_paths, required_vec),
+	(10, retry_until, required),
+});
+
 /// Instructions for how to respond to an `InvoiceRequest`.
 pub enum InvreqResponseInstructions {
 	/// We are the recipient of this payment, and a [`Bolt12Invoice`] should be sent in response to
@@ -455,6 +526,11 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		let nonce = match context {
 			None if invoice_request.metadata().is_some() => None,
 			Some(OffersContext::InvoiceRequest { nonce, payment_metadata: _ }) => Some(nonce),
+			Some(OffersContext::DelegatedInvoiceRequest { nonce }) => {
+				let invoice_request = invoice_request.verify_for_delegation(nonce, expanded_key)?;
+				self.verify_delegated_payment_token(&invoice_request)?;
+				return Ok(InvreqResponseInstructions::SendInvoice(invoice_request));
+			},
 			Some(OffersContext::StaticInvoiceRequested {
 				recipient_id,
 				invoice_slot,
@@ -482,6 +558,46 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		}?;
 
 		Ok(InvreqResponseInstructions::SendInvoice(invoice_request))
+	}
+
+	/// Verifies the `payment_token` of an offer derived from one of our point-of-sale templates,
+	/// as mirrored in the given verified [`InvoiceRequest`].
+	///
+	/// Per [bLIP 56], the request must be rejected if the `notification_path` or `payment_token`
+	/// is missing, the token fails to decrypt, or the token's sealed amount or description do not
+	/// match the mirrored offer fields, since no deliverable notification could be produced for
+	/// the resulting payment.
+	///
+	/// [bLIP 56]: https://github.com/lightning/blips/pull/56
+	fn verify_delegated_payment_token(
+		&self, invoice_request: &InvoiceRequestVerifiedFromOffer,
+	) -> Result<(), ()> {
+		let request = match invoice_request {
+			InvoiceRequestVerifiedFromOffer::DerivedKeys(request) => request,
+			InvoiceRequestVerifiedFromOffer::ExplicitKeys(_) => return Err(()),
+		};
+
+		if request.notification_paths().is_empty() {
+			return Err(());
+		}
+
+		let token = request.payment_token().ok_or(())?;
+		let payload = PaymentTokenPayload::decrypt(&request.keys.0.secret_key(), token)?;
+
+		let offer_amount_msats = match request.amount() {
+			Some(Amount::Bitcoin { amount_msats }) => amount_msats,
+			_ => return Err(()),
+		};
+		if payload.amount_msats != offer_amount_msats {
+			return Err(());
+		}
+
+		let offer_description = request.description().map(|description| description.to_string());
+		if payload.description != offer_description {
+			return Err(());
+		}
+
+		Ok(())
 	}
 
 	/// Verifies a [`Bolt12Invoice`] using the provided [`OffersContext`] or the invoice's payer
@@ -631,6 +747,116 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				.map_err(|_| Bolt12SemanticError::MissingPaths)
 		})
 		.map(|(builder, _)| builder)
+	}
+
+	/// Creates an [`Offer`] template for handing to a point-of-sale device, which constructs
+	/// per-order offers from it by adding an amount, description, expiry, `notification_path`s,
+	/// and a `payment_token` sealed to the template's signing pubkey.
+	///
+	/// The template sets the `payment_notifications` feature bit to advertise that, when a
+	/// payment for a per-order offer is claimed, a payment notification will be delivered to the
+	/// device over the offer's `notification_path`. Corresponding [`InvoiceRequest`]s are
+	/// verified by [`Self::verify_invoice_request`] by re-deriving the template's signing keys
+	/// from the blinded path context, independently of the offer's TLV records, which the device
+	/// modifies.
+	///
+	/// The template MAY be refreshed periodically to rotate the blinded paths it contains.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the parameterized [`MessageRouter`] is unable to create a blinded path
+	/// for the offer.
+	pub fn create_pos_delegation_template<ES: EntropySource>(
+		&self, entropy_source: ES, peers: Vec<MessageForwardNode>,
+		absolute_expiry: Option<Duration>,
+	) -> Result<Offer, Bolt12SemanticError> {
+		let expanded_key = &self.inbound_payment_key;
+		let entropy = &entropy_source;
+
+		let nonce = Nonce::from_entropy_source(entropy);
+		let context = MessageContext::Offers(OffersContext::DelegatedInvoiceRequest { nonce });
+		let keys = signer::derive_keys_for_delegation(nonce, expanded_key);
+
+		let mut builder = OfferBuilder::new(keys.public_key())
+			.chain_hash(self.chain_hash)
+			.supports_payment_notifications();
+		if let Some(absolute_expiry) = absolute_expiry {
+			builder = builder.absolute_expiry(absolute_expiry);
+		}
+		for path in self
+			.create_blinded_paths(peers, context)
+			.map_err(|_| Bolt12SemanticError::MissingPaths)?
+		{
+			builder = builder.path(path);
+		}
+
+		builder.build()
+	}
+
+	/// Constructs a per-order [`Offer`] from a merchant-provided point-of-sale template, for
+	/// presenting to a customer as a QR code or over another transport.
+	///
+	/// A fresh per-order secret `order_id` is generated and returned alongside the offer. It is
+	/// sealed both into the offer's `payment_token`, which only the merchant can read, and into
+	/// the message context of a `notification_path` back to this node with `merchant_node_id` as
+	/// the introduction node. When the merchant claims the order's payment, it relays the
+	/// `order_id` recovered from the token in a payment notification over that path, surfaced via
+	/// [`Event::PaymentNotificationReceived`] once authenticated against the path context. The
+	/// node therefore needs no persistent order state; the returned `order_id` only correlates
+	/// the event with the order.
+	///
+	/// `merchant_node_id` must be an announced node this node can receive onion messages through,
+	/// typically its always-connected peer that provided the template.
+	///
+	/// Errors if the template does not set the `payment_notifications` feature bit or already has
+	/// any of the per-order fields set.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	///
+	/// [`Event::PaymentNotificationReceived`]: crate::events::Event::PaymentNotificationReceived
+	pub fn create_pos_order_offer<ES: EntropySource>(
+		&self, template: &Offer, merchant_node_id: PublicKey, amount_msats: u64,
+		description: Option<String>, order_absolute_expiry: Option<Duration>, entropy_source: ES,
+	) -> Result<(Offer, Vec<u8>), Bolt12SemanticError> {
+		let entropy = &entropy_source;
+		let order_id = entropy.get_secure_random_bytes()[..MIN_ORDER_ID_LEN].to_vec();
+
+		let context = MessageContext::PosNotification(PosNotificationContext::InboundOrder {
+			order_id: order_id.clone(),
+			amount_msats,
+			description: description.clone(),
+			order_absolute_expiry,
+		});
+		let intermediate_nodes =
+			[MessageForwardNode { node_id: merchant_node_id, short_channel_id: None }];
+		// Compact padding keeps the offer scannable as a QR code, trading off how well the
+		// path's contents are hidden.
+		let notification_path = BlindedMessagePath::new(
+			&intermediate_nodes,
+			self.get_our_node_id(),
+			self.get_receive_auth_key(),
+			context,
+			true,
+			entropy,
+			&self.secp_ctx,
+		);
+
+		let offer = template
+			.modify()?
+			.with_pos_order(
+				amount_msats,
+				description,
+				order_id.clone(),
+				vec![notification_path],
+				order_absolute_expiry,
+				entropy,
+				&self.secp_ctx,
+			)?
+			.build();
+
+		Ok((offer, order_id))
 	}
 
 	/// Create an offer for receiving async payments as an often-offline recipient.
@@ -982,6 +1208,9 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 
 		let (payment_hash, payment_secret) = get_payment_info(amount_msats, relative_expiry)?;
 
+		let payment_metadata =
+			self.embed_pos_order_payment_metadata(invoice_request, payment_metadata);
+
 		let context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
 			offer_id: invoice_request.offer_id,
 			invoice_request: invoice_request.fields(),
@@ -1012,6 +1241,43 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		let context = MessageContext::Offers(OffersContext::InboundPayment { payment_hash });
 
 		Ok((builder, context))
+	}
+
+	/// If the given [`InvoiceRequest`] mirrors a point-of-sale offer whose `payment_token` is
+	/// decryptable with the request's derived keys, stores the recovered `order_id`, the offer's
+	/// `notification_path`s, and the offer's expiry in the payment metadata so they can be
+	/// retrieved when the payment is claimed and a payment notification needs to be sent.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	fn embed_pos_order_payment_metadata(
+		&self, invoice_request: &VerifiedInvoiceRequest<DerivedSigningPubkey>,
+		mut payment_metadata: Option<BTreeMap<u64, Vec<u8>>>,
+	) -> Option<BTreeMap<u64, Vec<u8>>> {
+		let notification_paths = invoice_request.notification_paths();
+		if notification_paths.is_empty() {
+			return payment_metadata;
+		}
+		let token = match invoice_request.payment_token() {
+			Some(token) => token,
+			None => return payment_metadata,
+		};
+		let payload =
+			match PaymentTokenPayload::decrypt(&invoice_request.keys.0.secret_key(), token) {
+				Ok(payload) => payload,
+				Err(()) => return payment_metadata,
+			};
+
+		let metadata = payment_metadata.get_or_insert_with(BTreeMap::new);
+		metadata.insert(POS_ORDER_ID_PAYMENT_METADATA_KEY, payload.order_id);
+		metadata.insert(
+			POS_NOTIFICATION_PATHS_PAYMENT_METADATA_KEY,
+			WithoutLength(&notification_paths.to_vec()).encode(),
+		);
+		if let Some(expiry) = invoice_request.absolute_expiry() {
+			metadata.insert(POS_ORDER_EXPIRY_PAYMENT_METADATA_KEY, expiry.as_secs().encode());
+		}
+
+		payment_metadata
 	}
 
 	/// Creates an [`InvoiceBuilder<ExplicitSigningPubkey>`] for the
@@ -1309,6 +1575,170 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		&self,
 	) -> Vec<(AsyncPaymentsMessage, MessageSendInstructions)> {
 		core::mem::take(&mut self.pending_async_payments_messages.lock().unwrap())
+	}
+
+	/// Gets the enqueued [`PosNotificationMessage`]s with their corresponding
+	/// [`MessageSendInstructions`].
+	pub fn release_pending_pos_notification_messages(
+		&self,
+	) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		core::mem::take(&mut self.pending_pos_notification_messages.lock().unwrap())
+	}
+
+	/// Restores [`PendingPosNotification`]s that were unacknowledged when this node last shut
+	/// down. Sending resumes on the next timer tick.
+	pub fn with_pending_pos_notifications(
+		self, pending_pos_notifications: Vec<PendingPosNotification>,
+	) -> Self {
+		*self.pending_pos_notifications.lock().unwrap() = pending_pos_notifications;
+		self
+	}
+
+	/// Returns the [`PendingPosNotification`]s that have not been acknowledged yet, for
+	/// persistence across restarts.
+	pub fn pending_pos_notifications(&self) -> Vec<PendingPosNotification> {
+		self.pending_pos_notifications.lock().unwrap().clone()
+	}
+
+	/// Queues a payment notification for the point-of-sale device that constructed the offer the
+	/// claimed payment was for, using the order data recovered from the payment's metadata.
+	///
+	/// The notification is retried on each timer tick until acknowledged or until the order's
+	/// expiry plus a grace period has passed.
+	pub(crate) fn enqueue_pos_payment_notification(
+		&self, order_id: Vec<u8>, notification_paths: Vec<BlindedMessagePath>, amount_msats: u64,
+		payment_hash: PaymentHash, payment_preimage: PaymentPreimage,
+		order_absolute_expiry: Option<Duration>,
+	) {
+		let retry_until = order_absolute_expiry
+			.unwrap_or_else(|| {
+				self.duration_since_epoch()
+					.saturating_add(DEFAULT_PENDING_POS_NOTIFICATION_LIFETIME)
+			})
+			.saturating_add(POS_NOTIFICATION_GRACE_PERIOD);
+		let pending = PendingPosNotification {
+			payment_hash,
+			payment_preimage,
+			amount_msats,
+			order_id,
+			notification_paths,
+			retry_until,
+		};
+
+		self.enqueue_pending_pos_notification_messages(&pending);
+		self.pending_pos_notifications.lock().unwrap().push(pending);
+	}
+
+	/// Re-enqueues sends for all unacknowledged payment notifications, dropping those whose
+	/// retry window has passed. Intended to be called on each timer tick.
+	pub(crate) fn requeue_pending_pos_notifications(&self) {
+		let now = self.duration_since_epoch();
+		let mut pending_notifications = self.pending_pos_notifications.lock().unwrap();
+		pending_notifications.retain(|pending| {
+			if pending.retry_until < now {
+				log_error!(
+					self.logger,
+					"Abandoning undeliverable PoS payment notification for payment {}; the \
+					point-of-sale device never confirmed the order and manual reconciliation may \
+					be required",
+					pending.payment_hash
+				);
+				false
+			} else {
+				true
+			}
+		});
+		for pending in pending_notifications.iter() {
+			self.enqueue_pending_pos_notification_messages(pending);
+		}
+	}
+
+	/// Recovers the point-of-sale order data embedded in a claimed payment's metadata by
+	/// [`Self::create_invoice_builder_from_invoice_request_with_keys`], returning the `order_id`,
+	/// the offer's `notification_path`s, and the order's expiry.
+	///
+	/// Returns `None` if the payment was not for a point-of-sale offer.
+	pub(crate) fn pos_order_data_from_payment_metadata(
+		payment_metadata: &BTreeMap<u64, Vec<u8>>,
+	) -> Option<(Vec<u8>, Vec<BlindedMessagePath>, Option<Duration>)> {
+		let order_id = payment_metadata.get(&POS_ORDER_ID_PAYMENT_METADATA_KEY)?;
+		let paths_bytes = payment_metadata.get(&POS_NOTIFICATION_PATHS_PAYMENT_METADATA_KEY)?;
+
+		let mut cursor = crate::io::Cursor::new(paths_bytes);
+		let mut reader = FixedLengthReader::new(&mut cursor, paths_bytes.len() as u64);
+		let notification_paths: WithoutLength<Vec<BlindedMessagePath>> =
+			LengthReadable::read_from_fixed_length_buffer(&mut reader).ok()?;
+		if notification_paths.0.is_empty() {
+			return None;
+		}
+
+		let order_absolute_expiry = payment_metadata
+			.get(&POS_ORDER_EXPIRY_PAYMENT_METADATA_KEY)
+			.and_then(|bytes| {
+				let mut cursor = crate::io::Cursor::new(bytes);
+				<u64 as Readable>::read(&mut cursor).ok()
+			})
+			.map(Duration::from_secs);
+
+		Some((order_id.clone(), notification_paths.0, order_absolute_expiry))
+	}
+
+	/// Resolves a pending payment notification once the point-of-sale device acknowledged it.
+	pub(crate) fn resolve_pending_pos_notification(&self, payment_hash: &PaymentHash) {
+		self.pending_pos_notifications
+			.lock()
+			.unwrap()
+			.retain(|pending| pending.payment_hash != *payment_hash);
+	}
+
+	fn enqueue_pending_pos_notification_messages(&self, pending: &PendingPosNotification) {
+		let message = PosNotificationMessage::PaymentNotification(PaymentNotification {
+			payment_hash: pending.payment_hash,
+			payment_preimage: pending.payment_preimage,
+			amount_msats: pending.amount_msats,
+			order_id: pending.order_id.clone(),
+		});
+		let context =
+			MessageContext::PosNotification(PosNotificationContext::OutboundNotification {
+				payment_hash: pending.payment_hash,
+			});
+		let mut queue = self.pending_pos_notification_messages.lock().unwrap();
+		for path in pending.notification_paths.iter() {
+			let instructions = MessageSendInstructions::WithReplyPath {
+				destination: Destination::BlindedPath(path.clone()),
+				context: context.clone(),
+			};
+			queue.push((message.clone(), instructions));
+		}
+	}
+
+	/// Enqueues a `payment_proof` onion message to be sent to the point-of-sale device over the
+	/// given offer's `notification_path`s, proving to the device that this node paid the offer.
+	///
+	/// `proof` is a serialized BOLT 12 payer proof, as defined in
+	/// [bolts#1295](https://github.com/lightning/bolts/pull/1295).
+	///
+	/// Errors if the offer does not contain any `notification_path`s.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	pub fn enqueue_payment_proof(
+		&self, offer: &Offer, proof: Vec<u8>,
+	) -> Result<(), Bolt12SemanticError> {
+		let notification_paths = offer.notification_paths();
+		if notification_paths.is_empty() {
+			return Err(Bolt12SemanticError::MissingPaths);
+		}
+
+		let message = PosNotificationMessage::PaymentProof(PaymentProof { proof });
+		let mut queue = self.pending_pos_notification_messages.lock().unwrap();
+		for path in notification_paths.iter() {
+			let instructions = MessageSendInstructions::WithoutReplyPath {
+				destination: Destination::BlindedPath(path.clone()),
+			};
+			queue.push((message.clone(), instructions));
+		}
+
+		Ok(())
 	}
 
 	/// Retrieve an [`Offer`] for receiving async payments as an often-offline recipient. Will only

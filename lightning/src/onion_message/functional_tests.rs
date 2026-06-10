@@ -22,9 +22,13 @@ use super::messenger::{
 };
 use super::offers::{OffersMessage, OffersMessageHandler};
 use super::packet::{OnionMessageContents, Packet};
+use super::pos_notification::{
+	NotificationAck, NotificationNack, PaymentNotification, PaymentProof, PosNotificationMessage,
+	PosNotificationMessageHandler,
+};
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, DNSResolverContext, MessageContext,
-	MessageForwardNode, OffersContext, MESSAGE_PADDING_ROUND_OFF,
+	MessageForwardNode, OffersContext, PosNotificationContext, MESSAGE_PADDING_ROUND_OFF,
 };
 use crate::blinded_path::utils::is_padded;
 use crate::blinded_path::EmptyNodeIdLookUp;
@@ -65,6 +69,7 @@ struct MessengerNode {
 		Arc<TestOffersMessageHandler>,
 		Arc<TestAsyncPaymentsMessageHandler>,
 		Arc<TestDNSResolverMessageHandler>,
+		Arc<TestPosNotificationMessageHandler>,
 		Arc<TestCustomMessageHandler>,
 	>,
 	custom_message_handler: Arc<TestCustomMessageHandler>,
@@ -132,6 +137,24 @@ impl DNSResolverMessageHandler for TestDNSResolverMessageHandler {
 		None
 	}
 	fn handle_dnssec_proof(&self, _message: DNSSECProof, _context: DNSResolverContext) {}
+}
+
+struct TestPosNotificationMessageHandler {}
+
+impl PosNotificationMessageHandler for TestPosNotificationMessageHandler {
+	fn handle_payment_notification(
+		&self, _message: PaymentNotification, _context: PosNotificationContext,
+		_responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)> {
+		None
+	}
+	fn handle_notification_ack(&self, _message: NotificationAck, _context: PosNotificationContext) {
+	}
+	fn handle_notification_nack(
+		&self, _message: NotificationNack, _context: PosNotificationContext,
+	) {
+	}
+	fn handle_payment_proof(&self, _message: PaymentProof, _context: PosNotificationContext) {}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -310,6 +333,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 		let offers_message_handler = Arc::new(TestOffersMessageHandler {});
 		let async_payments_message_handler = Arc::new(TestAsyncPaymentsMessageHandler {});
 		let dns_resolver_message_handler = Arc::new(TestDNSResolverMessageHandler {});
+		let pos_notification_message_handler = Arc::new(TestPosNotificationMessageHandler {});
 		let custom_message_handler = Arc::new(TestCustomMessageHandler::new());
 		let messenger = if cfg.intercept_offline_peer_oms {
 			OnionMessenger::new_with_offline_peer_interception(
@@ -321,6 +345,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 				offers_message_handler,
 				async_payments_message_handler,
 				dns_resolver_message_handler,
+				pos_notification_message_handler,
 				Arc::clone(&custom_message_handler),
 			)
 		} else {
@@ -333,6 +358,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 				offers_message_handler,
 				async_payments_message_handler,
 				dns_resolver_message_handler,
+				pos_notification_message_handler,
 				Arc::clone(&custom_message_handler),
 			)
 		};

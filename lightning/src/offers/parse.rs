@@ -190,6 +190,8 @@ pub enum Bolt12SemanticError {
 	UnexpectedFeatures,
 	/// A required description was not provided.
 	MissingDescription,
+	/// A description was provided but was not expected.
+	UnexpectedDescription,
 	/// An issuer's signing pubkey was not provided.
 	MissingIssuerSigningPubkey,
 	/// An issuer's signing pubkey was provided but was not expected.
@@ -214,6 +216,8 @@ pub enum Bolt12SemanticError {
 	MissingPaths,
 	/// Blinded paths were provided but were not expected.
 	UnexpectedPaths,
+	/// A payment token was provided but was not expected.
+	UnexpectedPaymentToken,
 	/// The blinded payinfo given does not match the number of blinded path hops.
 	InvalidPayInfo,
 	/// An invoice creation time was expected but was missing.
