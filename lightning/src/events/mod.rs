@@ -2011,6 +2011,60 @@ pub enum Event {
 		/// [`ChannelManager::funding_transaction_signed`]: crate::ln::channelmanager::ChannelManager::funding_transaction_signed
 		unsigned_transaction: Transaction,
 	},
+	/// A merchant's `payment_notification` for a per-order offer constructed by this node as a
+	/// point-of-sale device was received and authenticated, meaning the merchant claimed the
+	/// payment for the order. A `notification_ack` was sent in response.
+	///
+	/// The notification was authenticated by matching the relayed `order_id` against the one in
+	/// the offer's notification path context, and the preimage and amount were verified. Handle
+	/// duplicates idempotently: the merchant retries notifications until acknowledged, so a
+	/// second event for an already-confirmed order may occur and must not record the payment
+	/// twice.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	///
+	/// # Failure Behavior and Persistence
+	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
+	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	PaymentNotificationReceived {
+		/// The per-order secret identifying the order, as generated when constructing the
+		/// per-order offer.
+		order_id: Vec<u8>,
+		/// The amount claimed by the merchant, in millisatoshis. At least the order amount.
+		amount_msats: u64,
+		/// The payment hash of the claimed payment.
+		payment_hash: PaymentHash,
+		/// The payment preimage released by the merchant when claiming the payment.
+		payment_preimage: PaymentPreimage,
+		/// The description set on the per-order offer, if any.
+		description: Option<String>,
+	},
+	/// A customer's `payment_proof` for a per-order offer constructed by this node as a
+	/// point-of-sale device was received over the offer's notification path.
+	///
+	/// The proof is a serialized BOLT 12 payer proof, as defined in
+	/// [bolts#1295](https://github.com/lightning/bolts/pull/1295). It is provided as opaque bytes
+	/// and has NOT been verified; verifying it per the bolts#1295 reader requirements, including
+	/// that the mirrored `payment_token` matches the one issued for this order, is the handler's
+	/// responsibility.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	///
+	/// # Failure Behavior and Persistence
+	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
+	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	PaymentProofReceived {
+		/// The per-order secret identifying the order, as generated when constructing the
+		/// per-order offer.
+		order_id: Vec<u8>,
+		/// The serialized, unverified BOLT 12 payer proof.
+		proof: Vec<u8>,
+		/// The amount in millisatoshis set on the per-order offer, against which the proof's
+		/// `invoice_amount` should be checked.
+		amount_msats: u64,
+		/// The description set on the per-order offer, if any.
+		description: Option<String>,
+	},
 }
 
 impl Writeable for Event {
@@ -2520,6 +2574,36 @@ impl Writeable for Event {
 					(7, counterparty_node_id, required),
 					(11, reason, required),
 					(13, contribution, option),
+				});
+			},
+			&Event::PaymentNotificationReceived {
+				ref order_id,
+				ref amount_msats,
+				ref payment_hash,
+				ref payment_preimage,
+				ref description,
+			} => {
+				53u8.write(writer)?;
+				write_tlv_fields!(writer, {
+					(1, order_id, required_vec),
+					(3, amount_msats, required),
+					(5, payment_hash, required),
+					(7, payment_preimage, required),
+					(9, description, option),
+				});
+			},
+			&Event::PaymentProofReceived {
+				ref order_id,
+				ref proof,
+				ref amount_msats,
+				ref description,
+			} => {
+				55u8.write(writer)?;
+				write_tlv_fields!(writer, {
+					(1, order_id, required_vec),
+					(3, proof, required_vec),
+					(5, amount_msats, required),
+					(7, description, option),
 				});
 			},
 			// Note that, going forward, all new events must only write data inside of
@@ -3172,6 +3256,44 @@ impl MaybeReadable for Event {
 						counterparty_node_id: counterparty_node_id.0.unwrap(),
 						reason: reason.unwrap_or(NegotiationFailureReason::Unknown),
 						contribution,
+					}))
+				};
+				f()
+			},
+			53u8 => {
+				let mut f = || {
+					_init_and_read_len_prefixed_tlv_fields!(reader, {
+						(1, order_id, required_vec),
+						(3, amount_msats, required),
+						(5, payment_hash, required),
+						(7, payment_preimage, required),
+						(9, description, option),
+					});
+
+					Ok(Some(Event::PaymentNotificationReceived {
+						order_id,
+						amount_msats: amount_msats.0.unwrap(),
+						payment_hash: payment_hash.0.unwrap(),
+						payment_preimage: payment_preimage.0.unwrap(),
+						description,
+					}))
+				};
+				f()
+			},
+			55u8 => {
+				let mut f = || {
+					_init_and_read_len_prefixed_tlv_fields!(reader, {
+						(1, order_id, required_vec),
+						(3, proof, required_vec),
+						(5, amount_msats, required),
+						(7, description, option),
+					});
+
+					Ok(Some(Event::PaymentProofReceived {
+						order_id,
+						proof,
+						amount_msats: amount_msats.0.unwrap(),
+						description,
 					}))
 				};
 				f()

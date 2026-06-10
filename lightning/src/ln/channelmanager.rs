@@ -24,6 +24,7 @@ use bitcoin::network::Network;
 use bitcoin::transaction::Transaction;
 
 use bitcoin::hash_types::{BlockHash, Txid};
+use bitcoin::hashes::cmp::fixed_time_eq;
 use bitcoin::hashes::hmac::Hmac;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::{Hash, HashEngine, HmacEngine};
@@ -34,6 +35,7 @@ use bitcoin::{secp256k1, Sequence, SignedAmount};
 
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, MessageForwardNode, OffersContext,
+	PosNotificationContext,
 };
 use crate::blinded_path::payment::{AsyncBolt12OfferContext, Bolt12OfferContext, PaymentContext};
 use crate::blinded_path::NodeIdLookUp;
@@ -94,7 +96,9 @@ use crate::ln::outbound_payment::{
 };
 use crate::ln::types::ChannelId;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
-use crate::offers::flow::{HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow};
+use crate::offers::flow::{
+	HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow, PendingPosNotification,
+};
 use crate::offers::invoice::{Bolt12Invoice, UnsignedBolt12Invoice};
 use crate::offers::invoice_error::InvoiceError;
 use crate::offers::invoice_request::{InvoiceRequest, InvoiceRequestVerifiedFromOffer};
@@ -112,6 +116,10 @@ use crate::onion_message::messenger::{
 	MessageRouter, MessageSendInstructions, Responder, ResponseInstruction,
 };
 use crate::onion_message::offers::{OffersMessage, OffersMessageHandler};
+use crate::onion_message::pos_notification::{
+	NackReason, NotificationAck, NotificationNack, PaymentNotification, PaymentProof,
+	PosNotificationMessage, PosNotificationMessageHandler,
+};
 use crate::routing::gossip::NodeId;
 use crate::routing::router::{
 	BlindedTail, FixedRouter, InFlightHtlcs, Path, Payee, PaymentParameters, Route,
@@ -9097,6 +9105,7 @@ impl<
 				.remove_stale_payments(duration_since_epoch, &self.pending_events);
 
 			self.check_refresh_async_receive_offer_cache(true);
+			self.flow.requeue_pending_pos_notifications();
 
 			if self.check_free_holding_cells() {
 				// While we try to ensure we clear holding cells immediately, its possible we miss
@@ -10453,6 +10462,29 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						durable_preimage_channel,
 					}) = payment
 					{
+						if let events::PaymentPurpose::Bolt12OfferPayment {
+							payment_preimage: Some(payment_preimage),
+							payment_context,
+							..
+						} = &purpose
+						{
+							if let Some(metadata) = &payment_context.payment_metadata {
+								if let Some((order_id, notification_paths, order_expiry)) =
+									OffersMessageFlow::<MR, L>::pos_order_data_from_payment_metadata(
+										metadata,
+									) {
+									self.flow.enqueue_pos_payment_notification(
+										order_id,
+										notification_paths,
+										amount_msat,
+										payment_hash,
+										*payment_preimage,
+										order_expiry,
+									);
+								}
+							}
+						}
+
 						let event = events::Event::PaymentClaimed {
 							payment_hash,
 							purpose,
@@ -14893,6 +14925,61 @@ impl<
 		Ok(())
 	}
 
+	/// Creates an [`Offer`] template for handing to a point-of-sale device, which constructs
+	/// per-order offers from it. When a payment for such a per-order offer is claimed, a payment
+	/// notification is automatically delivered to the device over the offer's
+	/// `notification_path`, with retries on each timer tick until acknowledged.
+	///
+	/// See [`OffersMessageFlow::create_pos_delegation_template`] for details and
+	/// [bLIP 56](https://github.com/lightning/blips/pull/56) for the protocol.
+	pub fn create_pos_delegation_template(
+		&self, absolute_expiry: Option<Duration>,
+	) -> Result<Offer, Bolt12SemanticError> {
+		self.flow.create_pos_delegation_template(
+			&self.entropy_source,
+			self.get_peers_for_blinded_path(),
+			absolute_expiry,
+		)
+	}
+
+	/// Constructs a per-order [`Offer`] from a merchant-provided point-of-sale template, for
+	/// presenting to a customer, returning the offer along with the generated per-order
+	/// `order_id`. Once the merchant claims the order's payment, its notification is surfaced via
+	/// [`Event::PaymentNotificationReceived`].
+	///
+	/// See [`OffersMessageFlow::create_pos_order_offer`] for details and
+	/// [bLIP 56](https://github.com/lightning/blips/pull/56) for the protocol.
+	///
+	/// [`Event::PaymentNotificationReceived`]: crate::events::Event::PaymentNotificationReceived
+	pub fn create_pos_order_offer(
+		&self, template: &Offer, merchant_node_id: PublicKey, amount_msats: u64,
+		description: Option<String>, order_absolute_expiry: Option<Duration>,
+	) -> Result<(Offer, Vec<u8>), Bolt12SemanticError> {
+		self.flow.create_pos_order_offer(
+			template,
+			merchant_node_id,
+			amount_msats,
+			description,
+			order_absolute_expiry,
+			&self.entropy_source,
+		)
+	}
+
+	/// Sends a `payment_proof` onion message to the point-of-sale device behind the given offer's
+	/// `notification_path`s, proving that this node paid the offer. `proof` is a serialized
+	/// BOLT 12 payer proof, as defined in
+	/// [bolts#1295](https://github.com/lightning/bolts/pull/1295).
+	///
+	/// Errors if the offer does not contain any `notification_path`s.
+	///
+	/// See [bLIP 56](https://github.com/lightning/blips/pull/56) for more information.
+	pub fn send_payment_proof(
+		&self, offer: &Offer, proof: Vec<u8>,
+	) -> Result<(), Bolt12SemanticError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		self.flow.enqueue_payment_proof(offer, proof)
+	}
+
 	/// Pays for an [`Offer`] using the given parameters by creating an [`InvoiceRequest`] and
 	/// enqueuing it to be sent via an onion message. [`ChannelManager`] will pay the actual
 	/// [`Bolt12Invoice`] once it is received.
@@ -17735,6 +17822,131 @@ impl<
 		R: Router,
 		MR: MessageRouter,
 		L: Logger,
+	> PosNotificationMessageHandler for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
+{
+	fn handle_payment_notification(
+		&self, message: PaymentNotification, context: PosNotificationContext,
+		responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)> {
+		let (order_id, amount_msats, description, order_absolute_expiry) = match context {
+			PosNotificationContext::InboundOrder {
+				order_id,
+				amount_msats,
+				description,
+				order_absolute_expiry,
+			} => (order_id, amount_msats, description, order_absolute_expiry),
+			PosNotificationContext::OutboundNotification { .. } => {
+				return responder.map(|responder| {
+					let nack = NotificationNack { reason: NackReason::UnknownOrder };
+					(PosNotificationMessage::NotificationNack(nack), responder.respond())
+				});
+			},
+		};
+
+		// The path-level authentication of the notification path guarantees the context was
+		// created by us, and only the merchant can recover the order_id from the offer's
+		// payment_token, so a matching order_id authenticates the notification as
+		// merchant-originated. Without it, the amount cannot be trusted.
+		let order_id_matches =
+			order_id.len() == message.order_id.len() && fixed_time_eq(&order_id, &message.order_id);
+		let reason = if !order_id_matches {
+			Some(NackReason::OrderIdMismatch)
+		} else if order_absolute_expiry.map_or(false, |expiry| self.duration_since_epoch() > expiry)
+		{
+			Some(NackReason::OrderExpired)
+		} else if message.amount_msats < amount_msats {
+			Some(NackReason::AmountInsufficient)
+		} else if PaymentHash::from(message.payment_preimage) != message.payment_hash {
+			Some(NackReason::InvalidPreimage)
+		} else {
+			None
+		};
+
+		if let Some(reason) = reason {
+			return responder.map(|responder| {
+				let nack = NotificationNack { reason };
+				(PosNotificationMessage::NotificationNack(nack), responder.respond())
+			});
+		}
+
+		// The merchant retries notifications until acknowledged, so consumers of this event must
+		// handle duplicates for an already-confirmed order idempotently.
+		{
+			let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+			let mut pending_events = self.pending_events.lock().unwrap();
+			pending_events.push_back((
+				events::Event::PaymentNotificationReceived {
+					order_id,
+					amount_msats: message.amount_msats,
+					payment_hash: message.payment_hash,
+					payment_preimage: message.payment_preimage,
+					description,
+				},
+				None,
+			));
+		}
+
+		responder.map(|responder| {
+			let ack = NotificationAck {};
+			(PosNotificationMessage::NotificationAck(ack), responder.respond())
+		})
+	}
+
+	fn handle_notification_ack(&self, _message: NotificationAck, context: PosNotificationContext) {
+		if let PosNotificationContext::OutboundNotification { payment_hash } = context {
+			let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+			self.flow.resolve_pending_pos_notification(&payment_hash);
+		}
+	}
+
+	fn handle_notification_nack(&self, message: NotificationNack, context: PosNotificationContext) {
+		if let PosNotificationContext::OutboundNotification { payment_hash } = context {
+			log_error!(
+				self.logger,
+				"PoS payment notification for payment {} was rejected with reason {:?}; the \
+				payment was already claimed, so manual reconciliation may be required",
+				payment_hash,
+				message.reason
+			);
+			let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+			self.flow.resolve_pending_pos_notification(&payment_hash);
+		}
+	}
+
+	fn handle_payment_proof(&self, message: PaymentProof, context: PosNotificationContext) {
+		if let PosNotificationContext::InboundOrder {
+			order_id, amount_msats, description, ..
+		} = context
+		{
+			let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+			let mut pending_events = self.pending_events.lock().unwrap();
+			pending_events.push_back((
+				events::Event::PaymentProofReceived {
+					order_id,
+					proof: message.proof,
+					amount_msats,
+					description,
+				},
+				None,
+			));
+		}
+	}
+
+	fn release_pending_messages(&self) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		self.flow.release_pending_pos_notification_messages()
+	}
+}
+
+impl<
+		M: chain::Watch<SP::EcdsaSigner>,
+		T: BroadcasterInterface,
+		ES: EntropySource,
+		NS: NodeSigner,
+		SP: SignerProvider,
+		F: FeeEstimator,
+		R: Router,
+		MR: MessageRouter,
+		L: Logger,
 	> NodeIdLookUp for ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
 {
 	fn next_node_id(&self, short_channel_id: u64) -> Option<PublicKey> {
@@ -18508,6 +18720,7 @@ impl<
 			}
 		}
 
+		let pending_pos_notifications = self.flow.pending_pos_notifications();
 		write_tlv_fields!(writer, {
 			(1, pending_outbound_payments_no_retry, required),
 			(2, pending_intercepted_htlcs, option),
@@ -18527,6 +18740,7 @@ impl<
 			(19, peer_storage_dir, optional_vec),
 			(21, WithoutLength(&self.flow.writeable_async_receive_offer_cache()), required),
 			(23, self.best_block.read().unwrap().previous_blocks, required),
+			(25, pending_pos_notifications, optional_vec),
 		});
 
 		// Remove the SpliceNegotiationFailed and DiscardFunding events added earlier.
@@ -18613,6 +18827,7 @@ pub(super) struct ChannelManagerData<SP: SignerProvider> {
 	in_flight_monitor_updates: HashMap<(PublicKey, ChannelId), Vec<ChannelMonitorUpdate>>,
 	peer_storage_dir: Vec<(PublicKey, Vec<u8>)>,
 	async_receive_offer_cache: AsyncReceiveOfferCache,
+	pending_pos_notifications: Vec<PendingPosNotification>,
 	// Marked `_legacy` because in versions > 0.2 we are taking steps to remove the requirement of
 	// regularly persisting the `ChannelManager` and instead rebuild the set of HTLC forwards from
 	// `Channel{Monitor}` data.
@@ -18804,6 +19019,7 @@ impl<'a, ES: EntropySource, SP: SignerProvider, L: Logger>
 		let mut inbound_payment_id_secret = None;
 		let mut peer_storage_dir: Option<Vec<(PublicKey, Vec<u8>)>> = None;
 		let mut async_receive_offer_cache: AsyncReceiveOfferCache = AsyncReceiveOfferCache::new();
+		let mut pending_pos_notifications = None;
 		let mut best_block_previous_blocks = None;
 		read_tlv_fields!(reader, {
 			(1, pending_outbound_payments_no_retry, option),
@@ -18824,6 +19040,7 @@ impl<'a, ES: EntropySource, SP: SignerProvider, L: Logger>
 			(19, peer_storage_dir, optional_vec),
 			(21, async_receive_offer_cache, (default_value, async_receive_offer_cache)),
 			(23, best_block_previous_blocks, option),
+			(25, pending_pos_notifications, optional_vec),
 		});
 
 		// Merge legacy pending_outbound_payments fields into a single HashMap.
@@ -18944,6 +19161,7 @@ impl<'a, ES: EntropySource, SP: SignerProvider, L: Logger>
 			in_flight_monitor_updates: in_flight_monitor_updates.unwrap_or_default(),
 			peer_storage_dir: peer_storage_dir.unwrap_or_default(),
 			async_receive_offer_cache,
+			pending_pos_notifications: pending_pos_notifications.unwrap_or_default(),
 			version,
 		})
 	}
@@ -19245,6 +19463,7 @@ impl<
 			mut in_flight_monitor_updates,
 			peer_storage_dir,
 			async_receive_offer_cache,
+			pending_pos_notifications,
 			version: _version,
 		} = data;
 
@@ -20450,7 +20669,8 @@ impl<
 			args.message_router,
 			args.logger.clone(),
 		)
-		.with_async_payments_offers_cache(async_receive_offer_cache);
+		.with_async_payments_offers_cache(async_receive_offer_cache)
+		.with_pending_pos_notifications(pending_pos_notifications);
 
 		let channel_manager = ChannelManager {
 			chain_hash,

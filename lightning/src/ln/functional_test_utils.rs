@@ -533,7 +533,7 @@ type TestOnionMessenger<'chan_man, 'node_cfg, 'chan_mon_cfg> = OnionMessenger<
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	IgnoringMessageHandler,
-	IgnoringMessageHandler,
+	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	IgnoringMessageHandler,
 >;
 
@@ -4799,7 +4799,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(
 			&chan_mgrs[i],
 			&chan_mgrs[i],
 			IgnoringMessageHandler {},
-			IgnoringMessageHandler {},
+			&chan_mgrs[i],
 			IgnoringMessageHandler {},
 		);
 		let gossip_sync = P2PGossipSync::new(cfgs[i].network_graph.as_ref(), None, cfgs[i].logger);
