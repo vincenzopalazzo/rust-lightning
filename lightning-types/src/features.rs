@@ -83,6 +83,8 @@
 //!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
 //! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
+//! - `PaymentNotifications` - supports delivering payment notifications for point-of-sale offers
+//!   (see [bLIP 56](https://github.com/lightning/blips/pull/56) for more information).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -221,7 +223,12 @@ mod sealed {
 		// Byte 7
 		Trampoline,
 	]);
-	define_context!(OfferContext, []);
+	define_context!(OfferContext, [
+		// Byte 0 - 32
+		,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+		// Byte 33
+		PaymentNotifications,
+	]);
 	define_context!(InvoiceRequestContext, []);
 	define_context!(Bolt12InvoiceContext, [
 		// Byte 0
@@ -727,6 +734,17 @@ mod sealed {
 		clear_dns_resolution,
 		supports_dns_resolution,
 		requires_dns_resolution
+	);
+	define_feature!(
+		265,
+		PaymentNotifications,
+		[OfferContext],
+		"Feature flags for point-of-sale payment notifications.",
+		set_payment_notifications_optional,
+		set_payment_notifications_required,
+		clear_payment_notifications,
+		supports_payment_notifications,
+		requires_payment_notifications
 	);
 
 	// Note: update the module-level docs when a new feature bit is added!
