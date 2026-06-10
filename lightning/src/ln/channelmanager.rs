@@ -94,6 +94,7 @@ use crate::ln::outbound_payment::{
 };
 use crate::ln::types::ChannelId;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
+use crate::offers::contacts::ContactSecrets;
 use crate::offers::flow::{HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow};
 use crate::offers::invoice::{Bolt12Invoice, UnsignedBolt12Invoice};
 use crate::offers::invoice_error::InvoiceError;
@@ -773,6 +774,45 @@ pub struct OptionalOfferPaymentParams {
 	/// will ultimately fail once all pending paths have failed (generating an
 	/// [`Event::PaymentFailed`]).
 	pub retry_strategy: Retry,
+	/// BLIP 42 contact secrets identifying us to the recipient, revealing that the payment came
+	/// from one of their contacts.
+	///
+	/// Only set this when the user explicitly chose to reveal their identity to the recipient
+	/// (e.g., by saving them as a contact), as it makes payments linkable. When set, the primary
+	/// secret is included in the invoice request. Obtain the secrets either from
+	/// [`ChannelManager::compute_contact_secret`] when we add the contact first, or from
+	/// [`ContactSecrets::from_remote_secret`] with the secret from
+	/// [`InvoiceRequestFields::contact_secret`] when they paid us first.
+	///
+	/// [`InvoiceRequestFields::contact_secret`]: crate::offers::invoice_request::InvoiceRequestFields::contact_secret
+	pub contact_secrets: Option<ContactSecrets>,
+	/// Our own offer to include in the invoice request for BLIP 42 contact management, allowing
+	/// the recipient to pay us back and thereby establish a mutual contact relationship.
+	///
+	/// If `None`, no payer offer will be included in the invoice request. As with
+	/// [`Self::contact_secrets`], only set this when the user explicitly chose to reveal their
+	/// identity to the recipient. To keep invoice requests small enough for the recipient to
+	/// store the contact data, the offer's encoding must not exceed [`PAYER_OFFER_MAX_BYTES`];
+	/// use a long-lived offer created via [`ChannelManager::create_compact_offer_builder`].
+	///
+	/// Note that to converge on the same contact secret as the recipient, this should be the
+	/// same offer used with [`ChannelManager::compute_contact_secret`].
+	///
+	/// # Example
+	/// ```rust,ignore
+	/// // Include a compact offer with a single blinded path through a trusted peer.
+	/// let (builder, nonce) = channel_manager.create_compact_offer_builder(trusted_peer_pubkey)?;
+	/// let payer_offer = builder.build()?;
+	///
+	/// let params = OptionalOfferPaymentParams {
+	///     contact_secrets: Some(channel_manager.compute_contact_secret(&payer_offer, nonce, &offer)?),
+	///     payer_offer: Some(payer_offer),
+	///     ..Default::default()
+	/// };
+	/// ```
+	///
+	/// [`PAYER_OFFER_MAX_BYTES`]: crate::offers::contacts::PAYER_OFFER_MAX_BYTES
+	pub payer_offer: Option<Offer>,
 }
 
 impl Default for OptionalOfferPaymentParams {
@@ -784,6 +824,8 @@ impl Default for OptionalOfferPaymentParams {
 			retry_strategy: Retry::Timeout(core::time::Duration::from_secs(2)),
 			#[cfg(not(feature = "std"))]
 			retry_strategy: Retry::Attempts(3),
+			contact_secrets: None,
+			payer_offer: None,
 		}
 	}
 }
@@ -14732,6 +14774,37 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 
 		Ok(builder.into())
 	}
+
+	/// Creates a compact [`OfferBuilder`] suitable for BLIP-42's `payer_offer` field, returning
+	/// it along with the [`Nonce`] used to derive the offer's metadata and signing pubkey.
+	///
+	/// The offer contains a single blinded path through `intro_node_id`, keeping its encoding
+	/// small enough for invoice request fields where space is limited while preserving recipient
+	/// privacy. The intro node must be a public peer (routable via gossip) with an outbound
+	/// channel.
+	///
+	/// Persist the returned [`Nonce`] alongside the built offer: it is needed by
+	/// [`Self::compute_contact_secret`] to re-derive the offer's signing keys.
+	///
+	/// # Privacy
+	///
+	/// Uses a derived signing pubkey in the offer for recipient privacy. The intro node learns
+	/// that we are the offer's recipient, so choose a trusted peer.
+	///
+	/// # Errors
+	///
+	/// Errors if a blinded path through `intro_node_id` cannot be created.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	pub fn create_compact_offer_builder(
+		&$self, intro_node_id: PublicKey,
+	) -> Result<($builder, Nonce), Bolt12SemanticError> {
+		let (builder, nonce) = $self.flow.create_compact_offer_builder(
+			&$self.entropy_source, intro_node_id
+		)?;
+
+		Ok((builder.into(), nonce))
+	}
 } }
 
 macro_rules! create_refund_builder { ($self: ident, $builder: ty) => {
@@ -14967,6 +15040,8 @@ impl<
 			payment_id,
 			None,
 			create_pending_payment_fn,
+			optional_params.contact_secrets,
+			optional_params.payer_offer,
 		)
 	}
 
@@ -14996,6 +15071,8 @@ impl<
 			payment_id,
 			Some(offer.hrn),
 			create_pending_payment_fn,
+			optional_params.contact_secrets,
+			optional_params.payer_offer,
 		)
 	}
 
@@ -15038,7 +15115,26 @@ impl<
 			payment_id,
 			None,
 			create_pending_payment_fn,
+			optional_params.contact_secrets,
+			optional_params.payer_offer,
 		)
+	}
+
+	/// Computes the BLIP 42 contact secret shared between us and a contact, deterministically
+	/// derived from one of our offers and the contact's offer.
+	///
+	/// `our_offer` must have been created by this [`ChannelManager`] with blinded paths and
+	/// `our_offer_nonce` (e.g., via [`Self::create_compact_offer_builder`]) so that the keys
+	/// behind its signing pubkey can be re-derived. Use this when adding a contact that hasn't
+	/// paid us before; when they paid us first, use [`ContactSecrets::from_remote_secret`] with
+	/// the secret they sent instead.
+	///
+	/// The returned secrets may be included in an invoice request via
+	/// [`OptionalOfferPaymentParams::contact_secrets`].
+	pub fn compute_contact_secret(
+		&self, our_offer: &Offer, our_offer_nonce: Nonce, their_offer: &Offer,
+	) -> Result<ContactSecrets, Bolt12SemanticError> {
+		self.flow.compute_contact_secret(our_offer, our_offer_nonce, their_offer)
 	}
 
 	#[rustfmt::skip]
@@ -15046,6 +15142,7 @@ impl<
 		&self, offer: &Offer, quantity: Option<u64>, amount_msats: Option<u64>,
 		payer_note: Option<String>, payment_id: PaymentId,
 		human_readable_name: Option<HumanReadableName>, create_pending_payment: CPP,
+		contacts: Option<ContactSecrets>, payer_offer: Option<Offer>,
 	) -> Result<(), Bolt12SemanticError> {
 		let entropy = &self.entropy_source;
 		let nonce = Nonce::from_entropy_source(entropy);
@@ -15069,6 +15166,15 @@ impl<
 		let builder = match human_readable_name {
 			None => builder,
 			Some(hrn) => builder.sourced_from_human_readable_name(hrn),
+		};
+
+		let builder = match contacts {
+			None => builder,
+			Some(secrets) => builder.contact_secrets(secrets),
+		};
+		let builder = match payer_offer {
+			None => builder,
+			Some(offer) => builder.payer_offer(&offer),
 		};
 
 		let invoice_request = builder.build_and_sign()?;

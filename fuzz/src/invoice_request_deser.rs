@@ -98,6 +98,9 @@ fn build_response<T: secp256k1::Signing + secp256k1::Verification>(
 					.payer_note()
 					.map(|s| UntrustedString(s.to_string())),
 				human_readable_name: None,
+				contact_secret: None,
+				payer_offer: None,
+				payer_bip_353_name: None,
 			}
 		};
 

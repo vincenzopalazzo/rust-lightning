@@ -36,6 +36,7 @@ use crate::ln::channel_state::ChannelDetails;
 use crate::ln::channelmanager::{InterceptId, PaymentId, CLTV_FAR_FAR_AWAY};
 use crate::ln::inbound_payment;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
+use crate::offers::contacts::{compute_contact_secret, ContactSecrets};
 use crate::offers::invoice::{
 	Bolt12Invoice, DerivedSigningPubkey, ExplicitSigningPubkey, InvoiceBuilder,
 	DEFAULT_RELATIVE_EXPIRY,
@@ -573,6 +574,62 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		}
 
 		Ok((builder.into(), nonce))
+	}
+
+	/// Creates a minimal [`OfferBuilder`] with derived metadata and a single blinded path through
+	/// `intro_node_id`, returning it along with the [`Nonce`] used to derive the offer's metadata
+	/// and signing pubkey.
+	///
+	/// The resulting offer (~200 bytes) is suitable as a BLIP 42 payer offer, which must stay
+	/// below [`PAYER_OFFER_MAX_BYTES`]. The intro node must be a public peer (routable via
+	/// gossip) with an outbound channel.
+	///
+	/// Persist the returned [`Nonce`] alongside the built offer: it is needed by
+	/// [`Self::compute_contact_secret`] to re-derive the offer's signing keys.
+	///
+	/// # Privacy
+	///
+	/// The intro node learns that we are the offer's recipient, so choose a trusted peer.
+	///
+	/// This is not exported to bindings users as builder patterns don't map outside of move semantics.
+	///
+	/// [`PAYER_OFFER_MAX_BYTES`]: crate::offers::contacts::PAYER_OFFER_MAX_BYTES
+	pub fn create_compact_offer_builder<ES: EntropySource>(
+		&self, entropy_source: ES, intro_node_id: PublicKey,
+	) -> Result<(OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Nonce), Bolt12SemanticError> {
+		self.create_offer_builder_intern(&entropy_source, |_, context, _| {
+			let peers = vec![MessageForwardNode { node_id: intro_node_id, short_channel_id: None }];
+			self.create_blinded_paths(peers, context)
+				.map(|paths| paths.into_iter().take(1))
+				.map_err(|_| Bolt12SemanticError::MissingPaths)
+		})
+	}
+
+	/// Computes the BLIP 42 contact secret shared between us and a contact, deterministically
+	/// derived from one of our offers and the contact's offer.
+	///
+	/// `our_offer` must have been created by this flow with blinded paths and `our_offer_nonce`
+	/// (e.g., via [`Self::create_compact_offer_builder`]) so that the keys behind its signing
+	/// pubkey can be re-derived. Use this when adding a contact that hasn't paid us before; when
+	/// they paid us first, use [`ContactSecrets::from_remote_secret`] with the secret they sent
+	/// instead.
+	///
+	/// # Errors
+	///
+	/// Returns [`Bolt12SemanticError::InvalidMetadata`] if `our_offer` was not created by this
+	/// flow using `our_offer_nonce`, and [`Bolt12SemanticError::MissingSigningPubkey`] if
+	/// `their_offer` has neither an issuer signing pubkey nor a blinded path.
+	pub fn compute_contact_secret(
+		&self, our_offer: &Offer, our_offer_nonce: Nonce, their_offer: &Offer,
+	) -> Result<ContactSecrets, Bolt12SemanticError> {
+		let expanded_key = &self.inbound_payment_key;
+		let secp_ctx = &self.secp_ctx;
+
+		let keys = our_offer
+			.derive_issuer_signing_keys(our_offer_nonce, expanded_key, secp_ctx)
+			.map_err(|()| Bolt12SemanticError::InvalidMetadata)?;
+
+		compute_contact_secret(secp_ctx, &keys.secret_key(), their_offer)
 	}
 
 	/// Creates an [`OfferBuilder`] such that the [`Offer`] it builds is recognized by the

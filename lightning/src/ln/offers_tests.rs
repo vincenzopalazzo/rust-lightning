@@ -52,7 +52,7 @@ use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::payment::{Bolt12OfferContext, Bolt12RefundContext, DummyTlvs, PaymentContext};
 use crate::blinded_path::message::{MessageContext, OffersContext};
 use crate::events::{ClosureReason, Event, HTLCHandlingFailureType, PaidBolt12Invoice, PaymentFailureReason, PaymentPurpose};
-use crate::ln::channelmanager::{PaymentId, RecentPaymentDetails, self};
+use crate::ln::channelmanager::{OptionalOfferPaymentParams, PaymentId, RecentPaymentDetails, self};
 use crate::ln::outbound_payment::{Bolt12PaymentError, RecipientOnionFields, Retry};
 use crate::types::features::Bolt12InvoiceFeatures;
 use crate::ln::functional_test_utils::*;
@@ -60,6 +60,7 @@ use crate::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, Init, OnionMess
 use crate::ln::outbound_payment::IDEMPOTENCY_TIMEOUT_TICKS;
 use crate::offers::invoice::Bolt12Invoice;
 use crate::offers::invoice_error::InvoiceError;
+use crate::offers::contacts::{PayerContact, PAYER_OFFER_MAX_BYTES};
 use crate::offers::invoice_request::{InvoiceRequest, InvoiceRequestFields, InvoiceRequestVerifiedFromOffer};
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::OfferBuilder;
@@ -577,6 +578,9 @@ fn creates_and_pays_for_offer_using_two_hop_blinded_path() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -736,6 +740,9 @@ fn creates_and_pays_for_offer_using_one_hop_blinded_path() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -760,6 +767,149 @@ fn creates_and_pays_for_offer_using_one_hop_blinded_path() {
 
 	claim_bolt12_payment(bob, &[alice], payment_context, &invoice);
 	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+/// Checks that the BLIP 42 contact fields a payer reveals reach the recipient through the payment
+/// flow, and that payments in the opposite direction are mutually attributed to the same contact
+/// pair via the deterministically derived contact secret.
+#[test]
+fn pays_for_offer_with_blip42_contact_fields() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let (alice_offer_builder, alice_offer_nonce) =
+		alice.node.create_compact_offer_builder(bob_id).unwrap();
+	let alice_offer = alice_offer_builder.amount_msats(10_000_000).build().unwrap();
+
+	// Bob saves Alice as a contact before paying her, deriving the shared contact secret from
+	// his own compact offer and hers.
+	let (bob_offer_builder, bob_offer_nonce) =
+		bob.node.create_compact_offer_builder(alice_id).unwrap();
+	let bob_offer = bob_offer_builder.build().unwrap();
+	assert!(bob_offer.as_ref().len() <= PAYER_OFFER_MAX_BYTES);
+	let bob_secrets =
+		bob.node.compute_contact_secret(&bob_offer, bob_offer_nonce, &alice_offer).unwrap();
+
+	// Alice independently derives the same secret from her offer and Bob's, as both will when
+	// concurrently adding each other.
+	let alice_secrets =
+		alice.node.compute_contact_secret(&alice_offer, alice_offer_nonce, &bob_offer).unwrap();
+	assert_eq!(alice_secrets, bob_secrets);
+
+	let payment_id = PaymentId([1; 32]);
+	let optional_params = OptionalOfferPaymentParams {
+		contact_secrets: Some(bob_secrets.clone()),
+		payer_offer: Some(bob_offer.clone()),
+		..Default::default()
+	};
+	bob.node.pay_for_offer(&alice_offer, None, payment_id, optional_params).unwrap();
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+
+	let (invoice_request, _) = extract_invoice_request(alice, &onion_message);
+	assert_eq!(invoice_request.contact_secret(), Some(*bob_secrets.primary_secret()));
+	assert_eq!(invoice_request.payer_offer(), Some(&bob_offer));
+
+	let invoice_request_fields = InvoiceRequestFields {
+		payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
+		quantity: None,
+		payer_note_truncated: None,
+		human_readable_name: None,
+		contact_secret: Some(*bob_secrets.primary_secret()),
+		payer_offer: Some(bob_offer.clone()),
+		payer_bip_353_name: None,
+	};
+
+	// Alice recognizes the payment as coming from her stored contact, so Bob's payer offer is
+	// withheld; had she not known him yet, it would have been surfaced to add him as a contact.
+	assert_eq!(
+		invoice_request_fields.payer_contact(core::slice::from_ref(&alice_secrets)),
+		Some(PayerContact::Known { index: 0 })
+	);
+	assert_eq!(
+		invoice_request_fields.payer_contact(&[]),
+		Some(PayerContact::New {
+			contact_secret: *bob_secrets.primary_secret(),
+			payer_offer: Some(&bob_offer),
+			payer_bip_353_name: None,
+		})
+	);
+
+	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
+		offer_id: alice_offer.id(),
+		invoice_request: invoice_request_fields,
+		payment_metadata: None,
+	});
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	route_bolt12_payment(bob, &[alice], &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	// Claiming checks that the contact fields round-trip through the blinded path data of the
+	// invoice's payment paths into Alice's PaymentClaimable event.
+	claim_bolt12_payment(bob, &[alice], payment_context, &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+
+	// Bob pays Alice back through the payer offer she received, reusing the same contact secret
+	// so that she can attribute the payment to him.
+	let payment_id = PaymentId([2; 32]);
+	let optional_params = OptionalOfferPaymentParams {
+		contact_secrets: Some(alice_secrets.clone()),
+		..Default::default()
+	};
+	alice.node.pay_for_offer(&bob_offer, Some(5_000_000), payment_id, optional_params).unwrap();
+	expect_recent_payment!(alice, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice_request, _) = extract_invoice_request(bob, &onion_message);
+	assert_eq!(invoice_request.contact_secret(), Some(*alice_secrets.primary_secret()));
+	assert_eq!(invoice_request.payer_offer(), None);
+
+	let invoice_request_fields = InvoiceRequestFields {
+		payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
+		quantity: None,
+		payer_note_truncated: None,
+		human_readable_name: None,
+		contact_secret: Some(*alice_secrets.primary_secret()),
+		payer_offer: None,
+		payer_bip_353_name: None,
+	};
+	assert_eq!(
+		invoice_request_fields.payer_contact(core::slice::from_ref(&bob_secrets)),
+		Some(PayerContact::Known { index: 0 })
+	);
+
+	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
+		offer_id: bob_offer.id(),
+		invoice_request: invoice_request_fields,
+		payment_metadata: None,
+	});
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(alice, &onion_message);
+	route_bolt12_payment(alice, &[bob], &invoice);
+	expect_recent_payment!(alice, RecentPaymentDetails::Pending, payment_id);
+
+	claim_bolt12_payment(alice, &[bob], payment_context, &invoice);
+	expect_recent_payment!(alice, RecentPaymentDetails::Fulfilled, payment_id);
 }
 
 /// Checks that a `Router` can attach `payment_metadata` to the [`PaymentContext`] of a blinded
@@ -818,6 +968,9 @@ fn router_modifies_payment_metadata_in_blinded_path() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: Some(expected_metadata),
 	});
@@ -901,6 +1054,9 @@ fn pays_for_offer_with_payment_metadata_in_invoice_request_context() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: Some(expected_metadata),
 	});
@@ -1010,6 +1166,9 @@ fn pays_for_offer_without_blinded_paths() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -1279,6 +1438,9 @@ fn creates_and_pays_for_offer_with_retry() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -1345,6 +1507,9 @@ fn pays_bolt12_invoice_asynchronously() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -1443,6 +1608,9 @@ fn creates_offer_with_blinded_path_using_unannounced_introduction_node() {
 			quantity: None,
 			payer_note_truncated: None,
 			human_readable_name: None,
+			contact_secret: None,
+			payer_offer: None,
+			payer_bip_353_name: None,
 		},
 		payment_metadata: None,
 	});
@@ -2655,6 +2823,9 @@ fn creates_and_pays_for_phantom_offer() {
 				quantity: None,
 				payer_note_truncated: None,
 				human_readable_name: None,
+				contact_secret: None,
+				payer_offer: None,
+				payer_bip_353_name: None,
 			},
 		payment_metadata: None,
 		});
