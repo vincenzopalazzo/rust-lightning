@@ -100,6 +100,7 @@ fn build_response<T: secp256k1::Signing + secp256k1::Verification>(
 				human_readable_name: None,
 				contact_secret: None,
 				payer_offer: None,
+				payer_bip_353_name: None,
 			}
 		};
 
