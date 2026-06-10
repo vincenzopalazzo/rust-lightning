@@ -72,7 +72,10 @@ use crate::ln::channelmanager::PaymentId;
 use crate::ln::inbound_payment::{ExpandedKey, IV_LEN};
 use crate::ln::msgs::DecodeError;
 use crate::offers::contacts::{
-	ContactSecret, INVREQ_CONTACT_SECRET_TYPE, INVREQ_PAYER_OFFER_TYPE, PAYER_OFFER_MAX_BYTES,
+	ContactSecret, ContactSecrets, PayerBip353Name, PayerBip353Signature, PayerContact,
+	INVREQ_CONTACT_SECRET_TYPE, INVREQ_PAYER_BIP_353_NAME_TYPE,
+	INVREQ_PAYER_BIP_353_SIGNATURE_TYPE, INVREQ_PAYER_OFFER_TYPE, PAYER_BIP_353_SIGNATURE_TAG,
+	PAYER_OFFER_MAX_BYTES,
 };
 use crate::offers::invoice::{DerivedSigningPubkey, ExplicitSigningPubkey, SigningPubkeyStrategy};
 use crate::offers::merkle::{
@@ -190,6 +193,9 @@ macro_rules! invoice_request_builder_methods { (
 			payer: PayerContents(metadata), offer, chain: None, amount_msats: None,
 			features: InvoiceRequestFeatures::empty(), quantity: None, payer_note: None,
 			offer_from_hrn: None, invreq_contact_secret: None, invreq_payer_offer: None,
+			// Always `None` when building: LDK supports receiving BIP 353 payer names but not
+			// yet revealing its own.
+			invreq_payer_bip_353_name: None, invreq_payer_bip_353_signature: None,
 			#[cfg(test)]
 			experimental_bar: None,
 		}
@@ -728,6 +734,8 @@ pub(super) struct InvoiceRequestContentsWithoutPayerSigningPubkey {
 	offer_from_hrn: Option<HumanReadableName>,
 	invreq_contact_secret: Option<ContactSecret>,
 	invreq_payer_offer: Option<Offer>,
+	invreq_payer_bip_353_name: Option<HumanReadableName>,
+	invreq_payer_bip_353_signature: Option<PayerBip353Signature>,
 	#[cfg(test)]
 	experimental_bar: Option<u64>,
 }
@@ -799,6 +807,16 @@ macro_rules! invoice_request_accessors { ($self: ident, $contents: expr) => {
 	/// back and thereby establish a mutual contact relationship.
 	pub fn payer_offer(&$self) -> Option<&crate::offers::offer::Offer> {
 		$contents.payer_offer()
+	}
+
+	/// Returns the BIP 353 name the payer revealed in the invoice request, allowing us to pay
+	/// them back and thereby establish a mutual contact relationship.
+	///
+	/// The accompanying signature has already been verified against the contained
+	/// [`PayerBip353Name::offer_signing_key`], but the name itself is unverified until the offer
+	/// it resolves to is checked with [`PayerBip353Name::matches_offer`].
+	pub fn payer_bip_353_name(&$self) -> Option<crate::offers::contacts::PayerBip353Name> {
+		$contents.payer_bip_353_name()
 	}
 } }
 
@@ -1118,6 +1136,7 @@ macro_rules! fields_accessor {
 				human_readable_name: $self.offer_from_hrn().clone(),
 				contact_secret: $self.contact_secret(),
 				payer_offer: $self.payer_offer().cloned(),
+				payer_bip_353_name: $self.payer_bip_353_name(),
 			}
 		}
 	};
@@ -1242,6 +1261,12 @@ impl InvoiceRequestContents {
 		self.inner.invreq_payer_offer.as_ref()
 	}
 
+	pub(super) fn payer_bip_353_name(&self) -> Option<PayerBip353Name> {
+		let name = self.inner.invreq_payer_bip_353_name.clone()?;
+		let signature = self.inner.invreq_payer_bip_353_signature.as_ref()?;
+		Some(PayerBip353Name { name, offer_signing_key: signature.offer_signing_key })
+	}
+
 	pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef<'_> {
 		let (payer, offer, mut invoice_request, experimental_offer, experimental_invoice_request) =
 			self.inner.as_tlv_stream();
@@ -1290,6 +1315,8 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
 			invreq_contact_secret: self.invreq_contact_secret.as_ref(),
 			invreq_payer_offer: self.invreq_payer_offer.as_ref().map(|offer| &offer.bytes),
+			invreq_payer_bip_353_name: self.invreq_payer_bip_353_name.as_ref(),
+			invreq_payer_bip_353_signature: self.invreq_payer_bip_353_signature.as_ref(),
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
 		};
@@ -1361,6 +1388,8 @@ tlv_stream!(
 	{
 		(INVREQ_CONTACT_SECRET_TYPE, invreq_contact_secret: ContactSecret),
 		(INVREQ_PAYER_OFFER_TYPE, invreq_payer_offer: (Vec<u8>, WithoutLength)),
+		(INVREQ_PAYER_BIP_353_NAME_TYPE, invreq_payer_bip_353_name: HumanReadableName),
+		(INVREQ_PAYER_BIP_353_SIGNATURE_TYPE, invreq_payer_bip_353_signature: PayerBip353Signature),
 		// When adding experimental TLVs, update EXPERIMENTAL_TLV_ALLOCATION_SIZE accordingly in
 		// UnsignedInvoiceRequest::new to avoid unnecessary allocations.
 	}
@@ -1372,6 +1401,8 @@ tlv_stream!(
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
 		(INVREQ_CONTACT_SECRET_TYPE, invreq_contact_secret: ContactSecret),
 		(INVREQ_PAYER_OFFER_TYPE, invreq_payer_offer: (Vec<u8>, WithoutLength)),
+		(INVREQ_PAYER_BIP_353_NAME_TYPE, invreq_payer_bip_353_name: HumanReadableName),
+		(INVREQ_PAYER_BIP_353_SIGNATURE_TYPE, invreq_payer_bip_353_signature: PayerBip353Signature),
 		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
 	}
 );
@@ -1483,6 +1514,20 @@ impl TryFrom<Vec<u8>> for InvoiceRequest {
 		let message = TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &bytes);
 		merkle::verify_signature(&signature, &message, contents.payer_signing_pubkey)?;
 
+		// Per BLIP 42, `invreq_payer_bip_353_signature` covers every invoice request record
+		// except the top-level signature (excluded by the merkle root computation) and the
+		// `invreq_payer_bip_353_signature` record itself.
+		if let Some(payer_bip_353_signature) = &contents.inner.invreq_payer_bip_353_signature {
+			let tlv_stream = TlvStream::new(&bytes)
+				.filter(|record| record.r#type != INVREQ_PAYER_BIP_353_SIGNATURE_TYPE);
+			let message = TaggedHash::from_tlv_stream(PAYER_BIP_353_SIGNATURE_TAG, tlv_stream);
+			merkle::verify_signature(
+				&payer_bip_353_signature.signature,
+				&message,
+				payer_bip_353_signature.offer_signing_key,
+			)?;
+		}
+
 		Ok(InvoiceRequest { bytes, contents, signature })
 	}
 }
@@ -1508,6 +1553,8 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			ExperimentalInvoiceRequestTlvStream {
 				invreq_contact_secret,
 				invreq_payer_offer,
+				invreq_payer_bip_353_name,
+				invreq_payer_bip_353_signature,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1546,6 +1593,12 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			.transpose()
 			.map_err(|_| Bolt12SemanticError::InvalidPayerOffer)?;
 
+		// Per BLIP 42, an invoice request revealing a BIP 353 name MUST be ignored if it doesn't
+		// prove ownership of an offer signing key via `invreq_payer_bip_353_signature`.
+		if invreq_payer_bip_353_name.is_some() && invreq_payer_bip_353_signature.is_none() {
+			return Err(Bolt12SemanticError::MissingSignature);
+		}
+
 		Ok(InvoiceRequestContents {
 			inner: InvoiceRequestContentsWithoutPayerSigningPubkey {
 				payer,
@@ -1558,6 +1611,8 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 				offer_from_hrn,
 				invreq_contact_secret,
 				invreq_payer_offer,
+				invreq_payer_bip_353_name,
+				invreq_payer_bip_353_signature,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1588,14 +1643,23 @@ pub struct InvoiceRequestFields {
 	/// This allows the recipient to establish a contact relationship with the payer.
 	///
 	/// Per BLIP 42, if this matches an existing contact of the recipient, the recipient MUST
-	/// ignore [`Self::payer_offer`] (and any future `bip_353_name` field) to prevent a leaked
-	/// `contact_secret` from being used to redirect future payments. Enforcement of this rule
-	/// is the responsibility of the application that owns the contacts list.
+	/// ignore [`Self::payer_offer`] and [`Self::payer_bip_353_name`] to prevent a leaked
+	/// `contact_secret` from being used to redirect future payments. [`Self::payer_contact`]
+	/// applies this rule against the contacts list owned by the application.
 	pub contact_secret: Option<ContactSecret>,
 
 	/// BLIP-42: The payer's own offer included in the invoice request, which can be used to pay
 	/// them back and thereby establish a mutual contact relationship.
 	pub payer_offer: Option<Offer>,
+
+	/// BLIP-42: The BIP 353 name the payer revealed in the invoice request, which can be used to
+	/// pay them back and thereby establish a mutual contact relationship.
+	///
+	/// The signature committing to [`PayerBip353Name::offer_signing_key`] was verified when the
+	/// invoice request was parsed, but the name remains unverified until the offer it resolves to
+	/// is checked with [`PayerBip353Name::matches_offer`]. As with [`Self::payer_offer`], this
+	/// MUST be ignored if [`Self::contact_secret`] matches an existing contact.
+	pub payer_bip_353_name: Option<PayerBip353Name>,
 }
 
 /// The maximum number of characters included in [`InvoiceRequestFields::payer_note_truncated`].
@@ -1606,11 +1670,36 @@ pub const PAYER_NOTE_LIMIT: usize = 512;
 #[cfg(fuzzing)]
 pub const PAYER_NOTE_LIMIT: usize = 8;
 
+impl InvoiceRequestFields {
+	/// Matches the BLIP 42 contact fields included by the payer against `known_contacts`,
+	/// applying the spec's rules for handling them.
+	///
+	/// Returns `None` if the payer chose not to reveal their identity. Otherwise, identifies the
+	/// known contact the payment came from, or surfaces the payer's details for adding them as a
+	/// new contact. In the former case the payer's offer and BIP 353 name are deliberately
+	/// withheld: per BLIP 42 they MUST be ignored so that a leaked contact secret cannot be used
+	/// to redirect future payments to an impersonator's offer.
+	pub fn payer_contact<'a>(
+		&'a self, known_contacts: &[ContactSecrets],
+	) -> Option<PayerContact<'a>> {
+		let contact_secret = self.contact_secret?;
+		match known_contacts.iter().position(|contact| contact.matches(&contact_secret)) {
+			Some(index) => Some(PayerContact::Known { index }),
+			None => Some(PayerContact::New {
+				contact_secret,
+				payer_offer: self.payer_offer.as_ref(),
+				payer_bip_353_name: self.payer_bip_353_name.as_ref(),
+			}),
+		}
+	}
+}
+
 impl Writeable for InvoiceRequestFields {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
-		// BLIP 42 fields use odd TLV types (7, 9) so older LDK nodes reading newer
+		// BLIP 42 fields use odd TLV types (7, 9, 11, 13) so older LDK nodes reading newer
 		// `Bolt12OfferContext.path_id` blobs silently ignore unknown fields per BOLT 1
-		// "odd, it's OK". TLVs 11 and 13 are reserved for invreq_payer_bip_353_{name,signature}.
+		// "odd, it's OK". The payer's BIP 353 signature is dropped after verification; only the
+		// offer signing key it committed to is kept (13) alongside the name (11).
 		write_tlv_fields!(writer, {
 			(0, self.payer_signing_pubkey, required),
 			(1, self.human_readable_name, option),
@@ -1618,6 +1707,8 @@ impl Writeable for InvoiceRequestFields {
 			(4, self.payer_note_truncated.as_ref().map(|s| WithoutLength(&s.0)), option),
 			(7, self.contact_secret, option),
 			(9, self.payer_offer.as_ref().map(|offer| WithoutLength(offer.as_ref())), option),
+			(11, self.payer_bip_353_name.as_ref().map(|pn| &pn.name), option),
+			(13, self.payer_bip_353_name.as_ref().map(|pn| pn.offer_signing_key), option),
 		});
 		Ok(())
 	}
@@ -1632,6 +1723,8 @@ impl Readable for InvoiceRequestFields {
 			(4, payer_note_truncated, (option, encoding: (String, WithoutLength))),
 			(7, contact_secret, option),
 			(9, payer_offer_bytes, (option, encoding: (Vec<u8>, WithoutLength))),
+			(11, payer_bip_353_name, option),
+			(13, payer_bip_353_offer_signing_key, option),
 		});
 
 		// These bytes were validated as an `Offer` when the `InvoiceRequest` containing them was
@@ -1641,6 +1734,16 @@ impl Readable for InvoiceRequestFields {
 			.transpose()
 			.map_err(|_| DecodeError::InvalidValue)?;
 
+		// Both fields were written together, so a lone one indicates the stored data was
+		// corrupted.
+		let payer_bip_353_name = match (payer_bip_353_name, payer_bip_353_offer_signing_key) {
+			(Some(name), Some(offer_signing_key)) => {
+				Some(PayerBip353Name { name, offer_signing_key })
+			},
+			(None, None) => None,
+			_ => return Err(DecodeError::InvalidValue),
+		};
+
 		Ok(InvoiceRequestFields {
 			payer_signing_pubkey: payer_signing_pubkey.0.unwrap(),
 			quantity,
@@ -1648,6 +1751,7 @@ impl Readable for InvoiceRequestFields {
 			human_readable_name,
 			contact_secret,
 			payer_offer,
+			payer_bip_353_name,
 		})
 	}
 }
@@ -1668,6 +1772,7 @@ mod tests {
 	use crate::offers::invoice_request::string_truncate_safe;
 	use crate::offers::merkle::{self, SignatureTlvStreamRef, TaggedHash, TlvStream};
 	use crate::offers::nonce::Nonce;
+	use crate::offers::offer::Offer;
 	#[cfg(not(c_bindings))]
 	use crate::offers::offer::OfferBuilder;
 	#[cfg(c_bindings)]
@@ -1685,6 +1790,7 @@ mod tests {
 	use bitcoin::network::Network;
 	use bitcoin::secp256k1::{self, Keypair, Secp256k1, SecretKey};
 	use core::num::NonZeroU64;
+	use core::str::FromStr;
 	#[cfg(feature = "std")]
 	use core::time::Duration;
 
@@ -1771,6 +1877,8 @@ mod tests {
 				ExperimentalInvoiceRequestTlvStreamRef {
 					invreq_contact_secret: None,
 					invreq_payer_offer: None,
+					invreq_payer_bip_353_name: None,
+					invreq_payer_bip_353_signature: None,
 					experimental_bar: None,
 				},
 			),
@@ -3232,6 +3340,7 @@ mod tests {
 						human_readable_name: None,
 						contact_secret: None,
 						payer_offer: None,
+						payer_bip_353_name: None,
 					}
 				);
 
@@ -3339,6 +3448,220 @@ mod tests {
 				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidPayerOffer)
 			),
 		}
+	}
+
+	/// Decodes one of the BOLT 12 bech32 strings (without checksum) used by the cross-compat
+	/// vectors below.
+	fn bech32_decode(encoded: &str) -> Vec<u8> {
+		use bech32::primitives::decode::CheckedHrpstring;
+		use bech32::NoChecksum;
+		CheckedHrpstring::new::<NoChecksum>(encoded).unwrap().byte_iter().collect()
+	}
+
+	/// An invoice request carrying `invreq_contact_secret` and `invreq_payer_offer`, taken from
+	/// lightning-kmp's `OfferTypesTestsCommon` (the BLIP 42 reference implementation).
+	const KMP_INVREQ_WITH_CONTACT_OFFER: &str = "lnr1qqs2xatpv5dg977k3wwzgdv473dfhwm2jp5qscyyj7zzm6cwy3vg6cgkyypsmuhrtwfzm85mht4a3vcp0yrlgua3u3m5uqpc6kf7nqjz6v70qw2jqgn3qkppqfufxgalt7nkrherkhnepnxn65z9yn7mknwtcf4d35gjj8q5zu26duzq2leeneh9myzzspr3wdx89vlfdtqc0w3w83j0tw8f73yvzcnzh5c5ecllf8s57unc7rud9zvy88gxd5nanxt6rjeata6dcnzarvacx9l7wu6e4sfq766scfgzvlp0fvp5v86230hwz99zuc5xywscek562j7hxjx0qzz0uae4ntplqq3qgdyhl4lcy62hzz855v8annkr46a8n9eqsn5satgpagesjqqqqqqppnqrjvugf2h366csswt7tml9ep4u7tvv4rf0wq8d4xwmjg20cfcjky6q9q7uccqs0l3etux0vcuzgpje7mye73a3k7hxysg694jj8rlmmgwzqgpwh4nf23k53cppx0ahd38nca0aujvcrkhrmv8aeax2lpkrc6ua0lqqxv3lmpuk78jqdrjlya0v8avapm7zagkvzu6aa7j787wecd20xml5zteu4erklvnlk0vtxp4y8pe4hjjh9x7syd98rehawsuwq8pfxxq0t56e5felm3s8ly68m33azdheystd29slqqgg4kgw54epcrx5gyzfxrshmgm7v";
+
+	/// The payer offer embedded in [`KMP_INVREQ_WITH_CONTACT_OFFER`].
+	const KMP_PAYER_OFFER: &str = "lno1qgsyxjtl6luzd9t3pr62xr7eemp6awnejusgf6gw45q75vcfqqqqqqqsespexwyy4tcadvgg89l9aljus6709kx235hhqrk6n8dey98uyuftzdqzs0wvvqg8lcu47r8kvwpyqevldjvlg7cm0tnzgydz6efr3laa58pqyqht6e54gm2guqsn87mkcneuwh77fxvpmt3akr7u7n90smpudwwhlsqrxglas7t0reqx3e0jwhkr7kwsalpw5txpwdw7lf0rl8vux48ndl6p9u72u3m0kflm8k9nq6jrsu6meftjn0gzxjn3um7hgw8qrs5nrq846dv6yulaccrljdracc73xmujg9k4zc0sqyy2my822usupn2yzpynpcta5dlx";
+
+	/// An invoice request carrying `invreq_contact_secret`, `invreq_payer_bip_353_name`, and
+	/// `invreq_payer_bip_353_signature`, taken from lightning-kmp's `OfferTypesTestsCommon` (the
+	/// BLIP 42 reference implementation).
+	const KMP_INVREQ_WITH_CONTACT_ADDRESS: &str = "lnr1qqs2xatpv5dg977k3wwzgdv473dfhwm2jp5qscyyj7zzm6cwy3vg6cgkyypsmuhrtwfzm85mht4a3vcp0yrlgua3u3m5uqpc6kf7nqjz6v70qw2jqy49sggrsehtg7l3jphg6z9mymtz7vrun08h7y40nr3cfqytdswkmax83nc0qs9agk3m5459qfcj566q2hjmla5vvguasm8rvgch64had2gxkqttpzvx360kyvyav4l0gvxlqd5rmjm99shhyazvt26qzn7t4g4g2cfgmlnhxkdvzg8l9dmwedtfcdlvjzgv5485hyemqxrwuj82ksamgrsh4axcwu9ya8l8wdv6c5gswurgdajku6tcppskx6twwyhxxml7wu6e43mpqgjyrc6tvlnz8j96sfh0redhhykftsmu88mtqnlkk79uz5lwjhujn7tyga42vxqfw3qhrc338p694334cktpw5fkkl26xale4uhslhh2aq4cjrfdxp279m44q3k96ly54m6lquwqm9ndfffwyc8ru53d6djq";
+
+	/// The private key behind the payer signing pubkey of [`KMP_INVREQ_WITH_CONTACT_ADDRESS`].
+	const KMP_CONTACT_ADDRESS_PAYER_KEY: &str =
+		"bc8c43b545f07b95a57577a4725065a657fa4831cb95d910970a50eb88949a7e";
+
+	/// The private key behind the offer signing key committed in the BIP 353 signature of
+	/// [`KMP_INVREQ_WITH_CONTACT_ADDRESS`].
+	const KMP_CONTACT_ADDRESS_OFFER_KEY: &str =
+		"2eb661efb156b9fd7f4b8cf3b13cd6ed809d18cf6a38b593ff8d8ec9be2a4db5";
+
+	#[test]
+	fn parses_invoice_request_with_contact_offer_cross_compat_vector() {
+		use bitcoin::hex::FromHex;
+
+		let bytes = bech32_decode(KMP_INVREQ_WITH_CONTACT_OFFER);
+		let invoice_request = InvoiceRequest::try_from(bytes.clone()).unwrap();
+
+		let expected_secret = <[u8; 32]>::from_hex(
+			"f6b50c250267c2f4b03461f4a8beee114a2e628623a18cda9a54bd7348cf0084",
+		)
+		.unwrap();
+		assert_eq!(invoice_request.contact_secret(), Some(ContactSecret::new(expected_secret)));
+
+		let payer_offer = KMP_PAYER_OFFER.parse::<Offer>().unwrap();
+		assert_eq!(invoice_request.payer_offer(), Some(&payer_offer));
+		assert_eq!(invoice_request.payer_bip_353_name(), None);
+
+		// The parsed invoice request must re-serialize to the exact bytes it was parsed from.
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+		assert_eq!(buffer, bytes);
+	}
+
+	#[test]
+	fn parses_invoice_request_with_contact_address_cross_compat_vector() {
+		use bitcoin::hex::FromHex;
+
+		let secp_ctx = Secp256k1::new();
+		let bytes = bech32_decode(KMP_INVREQ_WITH_CONTACT_ADDRESS);
+		let invoice_request = InvoiceRequest::try_from(bytes.clone()).unwrap();
+
+		let expected_secret = <[u8; 32]>::from_hex(
+			"ff2b76ecb569c37ec9090ca54f4b933b0186ee48eab43bb40e17af4d8770a4e9",
+		)
+		.unwrap();
+		assert_eq!(invoice_request.contact_secret(), Some(ContactSecret::new(expected_secret)));
+		assert_eq!(invoice_request.payer_offer(), None);
+
+		let offer_key =
+			SecretKey::from_str(KMP_CONTACT_ADDRESS_OFFER_KEY).unwrap().public_key(&secp_ctx);
+		let payer_bip_353_name = invoice_request.payer_bip_353_name().unwrap();
+		assert_eq!(payer_bip_353_name.name.user(), "phoenix");
+		assert_eq!(payer_bip_353_name.name.domain(), "acinq.co");
+		assert_eq!(payer_bip_353_name.offer_signing_key, offer_key);
+
+		// The parsed invoice request must re-serialize to the exact bytes it was parsed from.
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+		assert_eq!(buffer, bytes);
+	}
+
+	/// Replaces the BIP 353 signature of [`KMP_INVREQ_WITH_CONTACT_ADDRESS`] and signs the result
+	/// with the vector's payer key, producing an otherwise valid invoice request.
+	fn invoice_request_with_modified_bip_353_signature(
+		bip_353_signature: Option<&crate::offers::contacts::PayerBip353Signature>,
+	) -> Result<InvoiceRequest, Bolt12ParseError> {
+		let secp_ctx = Secp256k1::new();
+		let bytes = bech32_decode(KMP_INVREQ_WITH_CONTACT_ADDRESS);
+		let invoice_request = InvoiceRequest::try_from(bytes).unwrap();
+
+		let mut tlv_stream = invoice_request.as_tlv_stream();
+		tlv_stream.5.invreq_payer_bip_353_signature = bip_353_signature;
+
+		let mut unsigned_bytes = Vec::new();
+		tlv_stream.0.write(&mut unsigned_bytes).unwrap();
+		tlv_stream.1.write(&mut unsigned_bytes).unwrap();
+		tlv_stream.2.write(&mut unsigned_bytes).unwrap();
+		tlv_stream.4.write(&mut unsigned_bytes).unwrap();
+		tlv_stream.5.write(&mut unsigned_bytes).unwrap();
+
+		let payer_key = SecretKey::from_str(KMP_CONTACT_ADDRESS_PAYER_KEY).unwrap();
+		let keys = Keypair::from_secret_key(&secp_ctx, &payer_key);
+		let message = TaggedHash::from_valid_tlv_stream_bytes(SIGNATURE_TAG, &unsigned_bytes);
+		let signature = secp_ctx.sign_schnorr_no_aux_rand(message.as_digest(), &keys);
+
+		let mut buffer = Vec::new();
+		tlv_stream.0.write(&mut buffer).unwrap();
+		tlv_stream.1.write(&mut buffer).unwrap();
+		tlv_stream.2.write(&mut buffer).unwrap();
+		SignatureTlvStreamRef { signature: Some(&signature) }.write(&mut buffer).unwrap();
+		tlv_stream.4.write(&mut buffer).unwrap();
+		tlv_stream.5.write(&mut buffer).unwrap();
+
+		InvoiceRequest::try_from(buffer)
+	}
+
+	#[test]
+	fn fails_parsing_invoice_request_with_invalid_bip_353_signature() {
+		let secp_ctx = Secp256k1::new();
+		let offer_key = SecretKey::from_str(KMP_CONTACT_ADDRESS_OFFER_KEY).unwrap();
+
+		// Sign an unrelated digest with the committed key, yielding a well-formed signature that
+		// doesn't cover the invoice request.
+		let keys = Keypair::from_secret_key(&secp_ctx, &offer_key);
+		let digest = bitcoin::secp256k1::Message::from_digest([42; 32]);
+		let bogus_signature = secp_ctx.sign_schnorr_no_aux_rand(&digest, &keys);
+		let bogus = crate::offers::contacts::PayerBip353Signature {
+			offer_signing_key: offer_key.public_key(&secp_ctx),
+			signature: bogus_signature,
+		};
+
+		match invoice_request_with_modified_bip_353_signature(Some(&bogus)) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSignature(secp256k1::Error::IncorrectSignature)
+			),
+		}
+	}
+
+	#[test]
+	fn fails_parsing_invoice_request_with_missing_bip_353_signature() {
+		match invoice_request_with_modified_bip_353_signature(None) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::MissingSignature)
+			),
+		}
+	}
+
+	#[test]
+	fn invoice_request_fields_round_trip_with_bip_353_name() {
+		use crate::io;
+		use crate::offers::contacts::PayerBip353Name;
+		use crate::onion_message::dns_resolution::HumanReadableName;
+
+		let secp_ctx = Secp256k1::new();
+		let offer_key = SecretKey::from_str(KMP_CONTACT_ADDRESS_OFFER_KEY).unwrap();
+		let fields = InvoiceRequestFields {
+			payer_signing_pubkey: payer_pubkey(),
+			quantity: None,
+			payer_note_truncated: None,
+			human_readable_name: None,
+			contact_secret: Some(ContactSecret::new([3; 32])),
+			payer_offer: None,
+			payer_bip_353_name: Some(PayerBip353Name {
+				name: HumanReadableName::new("phoenix", "acinq.co").unwrap(),
+				offer_signing_key: offer_key.public_key(&secp_ctx),
+			}),
+		};
+
+		let mut buffer = Vec::new();
+		fields.write(&mut buffer).unwrap();
+
+		let deserialized = InvoiceRequestFields::read(&mut io::Cursor::new(&buffer)).unwrap();
+		assert_eq!(deserialized, fields);
+	}
+
+	#[test]
+	fn applies_known_contact_rule_to_invoice_request_fields() {
+		use crate::offers::contacts::PayerContact;
+
+		let payer_offer = KMP_PAYER_OFFER.parse::<Offer>().unwrap();
+		let contact_secret = ContactSecret::new([3; 32]);
+		let fields = InvoiceRequestFields {
+			payer_signing_pubkey: payer_pubkey(),
+			quantity: None,
+			payer_note_truncated: None,
+			human_readable_name: None,
+			contact_secret: Some(contact_secret),
+			payer_offer: Some(payer_offer.clone()),
+			payer_bip_353_name: None,
+		};
+
+		// Without a matching contact, the payer's details are surfaced for adding a new contact.
+		let other_contact = ContactSecrets::new(ContactSecret::new([1; 32]));
+		assert_eq!(
+			fields.payer_contact(core::slice::from_ref(&other_contact)),
+			Some(PayerContact::New {
+				contact_secret,
+				payer_offer: Some(&payer_offer),
+				payer_bip_353_name: None,
+			})
+		);
+
+		// With a matching contact, the payer's offer MUST be withheld per BLIP 42.
+		let known_contacts = [other_contact, ContactSecrets::new(contact_secret)];
+		assert_eq!(fields.payer_contact(&known_contacts), Some(PayerContact::Known { index: 1 }));
+
+		// Without a contact secret, the payer didn't reveal their identity.
+		let anonymous = InvoiceRequestFields { contact_secret: None, ..fields };
+		assert_eq!(anonymous.payer_contact(&known_contacts), None);
 	}
 
 	#[test]

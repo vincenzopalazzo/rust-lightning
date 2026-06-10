@@ -38,11 +38,13 @@ use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
 use crate::offers::offer::Offer;
 use crate::offers::parse::Bolt12SemanticError;
+use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::util::ser::{Readable, Writeable, Writer};
 use bitcoin::hashes::cmp::fixed_time_eq;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
+use bitcoin::secp256k1::schnorr;
 use bitcoin::secp256k1::Scalar;
-use bitcoin::secp256k1::{self, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -54,6 +56,22 @@ pub(super) const INVREQ_CONTACT_SECRET_TYPE: u64 = 2_000_001_729;
 /// TLV record type for the `invreq_payer_offer` field defined in
 /// [BLIP 42](https://github.com/lightning/blips/blob/master/blip-0042.md).
 pub(super) const INVREQ_PAYER_OFFER_TYPE: u64 = 2_000_001_731;
+
+/// TLV record type for the `invreq_payer_bip_353_name` field defined in
+/// [BLIP 42](https://github.com/lightning/blips/blob/master/blip-0042.md).
+pub(super) const INVREQ_PAYER_BIP_353_NAME_TYPE: u64 = 2_000_001_733;
+
+/// TLV record type for the `invreq_payer_bip_353_signature` field defined in
+/// [BLIP 42](https://github.com/lightning/blips/blob/master/blip-0042.md).
+pub(super) const INVREQ_PAYER_BIP_353_SIGNATURE_TYPE: u64 = 2_000_001_735;
+
+/// Tag of the [`TaggedHash`] signed by `invreq_payer_bip_353_signature`, covering all invoice
+/// request TLV records except the top-level signature and the `invreq_payer_bip_353_signature`
+/// record itself.
+///
+/// [`TaggedHash`]: crate::offers::merkle::TaggedHash
+pub(super) const PAYER_BIP_353_SIGNATURE_TAG: &'static str =
+	concat!("lightning", "invoice_request", "invreq_payer_bip_353_signature");
 
 /// The maximum encoded size of an [`Offer`] used as a payer offer.
 ///
@@ -185,6 +203,101 @@ impl ContactSecrets {
 	}
 }
 
+/// The result of matching the BLIP 42 contact fields of a received payment against the
+/// recipient's known contacts, returned by [`InvoiceRequestFields::payer_contact`].
+///
+/// [`InvoiceRequestFields::payer_contact`]: crate::offers::invoice_request::InvoiceRequestFields::payer_contact
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PayerContact<'a> {
+	/// The payment came from the contact whose [`ContactSecrets`] sits at the given index of the
+	/// list the fields were matched against.
+	///
+	/// Per BLIP 42, the payer offer and BIP 353 name possibly included in the payment have been
+	/// discarded: acting on them could let a malicious node that obtained the contact's secret
+	/// redirect future payments to its own offer.
+	Known {
+		/// Index into the list of known contacts passed to
+		/// [`InvoiceRequestFields::payer_contact`].
+		///
+		/// [`InvoiceRequestFields::payer_contact`]: crate::offers::invoice_request::InvoiceRequestFields::payer_contact
+		index: usize,
+	},
+	/// The payment came from a payer not found among the known contacts who revealed their
+	/// contact details, which may be used to add them as a new contact after user authorization.
+	New {
+		/// The contact secret included by the payer. If the user attributes this payment to an
+		/// existing contact, store the secret with that contact via
+		/// [`ContactSecrets::add_remote_secret`]; when adding a new contact instead, use
+		/// [`ContactSecrets::from_remote_secret`].
+		contact_secret: ContactSecret,
+		/// The payer's own offer, which can be used to pay them back.
+		payer_offer: Option<&'a Offer>,
+		/// The payer's BIP 353 name, which can be used to pay them back once verified via
+		/// [`PayerBip353Name::matches_offer`].
+		payer_bip_353_name: Option<&'a PayerBip353Name>,
+	},
+}
+
+/// The BIP 353 human-readable name a payer revealed in an invoice request, along with the offer
+/// signing key they committed to in the accompanying `invreq_payer_bip_353_signature`.
+///
+/// While the signature proves that the payer controls `offer_signing_key`, it does NOT prove
+/// that the name actually belongs to them. To verify ownership, resolve the name via BIP 353
+/// and check that the resulting offer is signed with the committed key using
+/// [`Self::matches_offer`]. The resolution is intentionally deferred until after the payment is
+/// received so that unpaid invoice requests cannot be used to trigger DNS queries as a DoS
+/// vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayerBip353Name {
+	/// The BIP 353 human-readable name of the payer.
+	pub name: HumanReadableName,
+	/// The key the payer used to sign the invoice request, expected to be the signing key of
+	/// the offer obtained by resolving [`Self::name`].
+	pub offer_signing_key: PublicKey,
+}
+
+impl PayerBip353Name {
+	/// Verifies that the offer obtained by resolving [`Self::name`] via BIP 353 is controlled by
+	/// the key that signed the invoice request.
+	///
+	/// If this returns `false`, either the name doesn't belong to the payer or they changed the
+	/// signing key of the offer associated with it. Since the latter should be infrequent, the
+	/// payer is more likely to be malicious and should not be stored as a contact.
+	pub fn matches_offer(&self, offer: &Offer) -> bool {
+		if offer.issuer_signing_pubkey() == Some(self.offer_signing_key) {
+			return true;
+		}
+		offer.paths().iter().any(|path| {
+			path.blinded_hops().last().map(|hop| hop.blinded_node_id)
+				== Some(self.offer_signing_key)
+		})
+	}
+}
+
+/// The contents of the `invreq_payer_bip_353_signature` field defined in
+/// [BLIP 42](https://github.com/lightning/blips/blob/master/blip-0042.md): the offer signing
+/// key the payer claims to control and a signature of the invoice request made with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PayerBip353Signature {
+	pub(super) offer_signing_key: PublicKey,
+	pub(super) signature: schnorr::Signature,
+}
+
+impl Readable for PayerBip353Signature {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let offer_signing_key = Readable::read(r)?;
+		let signature = Readable::read(r)?;
+		Ok(PayerBip353Signature { offer_signing_key, signature })
+	}
+}
+
+impl Writeable for PayerBip353Signature {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.offer_signing_key.write(w)?;
+		self.signature.write(w)
+	}
+}
+
 /// We derive our contact secret deterministically based on our offer and our contact's offer.
 ///
 /// This provides a few interesting properties:
@@ -202,16 +315,16 @@ impl ContactSecrets {
 /// * `our_offer_signing_key` - The private key behind our offer's `offer_node_id`, i.e. its
 ///   issuer signing pubkey if set, otherwise the final `blinded_node_id` of its first path.
 ///   For offers whose signing pubkey was derived (e.g. ones built by
-///   [`OffersMessageFlow::create_offer_builder`]), use
+///   [`OffersMessageFlow::create_compact_offer_builder`]), use
 ///   [`OffersMessageFlow::compute_contact_secret`] instead, which re-derives this key
-///   internally.
+///   internally from the offer's nonce.
 /// * `their_offer` - The offer from the contact
 ///
 /// # Errors
 /// Returns [`Bolt12SemanticError::MissingSigningPubkey`] if their offer has neither an
 /// issuer signing key nor a blinded path.
 ///
-/// [`OffersMessageFlow::create_offer_builder`]: crate::offers::flow::OffersMessageFlow::create_offer_builder
+/// [`OffersMessageFlow::create_compact_offer_builder`]: crate::offers::flow::OffersMessageFlow::create_compact_offer_builder
 /// [`OffersMessageFlow::compute_contact_secret`]: crate::offers::flow::OffersMessageFlow::compute_contact_secret
 pub fn compute_contact_secret<T: secp256k1::Verification>(
 	secp_ctx: &Secp256k1<T>, our_offer_signing_key: &SecretKey, their_offer: &Offer,
