@@ -1,0 +1,64 @@
+warning: /home/ubuntu/btc-triage-scan/rust-lightning/Cargo.toml: unused manifest key: workspace.lints.rust.unexpected_cfgs.check-cfg
+   Compiling lightning v0.3.0+git (/home/ubuntu/btc-triage-scan/rust-lightning/lightning)
+warning: unused import: `fee_for_weight`
+  --> lightning/src/events/bump_transaction/mod.rs:19:39
+   |
+19 |     compute_feerate_sat_per_1000_weight, fee_for_weight, BroadcasterInterface, TransactionType,
+   |                                          ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `get_v2_channel_reserve_satoshis`
+  --> lightning/src/sign/tx_builder.rs:13:2
+   |
+13 |     get_v2_channel_reserve_satoshis, CommitmentStats, ANCHOR_OUTPUT_VALUE_SATOSHI,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `in_flight_monitor_updates`
+     --> lightning/src/ln/channelmanager.rs:11258:3
+      |
+11258 |         in_flight_monitor_updates: &mut BTreeMap<ChannelId, (OutPoint, Vec<ChannelMonitorUpdate>)>,
+      |         ^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_in_flight_monitor_updates`
+      |
+      = note: `#[warn(unused_variables)]` on by default
+
+warning: `lightning` (lib test) generated 3 warnings (run `cargo fix --lib -p lightning --tests` to apply 3 suggestions)
+    Finished release [optimized] target(s) in 7m 41s
+     Running unittests src/lib.rs (target/release/deps/lightning-5b9a34ecfa4cabbe)
+
+running 1 test
+       DEBUG [lightning::chain::onchaintx:799]                   Updating claims view at height 110 with 2 claim requests
+       DEBUG [lightning::chain::package:1412]                    Adding claiming input for outpoint 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:0
+       DEBUG [lightning::chain::package:1412]                    Adding claiming input for outpoint 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:1
+       INFO  [lightning::chain::onchaintx:891]                   Broadcasting onchain with txid 55b3115fb9cdba46b942ea3b334436e3b6fd077299e91bb1a6c0f0f168b8a7f5
+       INFO  [lightning::chain::onchaintx:924]                   Registering claiming request for 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:0, which exists as of height 110
+       INFO  [lightning::chain::onchaintx:924]                   Registering claiming request for 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:1, which exists as of height 110
+       DEBUG [lightning::chain::onchaintx:949]                   Updating claims view at height 110 with 1 matched transactions in block 110
+       TRACE [lightning::chain::onchaintx:1098]                  Bumping 1 candidates
+       DEBUG [lightning::chain::package:1710]                    Initiating fee rate bump from 253 s/kWU (116 s) to 253 s/kWU (116 s) using ForceBump strategy
+       DEBUG [lightning::chain::package:1752]                    Naive fee bump of 29s does not meet min relay fee requirements of 116s
+       DEBUG [lightning::chain::package:1762]                    Fee rate bumped by 116s from 253 s/KWU (116 s) to 505 s/KWU (232 s)
+       DEBUG [lightning::chain::package:1412]                    Adding claiming input for outpoint 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:1
+       INFO  [lightning::chain::onchaintx:1109]                  Broadcasting RBF-bumped onchain with txid 58646557b182b268d0568810e3475c18158255ddb544e753d2b01e9a5af3643f
+thread 'chain::onchaintx::tests::test_blocks_disconnected_mixed_cltv_resurrection_panic' panicked at lightning/src/chain/onchaintx.rs:1183:33:
+assertion failed: request.merge_package(package, new_best_height + 1).is_ok()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+       DEBUG [lightning::chain::onchaintx:799]                   Updating claims view at height 110 with 2 claim requests
+       DEBUG [lightning::chain::package:1412]                    Adding claiming input for outpoint 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:0
+       DEBUG [lightning::chain::package:1412]                    Adding claiming input for outpoint 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:1
+       INFO  [lightning::chain::onchaintx:891]                   Broadcasting onchain with txid 55b3115fb9cdba46b942ea3b334436e3b6fd077299e91bb1a6c0f0f168b8a7f5
+       INFO  [lightning::chain::onchaintx:924]                   Registering claiming request for 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:0, which exists as of height 110
+       INFO  [lightning::chain::onchaintx:924]                   Registering claiming request for 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:1, which exists as of height 110
+       DEBUG [lightning::chain::onchaintx:949]                   Updating claims view at height 110 with 1 matched transactions in block 110
+       TRACE [lightning::chain::onchaintx:1098]                  Bumping 1 candidates
+       DEBUG [lightning::chain::package:1710]                    Initiating fee rate bump from 253 s/kWU (116 s) to 253 s/kWU (116 s) using ForceBump strategy
+       DEBUG [lightning::chain::package:1752]                    Naive fee bump of 29s does not meet min relay fee requirements of 116s
+       DEBUG [lightning::chain::package:1762]                    Fee rate bumped by 116s from 253 s/KWU (116 s) to 505 s/KWU (232 s)
+       DEBUG [lightning::chain::package:1412]                    Adding claiming input for outpoint 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a:1
+       INFO  [lightning::chain::onchaintx:1109]                  Broadcasting RBF-bumped onchain with txid 58646557b182b268d0568810e3475c18158255ddb544e753d2b01e9a5af3643f
+thread 'chain::onchaintx::tests::test_blocks_disconnected_mixed_cltv_resurrection_panic' panicked at lightning/src/chain/onchaintx.rs:1183:33:
+assertion failed: request.merge_package(package, new_best_height + 1).is_ok()
+test chain::onchaintx::tests::test_blocks_disconnected_mixed_cltv_resurrection_panic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1503 filtered out; finished in 0.00s
+

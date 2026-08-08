@@ -1,0 +1,9 @@
+{
+  "project": "rust-lightning",
+  "commit": "4347eb85277d19bd06660228a7bed4b8a5b3c514",
+  "severity": "Medium",
+  "source": "sentinel-multi-harness",
+  "confirmed": "code-review",
+  "reported_upstream": false,
+  "primary_file": "lightning-liquidity/src/lsps5/validator.rs"
+}
