@@ -91,7 +91,7 @@ impl SerialIdExt for SerialId {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AbortReason {
 	InvalidStateTransition,
 	UnexpectedCounterpartyMessage,
@@ -142,6 +142,10 @@ pub(crate) enum AbortReason {
 	///
 	/// [`ChannelManager::cancel_funding_contributed`]: crate::ln::channelmanager::ChannelManager::cancel_funding_contributed
 	ManualIntervention,
+	/// The contribution is not valid given the current balances of the channel.
+	InvalidContribution(String),
+	/// A RBF is not available at this time.
+	RbfUnavailable(String),
 	/// Internal error
 	InternalError(&'static str),
 }
@@ -209,6 +213,12 @@ impl Display for AbortReason {
 				f.write_str("The initiator's feerate exceeds our maximum")
 			},
 			AbortReason::ManualIntervention => f.write_str("Manually aborted funding negotiation"),
+			AbortReason::InvalidContribution(text) => {
+				f.write_fmt(format_args!("Invalid contribution: {}", text))
+			},
+			AbortReason::RbfUnavailable(text) => {
+				f.write_fmt(format_args!("Rejecting RBF attempt: {}", text))
+			},
 			AbortReason::InternalError(text) => {
 				f.write_fmt(format_args!("Internal error: {}", text))
 			},
@@ -1242,13 +1252,9 @@ impl NegotiationContext {
 		// with witness versions V1 and up are always considered standard. Yes, the scripts can be
 		// anyone-can-spend-able, but if our counterparty wants to add an output like that then it's none
 		// of our concern really ¯\_(ツ)_/¯
-		//
-		// TODO: The last check would be simplified when https://github.com/rust-bitcoin/rust-bitcoin/commit/1656e1a09a1959230e20af90d20789a4a8f0a31b
-		// hits the next release of rust-bitcoin.
 		if !(msg.script.is_p2wpkh()
 			|| msg.script.is_p2wsh()
-			|| (msg.script.is_witness_program()
-				&& msg.script.witness_version().map(|v| v.to_num() >= 1).unwrap_or(false)))
+			|| msg.script.witness_version().map(|v| v.to_num() >= 1).unwrap_or(false))
 		{
 			return Err(AbortReason::InvalidOutputScript);
 		}

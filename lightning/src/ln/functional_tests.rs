@@ -31,8 +31,9 @@ use crate::ln::chan_utils::{
 };
 use crate::ln::channel::{
 	get_holder_selected_channel_reserve_satoshis, Channel, DISCONNECT_PEER_AWAITING_RESPONSE_TICKS,
-	MIN_CHAN_DUST_LIMIT_SATOSHIS, UNFUNDED_CHANNEL_AGE_LIMIT_TICKS,
+	UNFUNDED_CHANNEL_AGE_LIMIT_TICKS,
 };
+use crate::ln::channel_state::OutboundHTLCSource;
 use crate::ln::channelmanager::{
 	PaymentId, RAACommitmentOrder, BREAKDOWN_TIMEOUT, DISABLE_GOSSIP_TICKS, ENABLE_GOSSIP_TICKS,
 	MIN_CLTV_EXPIRY_DELTA,
@@ -164,7 +165,7 @@ pub fn fake_network_test() {
 	let route_params = RouteParameters::from_payment_params_and_value(payment_params, 1000000);
 	let route = Route {
 		paths: vec![Path { hops, blinded_tail: None }],
-		route_params: Some(route_params.clone()),
+		route_params: route_params.clone(),
 	};
 	let path: &[_] = &[&nodes[2], &nodes[3], &nodes[1]];
 	let payment_preimage_1 = send_along_route(&nodes[1], route, path, 1000000).0;
@@ -202,8 +203,7 @@ pub fn fake_network_test() {
 		+ chan_2.1.contents.fee_proportional_millionths as u64 * hops[2].fee_msat as u64 / 1000000;
 	hops[0].fee_msat = chan_3.1.contents.fee_base_msat as u64
 		+ chan_3.1.contents.fee_proportional_millionths as u64 * hops[1].fee_msat as u64 / 1000000;
-	let route =
-		Route { paths: vec![Path { hops, blinded_tail: None }], route_params: Some(route_params) };
+	let route = Route { paths: vec![Path { hops, blinded_tail: None }], route_params };
 	let path: &[_] = &[&nodes[3], &nodes[2], &nodes[1]];
 	let payment_hash_2 = send_along_route(&nodes[1], route, path, 1000000).1;
 
@@ -1507,9 +1507,11 @@ pub fn test_htlc_on_chain_success() {
 		} => {
 			assert_eq!(total_fee_earned_msat, Some(1000));
 			assert_eq!(prev_htlcs[0].channel_id, chan_id);
+			assert_eq!(prev_htlcs[0].amount_msat, Some(3001000));
 			assert_eq!(claim_from_onchain_tx, true);
 			assert_eq!(next_htlcs[0].channel_id, chan_2.2);
-			assert_eq!(outbound_amount_forwarded_msat, Some(3000000));
+			assert_eq!(next_htlcs[0].amount_msat, Some(3000000));
+			assert_eq!(outbound_amount_forwarded_msat, 3000000);
 		},
 		_ => panic!(),
 	}
@@ -1524,9 +1526,11 @@ pub fn test_htlc_on_chain_success() {
 		} => {
 			assert_eq!(total_fee_earned_msat, Some(1000));
 			assert_eq!(prev_htlcs[0].channel_id, chan_id);
+			assert_eq!(prev_htlcs[0].amount_msat, Some(3001000));
 			assert_eq!(claim_from_onchain_tx, true);
 			assert_eq!(next_htlcs[0].channel_id, chan_2.2);
-			assert_eq!(outbound_amount_forwarded_msat, Some(3000000));
+			assert_eq!(next_htlcs[0].amount_msat, Some(3000000));
+			assert_eq!(outbound_amount_forwarded_msat, 3000000);
 		},
 		_ => panic!(),
 	}
@@ -2358,16 +2362,6 @@ pub fn test_htlc_ignore_latest_remote_commitment() {
 	let node_a_id = nodes[0].node.get_our_node_id();
 	let node_b_id = nodes[1].node.get_our_node_id();
 
-	match *nodes[1].connect_style.borrow() {
-		ConnectStyle::FullBlockViaListen
-		| ConnectStyle::FullBlockDisconnectionsSkippingViaListen => {
-			// We rely on the ability to connect a block redundantly, which isn't allowed via
-			// `chain::Listen`, so we never run the test if we randomly get assigned that
-			// connect_style.
-			return;
-		},
-		_ => {},
-	}
 	let funding_tx = create_announced_chan_between_nodes(&nodes, 0, 1).3;
 	let message = "Channel force-closed".to_owned();
 	route_payment(&nodes[0], &[&nodes[1]], 10000000);
@@ -3002,6 +2996,28 @@ pub fn test_drop_messages_peer_disconnect_b() {
 }
 
 #[xtest(feature = "_externalize_tests")]
+pub fn test_filtered_block_connected_allows_same_block_rescan() {
+	let chanmon_cfgs = create_chanmon_cfgs(1);
+	let node_cfgs = create_node_cfgs(1, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(1, &node_cfgs, &[None]);
+	let nodes = create_network(1, &node_cfgs, &node_chanmgrs);
+
+	let best_block = nodes[0].node.current_best_block();
+	let height = best_block.height + 1;
+	let header = create_dummy_header(best_block.block_hash, height);
+	nodes[0].node.filtered_block_connected(&header, &[], height);
+	nodes[0].node.filtered_block_connected(&header, &[], height);
+
+	let current_best_block = nodes[0].node.current_best_block();
+	assert_eq!(current_best_block.block_hash, header.block_hash());
+	assert_eq!(current_best_block.height, height);
+	assert_eq!(
+		current_best_block.get_hash_at_height(best_block.height),
+		Some(best_block.block_hash)
+	);
+}
+
+#[xtest(feature = "_externalize_tests")]
 pub fn test_channel_ready_without_best_block_updated() {
 	// Previously, if we were offline when a funding transaction was locked in, and then we came
 	// back online, calling best_block_updated once followed by transactions_confirmed, we'd not
@@ -3422,6 +3438,7 @@ fn do_test_holding_cell_htlc_add_timeouts(forwarded_htlc: bool) {
 	let sending_node = if forwarded_htlc { &nodes[0] } else { &nodes[1] };
 	let (route, second_payment_hash, _, second_payment_secret) =
 		get_route_and_payment_hash!(sending_node, nodes[2], 100000);
+	assert_ne!(second_payment_hash, first_payment_hash);
 	let onion = RecipientOnionFields::secret_only(second_payment_secret, 100000);
 	let id = PaymentId(second_payment_hash.0);
 	sending_node.node.send_payment_with_route(route, second_payment_hash, onion, id).unwrap();
@@ -3436,6 +3453,30 @@ fn do_test_holding_cell_htlc_add_timeouts(forwarded_htlc: bool) {
 		expect_and_process_pending_htlcs(&nodes[1], false);
 	}
 	check_added_monitors(&nodes[1], 0);
+	if forwarded_htlc {
+		let channels = nodes[1].node.list_channels();
+		let inbound_channel =
+			channels.iter().find(|details| details.counterparty.node_id == node_a_id).unwrap();
+		let outbound_channel =
+			channels.iter().find(|details| details.counterparty.node_id == node_c_id).unwrap();
+		let inbound_htlc = inbound_channel
+			.pending_inbound_htlcs
+			.iter()
+			.find(|details| details.payment_hash == second_payment_hash)
+			.unwrap();
+		let outbound_htlc = outbound_channel
+			.pending_outbound_htlcs
+			.iter()
+			.find(|details| details.payment_hash == second_payment_hash)
+			.unwrap();
+		assert_eq!(outbound_htlc.htlc_id, None);
+		let inbound_reference = match &outbound_htlc.source {
+			Some(OutboundHTLCSource::Forwarded { inbound_htlc }) => inbound_htlc,
+			_ => panic!("Unexpected outbound HTLC source"),
+		};
+		assert_eq!(inbound_reference.channel_id, inbound_channel.channel_id);
+		assert_eq!(inbound_reference.htlc_id, inbound_htlc.htlc_id);
+	}
 
 	connect_blocks(&nodes[1], TEST_FINAL_CLTV - LATENCY_GRACE_PERIOD_BLOCKS);
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
@@ -4047,7 +4088,7 @@ pub fn test_onchain_to_onchain_claim() {
 			assert_eq!(prev_htlcs[0].channel_id, chan_1.2);
 			assert_eq!(claim_from_onchain_tx, true);
 			assert_eq!(next_htlcs[0].channel_id, chan_2.2);
-			assert_eq!(outbound_amount_forwarded_msat, Some(3000000));
+			assert_eq!(outbound_amount_forwarded_msat, 3000000);
 		},
 		_ => panic!("Unexpected event"),
 	}
@@ -7214,9 +7255,52 @@ pub fn test_simple_mpp() {
 	route.paths[1].hops[0].pubkey = node_c_id;
 	route.paths[1].hops[0].short_channel_id = chan_2_id;
 	route.paths[1].hops[1].short_channel_id = chan_4_id;
-	route.route_params.as_mut().unwrap().final_value_msat = 200_000;
+	route.route_params.final_value_msat = 200_000;
 	let paths: &[&[_]] = &[&[&nodes[1], &nodes[3]], &[&nodes[2], &nodes[3]]];
-	send_along_route_with_secret(&nodes[0], route, paths, 200_000, payment_hash, payment_secret);
+	let payment_id = send_along_route_with_secret(
+		&nodes[0],
+		route,
+		paths,
+		200_000,
+		payment_hash,
+		payment_secret,
+	);
+
+	let locally_originated = nodes[0]
+		.node
+		.list_channels()
+		.into_iter()
+		.flat_map(|channel| channel.pending_outbound_htlcs)
+		.collect::<Vec<_>>();
+	assert_eq!(locally_originated.len(), 2);
+	assert!(locally_originated
+		.iter()
+		.all(|details| { details.source == Some(OutboundHTLCSource::Local { payment_id }) }));
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_d_id = nodes[3].node.get_our_node_id();
+	let mut inbound_references = Vec::new();
+	for forwarder in [&nodes[1], &nodes[2]] {
+		let channels = forwarder.node.list_channels();
+		let inbound_channel =
+			channels.iter().find(|details| details.counterparty.node_id == node_a_id).unwrap();
+		let outbound_channel =
+			channels.iter().find(|details| details.counterparty.node_id == node_d_id).unwrap();
+		assert_eq!(inbound_channel.pending_inbound_htlcs.len(), 1);
+		assert_eq!(outbound_channel.pending_outbound_htlcs.len(), 1);
+
+		let outbound_htlc = &outbound_channel.pending_outbound_htlcs[0];
+		assert_eq!(outbound_htlc.payment_hash, payment_hash);
+		let inbound_reference = match &outbound_htlc.source {
+			Some(OutboundHTLCSource::Forwarded { inbound_htlc }) => inbound_htlc,
+			_ => panic!("Unexpected outbound HTLC source"),
+		};
+		assert_eq!(inbound_reference.channel_id, inbound_channel.channel_id);
+		assert_eq!(inbound_reference.htlc_id, inbound_channel.pending_inbound_htlcs[0].htlc_id);
+		inbound_references.push(inbound_reference.clone());
+	}
+	assert_ne!(inbound_references[0], inbound_references[1]);
+
 	claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], paths, payment_preimage));
 }
 
@@ -8579,7 +8663,7 @@ pub fn test_inconsistent_mpp_params() {
 	pass_along_path(&nodes[0], path_b, real_amt, hash, Some(payment_secret), event, true, None);
 
 	do_claim_payment_along_route(ClaimAlongRouteArgs::new(&nodes[0], &[path_a, path_b], preimage));
-	expect_payment_sent(&nodes[0], preimage, Some(None), true, true);
+	expect_payment_sent(&nodes[0], preimage, Some(Some(2000)), true, true);
 }
 
 #[xtest(feature = "_externalize_tests")]
@@ -9063,6 +9147,7 @@ pub fn test_nondust_htlc_excess_fees_are_dust() {
 	const DEFAULT_FEERATE: u32 = 253;
 	const HIGH_FEERATE: u32 = 275;
 	const EXCESS_FEERATE: u32 = HIGH_FEERATE - DEFAULT_FEERATE;
+	const DUST_EXPOSURE_MULTIPLIER: u64 = 10_000;
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	{
 		// Set the feerate of the channel funder above the `dust_exposure_limiting_feerate` of
@@ -9076,7 +9161,8 @@ pub fn test_nondust_htlc_excess_fees_are_dust() {
 
 	let mut config = test_legacy_channel_config();
 	// Set the dust limit to the default value
-	config.channel_config.max_dust_htlc_exposure = MaxDustHTLCExposure::FeeRateMultiplier(10_000);
+	config.channel_config.max_dust_htlc_exposure =
+		MaxDustHTLCExposure::FeeRateMultiplier(DUST_EXPOSURE_MULTIPLIER);
 	// Make sure the HTLC limits don't get in the way
 	let chan_ty = ChannelTypeFeatures::only_static_remote_key();
 	config.channel_handshake_limits.min_max_accepted_htlcs = chan_utils::max_htlcs(&chan_ty);
@@ -9203,8 +9289,15 @@ pub fn test_nondust_htlc_excess_fees_are_dust() {
 	let id = PaymentId(payment_hash_0_1.0);
 	let res = nodes[0].node.send_payment_with_route(route_0_1, payment_hash_0_1, onion, id);
 	unwrap_send_err!(nodes[0], res, true, APIError::ChannelUnavailable { .. }, {});
+	let channel_details = &nodes[0].node.list_channels()[0];
+	// A fee-rate-multiplier limit is the limiting feerate multiplied by the configured value.
+	let max_dust_exposure_msat = DEFAULT_FEERATE as u64 * DUST_EXPOSURE_MULTIPLIER;
+	let remaining_dust_exposure_msat = max_dust_exposure_msat
+		- channel_details.current_dust_exposure_msat.expect("dust exposure should be available");
+	assert_eq!(remaining_dust_exposure_msat, 16_000);
+	assert_eq!(channel_details.next_outbound_htlc_limit_msat, remaining_dust_exposure_msat);
 	nodes[0].logger.assert_log("lightning::ln::outbound_payment",
-		format!("Failed to send along path due to error: Channel unavailable: Cannot send more than our next-HTLC maximum - {} msat", 2325000), 1);
+		format!("Failed to send along path due to error: Channel unavailable: Cannot send more than our next-HTLC maximum - {} msat", remaining_dust_exposure_msat), 1);
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
 
 	assert_eq!(nodes[0].node.list_channels().len(), 1);
@@ -9310,13 +9403,6 @@ fn do_test_nondust_htlc_fees_dust_exposure_delta(features: ChannelTypeFeatures) 
 	let node_b_id = nodes[1].node.get_our_node_id();
 
 	let chan_id = create_chan_between_nodes_with_value(&nodes[0], &nodes[1], 100_000, 50_000_000).3;
-
-	let node_1_dust_buffer_feerate = {
-		let per_peer_state = nodes[1].node.per_peer_state.read().unwrap();
-		let chan_lock = per_peer_state.get(&node_a_id).unwrap().lock().unwrap();
-		let chan = chan_lock.channel_by_id.get(&chan_id).unwrap();
-		chan.context().get_dust_buffer_feerate(None) as u64
-	};
 
 	// Skip the router complaint when node 1 will attempt to pay node 0
 	let (route_1_0, payment_hash_1_0, _, payment_secret_1_0) =
@@ -9425,15 +9511,16 @@ fn do_test_nondust_htlc_fees_dust_exposure_delta(features: ChannelTypeFeatures) 
 	let res = nodes[1].node.send_payment_with_route(route_1_0, payment_hash_1_0, onion, id);
 	unwrap_send_err!(nodes[1], res, true, APIError::ChannelUnavailable { .. }, {});
 
-	let (htlc_success_tx_fee_sat, _) =
-		second_stage_tx_fees_sat(&features, node_1_dust_buffer_feerate as u32);
-	let dust_limit = if features == ChannelTypeFeatures::only_static_remote_key() {
-		MIN_CHAN_DUST_LIMIT_SATOSHIS * 1000 + htlc_success_tx_fee_sat * 1000
-	} else {
-		MIN_CHAN_DUST_LIMIT_SATOSHIS * 1000
-	};
+	let current_dust_exposure_msat = BASE_DUST_EXPOSURE_MSAT
+		+ EXCESS_FEERATE * commitment_tx_base_weight(&features) / 1000 * 1000;
+	let max_dust_exposure_msat = expected_dust_exposure_msat - 1;
+	let remaining_dust_exposure_msat = max_dust_exposure_msat - current_dust_exposure_msat;
+	assert_eq!(
+		nodes[1].node.list_channels()[0].next_outbound_htlc_limit_msat,
+		remaining_dust_exposure_msat
+	);
 	nodes[1].logger.assert_log("lightning::ln::outbound_payment",
-		format!("Failed to send along path due to error: Channel unavailable: Cannot send more than our next-HTLC maximum - {} msat", dust_limit), 1);
+		format!("Failed to send along path due to error: Channel unavailable: Cannot send more than our next-HTLC maximum - {} msat", remaining_dust_exposure_msat), 1);
 	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
 
 	assert_eq!(nodes[0].node.list_channels().len(), 1);

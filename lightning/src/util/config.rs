@@ -313,7 +313,7 @@ impl Readable for ChannelHandshakeConfig {
 ///
 /// These limits are only applied to our counterparty's limits, not our own.
 ///
-/// Use `0` or `<type>::max_value()` as appropriate to skip checking.
+/// Use `0` or `<type>::MAX` as appropriate to skip checking.
 ///
 /// Provides sane defaults for most configurations.
 ///
@@ -333,7 +333,7 @@ pub struct ChannelHandshakeLimits {
 	/// The remote node sets a limit on the minimum size of HTLCs we can send to them. This allows
 	/// you to limit the maximum minimum-size they can require.
 	///
-	/// Default value: `u64::max_value`
+	/// Default value: `u64::MAX`
 	pub max_htlc_minimum_msat: u64,
 	/// The remote node sets a limit on the maximum value of pending HTLCs to them at any given
 	/// time to limit their funds exposure to HTLCs. This allows you to set a minimum such value.
@@ -344,7 +344,7 @@ pub struct ChannelHandshakeLimits {
 	/// time, ensuring that we are able to be punished if we broadcast an old state. This allows to
 	/// you limit the amount which we will have to keep to ourselves (and cannot use for HTLCs).
 	///
-	/// Default value: `u64::max_value`.
+	/// Default value: `u64::MAX`.
 	pub max_channel_reserve_satoshis: u64,
 	/// The remote node sets a limit on the maximum number of pending HTLCs to them at any given
 	/// time. This allows you to set a minimum such value.
@@ -1092,6 +1092,12 @@ pub struct UserConfig {
 	/// [`Event::InvoiceReceived`]: crate::events::Event::InvoiceReceived
 	/// [`ChannelManager::send_payment_for_bolt12_invoice`]: crate::ln::channelmanager::ChannelManager::send_payment_for_bolt12_invoice
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
+	#[deprecated(
+		since = "0.4.0",
+		note = "Instead, manually handle invoice messages at the OffersMessageHandler layer, \
+		        delegating validation to an OffersMessageFlow where relevant, then pay using \
+		        ChannelManager::pay_for_bolt12_invoice (being careful to avoid duplicative payments)."
+	)]
 	pub manually_handle_bolt12_invoices: bool,
 	/// If this is set to `true`, dual-funded channels will be enabled.
 	///
@@ -1136,6 +1142,7 @@ pub struct UserConfig {
 	pub reject_inbound_splices: bool,
 }
 
+#[allow(deprecated)]
 impl Default for UserConfig {
 	fn default() -> Self {
 		UserConfig {
@@ -1158,6 +1165,7 @@ impl Default for UserConfig {
 // implement Readable here in a naive way (which is a bit easier for the fuzzer to handle). We
 // don't really want to ever expose this to users (if we did we'd want to use TLVs).
 #[cfg(fuzzing)]
+#[allow(deprecated)]
 impl Readable for UserConfig {
 	fn read<R: crate::io::Read>(reader: &mut R) -> Result<Self, crate::ln::msgs::DecodeError> {
 		Ok(Self {

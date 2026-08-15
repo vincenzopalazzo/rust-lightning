@@ -11,13 +11,17 @@
 //! LDK.
 
 use lightning_0_2::commitment_signed_dance as commitment_signed_dance_0_2;
+use lightning_0_2::events::bump_transaction::sync::WalletSourceSync as WalletSourceSync_0_2;
 use lightning_0_2::events::Event as Event_0_2;
 use lightning_0_2::get_monitor as get_monitor_0_2;
 use lightning_0_2::ln::channelmanager::PaymentId as PaymentId_0_2;
 use lightning_0_2::ln::channelmanager::RecipientOnionFields as RecipientOnionFields_0_2;
 use lightning_0_2::ln::functional_test_utils as lightning_0_2_utils;
 use lightning_0_2::ln::msgs::ChannelMessageHandler as _;
+use lightning_0_2::ln::msgs::OnionMessage as OnionMessage_0_2;
+use lightning_0_2::onion_message::packet::Packet as Packet_0_2;
 use lightning_0_2::routing::router as router_0_2;
+use lightning_0_2::util::ser::MaybeReadable as MaybeReadable_0_2;
 use lightning_0_2::util::ser::Writeable as _;
 
 use lightning_0_1::commitment_signed_dance as commitment_signed_dance_0_1;
@@ -45,22 +49,32 @@ use lightning_0_0_125::ln::msgs::ChannelMessageHandler as _;
 use lightning_0_0_125::routing::router as router_0_0_125;
 use lightning_0_0_125::util::ser::Writeable as _;
 
+use lightning::blinded_path::message::NextMessageHop;
 use lightning::chain::channelmonitor::{ANTI_REORG_DELAY, HTLC_FAIL_BACK_BUFFER};
-use lightning::events::{ClosureReason, Event, HTLCHandlingFailureType};
+use lightning::events::{ClosureReason, Event, HTLCHandlingFailureType, NegotiationFailureReason};
+use lightning::ln::channel_state::SpliceCandidateStatus;
 use lightning::ln::functional_test_utils::*;
+use lightning::ln::funding::FundingContribution;
+use lightning::ln::msgs;
 use lightning::ln::msgs::BaseMessageHandler as _;
 use lightning::ln::msgs::ChannelMessageHandler as _;
 use lightning::ln::msgs::MessageSendEvent;
 use lightning::ln::splicing_tests::*;
 use lightning::ln::types::ChannelId;
+use lightning::onion_message::packet::Packet;
 use lightning::sign::OutputSpender;
+use lightning::util::errors::APIError;
+use lightning::util::ser::{MaybeReadable, Writeable};
 use lightning::util::wallet_utils::WalletSourceSync;
 
+use lightning_types::features::ChannelTypeFeatures;
 use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 
 use bitcoin::script::Builder;
-use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::{opcodes, Amount, TxOut};
+
+use lightning::io::Cursor;
 
 use std::sync::Arc;
 
@@ -699,4 +713,534 @@ fn do_upgrade_mid_htlc_forward(test: MidHtlcForwardCase) {
 	expect_and_process_pending_htlcs(&nodes[2], false);
 	expect_payment_claimable!(nodes[2], pay_hash, pay_secret, 1_000_000);
 	claim_payment(&nodes[0], &[&nodes[1], &nodes[2]], pay_preimage);
+}
+
+/// Constructs a dummy `OnionMessage` (current version) for use in serialization tests.
+fn dummy_onion_message() -> msgs::OnionMessage {
+	let pubkey =
+		PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[42; 32]).unwrap());
+	msgs::OnionMessage {
+		blinding_point: pubkey,
+		onion_routing_packet: Packet {
+			version: 0,
+			public_key: pubkey,
+			hop_data: vec![1; 64],
+			hmac: [2; 32],
+		},
+	}
+}
+
+/// Constructs a dummy `OnionMessage` (0.2 version) for use in serialization tests.
+fn dummy_onion_message_0_2() -> OnionMessage_0_2 {
+	let pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(
+		&Secp256k1::new(),
+		&SecretKey::from_slice(&[42; 32]).unwrap(),
+	);
+	OnionMessage_0_2 {
+		blinding_point: pubkey,
+		onion_routing_packet: Packet_0_2 {
+			version: 0,
+			public_key: pubkey,
+			hop_data: vec![1; 64],
+			hmac: [2; 32],
+		},
+	}
+}
+
+#[test]
+fn test_onion_message_intercepted_upgrade_from_0_2() {
+	// Ensure that an `Event::OnionMessageIntercepted` serialized by LDK 0.2 (which uses
+	// `peer_node_id: PublicKey` in TLV field 0) can be deserialized by the current version,
+	// producing `NextMessageHop::NodeId`.
+	let pubkey =
+		PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[42; 32]).unwrap());
+
+	let event_0_2 = Event_0_2::OnionMessageIntercepted {
+		peer_node_id: pubkey,
+		message: dummy_onion_message_0_2(),
+	};
+
+	let serialized = lightning_0_2::util::ser::Writeable::encode(&event_0_2);
+
+	let mut reader = Cursor::new(&serialized);
+	let deserialized = <Event as MaybeReadable>::read(&mut reader).unwrap().unwrap();
+
+	match deserialized {
+		Event::OnionMessageIntercepted { prev_hop, next_hop, message } => {
+			// LDK 0.2 did not write a `prev_hop`, so it must default to `None`.
+			assert_eq!(prev_hop, None);
+			assert_eq!(next_hop, NextMessageHop::NodeId(pubkey));
+			assert_eq!(message, dummy_onion_message());
+		},
+		_ => panic!("Expected OnionMessageIntercepted event"),
+	}
+}
+
+#[test]
+fn test_onion_message_intercepted_node_id_downgrade_to_0_2() {
+	// Ensure that an `Event::OnionMessageIntercepted` with a `NodeId` next hop serialized by
+	// the current version can be deserialized by LDK 0.2 (which expects `peer_node_id` in TLV
+	// field 0 and ignores the newer `prev_hop` in TLV field 3).
+	let pubkey =
+		PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[42; 32]).unwrap());
+	let prev_hop =
+		PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[43; 32]).unwrap());
+
+	let event = Event::OnionMessageIntercepted {
+		prev_hop: Some(prev_hop),
+		next_hop: NextMessageHop::NodeId(pubkey),
+		message: dummy_onion_message(),
+	};
+
+	let serialized = event.encode();
+
+	let mut reader = Cursor::new(&serialized);
+	let deserialized = <Event_0_2 as MaybeReadable_0_2>::read(&mut reader).unwrap().unwrap();
+
+	match deserialized {
+		Event_0_2::OnionMessageIntercepted { peer_node_id, message } => {
+			assert_eq!(peer_node_id, pubkey);
+			assert_eq!(message, dummy_onion_message_0_2());
+		},
+		_ => panic!("Expected OnionMessageIntercepted event"),
+	}
+}
+
+#[test]
+fn test_onion_message_intercepted_scid_downgrade_to_0_2() {
+	// Ensure that an `Event::OnionMessageIntercepted` with a `ShortChannelId` next hop
+	// serialized by the current version cannot be deserialized by LDK 0.2, since the
+	// `peer_node_id` field (0) is not written for SCID variants and LDK 0.2 requires it.
+	let event = Event::OnionMessageIntercepted {
+		prev_hop: None,
+		next_hop: NextMessageHop::ShortChannelId(42),
+		message: dummy_onion_message(),
+	};
+
+	let serialized = event.encode();
+
+	// LDK 0.2 will try to read field 0 as required. Since it's absent, the read will fail.
+	let mut reader = Cursor::new(&serialized);
+	let result = <Event_0_2 as MaybeReadable_0_2>::read(&mut reader);
+	assert!(result.is_err(), "LDK 0.2 should fail to decode a ShortChannelId variant");
+}
+
+fn downgrade_setup_single_splice(
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, ChannelId, TxOut, FundingContribution) {
+	// Build a current node with a single pending (negotiated, not yet locked) splice that node 0
+	// funded (so node 0 is contributory, node 1 is a non-contributory acceptor). Return both
+	// nodes' serialized ChannelManager + ChannelMonitor and the channel id.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let (_, _, channel_id, _) =
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+
+	let added_value = Amount::from_sat(50_000);
+	provide_utxo_reserves(&nodes, 2, added_value * 2);
+	let overlapping_output = TxOut {
+		value: Amount::from_sat(1_000),
+		script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
+	};
+	let contribution = do_initiate_splice_in_and_out(
+		&nodes[0],
+		&nodes[1],
+		channel_id,
+		added_value,
+		vec![overlapping_output.clone()],
+	);
+	let committed_contribution = contribution.clone();
+	let (splice_tx, _) = splice_channel(&nodes[0], &nodes[1], channel_id, contribution);
+	mine_transaction(&nodes[0], &splice_tx);
+	mine_transaction(&nodes[1], &splice_tx);
+
+	let node_0_ser = nodes[0].node.encode();
+	let node_1_ser = nodes[1].node.encode();
+	let mon_0_ser = get_monitor!(nodes[0], channel_id).encode();
+	let mon_1_ser = get_monitor!(nodes[1], channel_id).encode();
+	(
+		node_0_ser,
+		node_1_ser,
+		mon_0_ser,
+		mon_1_ser,
+		channel_id,
+		overlapping_output,
+		committed_contribution,
+	)
+}
+
+#[test]
+fn downgrade_single_splice_loads_on_0_2() {
+	// A current node with a single pending splice serializes in a form LDK 0.2 can still read,
+	// whether or not we funded it: only odd TLVs are written (the even RBF gate is omitted for a
+	// single round), so 0.2 skips the contribution it can't track and loads the channel. RBF is
+	// the only state that blocks downgrade (see downgrade_rbf_refused_by_0_2).
+	let (node_0_ser, node_1_ser, mon_0_ser, mon_1_ser, _, _, _) = downgrade_setup_single_splice();
+
+	let mut chanmon_cfgs = lightning_0_2_utils::create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_all_state_policy_checks = true;
+	chanmon_cfgs[1].keys_manager.disable_all_state_policy_checks = true;
+	let node_cfgs = lightning_0_2_utils::create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = lightning_0_2_utils::create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = lightning_0_2_utils::create_network(2, &node_cfgs, &node_chanmgrs);
+	let mut config = lightning_0_2_utils::test_default_channel_config();
+	// The current side uses the anchors channel type by default; 0.2 only accepts a channel whose
+	// type it advertises support for, so enable anchors here too (otherwise the read is refused on
+	// the channel type, before the splice serialization is ever exercised).
+	config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+
+	// Node 0 (contributory initiator): the contribution lives in an odd TLV that 0.2 skips.
+	let mgr_0 = lightning_0_2_utils::_reload_node(
+		&nodes[0],
+		config.clone(),
+		&node_0_ser,
+		&[&mon_0_ser[..]],
+	);
+	assert_eq!(mgr_0.list_channels().len(), 1);
+	// Node 1 (non-contributory acceptor): nothing 0.2 can't represent.
+	let mgr_1 =
+		lightning_0_2_utils::_reload_node(&nodes[1], config, &node_1_ser, &[&mon_1_ser[..]]);
+	assert_eq!(mgr_1.list_channels().len(), 1);
+}
+
+#[test]
+fn downgrade_rbf_refused_by_0_2() {
+	// RBF (more than one negotiation round) is the one splice state LDK 0.2 cannot operate. Current
+	// writes the even RBF-gate TLV for it, which 0.2 rejects as an unknown even (required) field,
+	// so reading the ChannelManager fails rather than silently mishandling the extra candidate.
+	let (node_0_ser, mon_0_ser);
+	{
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		let node_id_1 = nodes[1].node.get_our_node_id();
+		let (_, _, channel_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+
+		let added_value = Amount::from_sat(50_000);
+		provide_utxo_reserves(&nodes, 2, added_value * 2);
+		let contribution = do_initiate_splice_in(&nodes[0], &nodes[1], channel_id, added_value);
+		let (first_splice_tx, new_funding_script) =
+			splice_channel(&nodes[0], &nodes[1], channel_id, contribution);
+
+		// RBF the splice, producing a second negotiated candidate.
+		provide_utxo_reserves(&nodes, 2, added_value * 2);
+		let rbf_feerate = bitcoin::FeeRate::from_sat_per_kwu(1000);
+		let rbf_contribution =
+			do_initiate_rbf_splice_in(&nodes[0], &nodes[1], channel_id, rbf_feerate);
+		complete_rbf_handshake(&nodes[0], &nodes[1]);
+		complete_interactive_funding_negotiation(
+			&nodes[0],
+			&nodes[1],
+			channel_id,
+			rbf_contribution,
+			new_funding_script,
+		);
+		let _ = sign_interactive_funding_tx(
+			SignInteractiveFundingTxArgs::new(&nodes[0], &nodes[1])
+				.replacing(first_splice_tx.compute_txid()),
+		);
+		expect_splice_pending_event(&nodes[0], &node_id_1);
+		// The acceptor did not contribute, so it gets no `SpliceNegotiated` event.
+		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+
+		node_0_ser = nodes[0].node.encode();
+		mon_0_ser = get_monitor!(nodes[0], channel_id).encode();
+	}
+
+	let mut chanmon_cfgs = lightning_0_2_utils::create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_all_state_policy_checks = true;
+	chanmon_cfgs[1].keys_manager.disable_all_state_policy_checks = true;
+	let node_cfgs = lightning_0_2_utils::create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = lightning_0_2_utils::create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = lightning_0_2_utils::create_network(2, &node_cfgs, &node_chanmgrs);
+	let mut config = lightning_0_2_utils::test_default_channel_config();
+	// Match the anchors channel type used on the current side, so the manager read reaches (and
+	// fails on) the even RBF-gate TLV rather than refusing the channel type itself.
+	config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	// _reload_node unwraps the manager read, which fails on the even RBF-gate TLV. Catch the panic
+	// here so it stays contained to the read we expect to fail.
+	let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		lightning_0_2_utils::_reload_node(&nodes[0], config, &node_0_ser, &[&mon_0_ser[..]]);
+	}))
+	.expect_err("0.2 should refuse to read the RBF splice");
+	let panic_msg = panic
+		.downcast_ref::<String>()
+		.map(String::as_str)
+		.or_else(|| panic.downcast_ref::<&str>().copied())
+		.unwrap_or("");
+	assert!(
+		panic_msg.contains("UnknownRequiredFeature"),
+		"expected an UnknownRequiredFeature decode failure, got: {panic_msg}",
+	);
+}
+
+#[test]
+fn upgrade_single_splice_from_0_2() {
+	// A pending single splice written by LDK 0.2 -- which never tracked our contribution -- is read
+	// by current: the candidate comes back via the TLV-3 fallback with `contribution: None`.
+	let (node_0_ser, node_1_ser, mon_0_ser, mon_1_ser, chan_id_bytes);
+	{
+		let chanmon_cfgs = lightning_0_2_utils::create_chanmon_cfgs(2);
+		let node_cfgs = lightning_0_2_utils::create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = lightning_0_2_utils::create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = lightning_0_2_utils::create_network(2, &node_cfgs, &node_chanmgrs);
+		let channel_id = lightning_0_2_utils::create_announced_chan_between_nodes_with_value(
+			&nodes, 0, 1, 100_000, 0,
+		)
+		.2;
+		chan_id_bytes = channel_id.0;
+
+		let contribution = lightning_0_2::ln::funding::SpliceContribution::SpliceOut {
+			outputs: vec![bitcoin::TxOut {
+				value: bitcoin::Amount::from_sat(1_000),
+				script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
+			}],
+		};
+		// 0.2 drives the splice through tx_signatures, leaving one negotiated (unlocked) candidate.
+		let _ = lightning_0_2::ln::splicing_tests::splice_channel(
+			&nodes[0],
+			&nodes[1],
+			channel_id,
+			contribution,
+		);
+
+		node_0_ser = nodes[0].node.encode();
+		node_1_ser = nodes[1].node.encode();
+		mon_0_ser = get_monitor_0_2!(nodes[0], channel_id).encode();
+		mon_1_ser = get_monitor_0_2!(nodes[1], channel_id).encode();
+	}
+
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_all_state_policy_checks = true;
+	chanmon_cfgs[1].keys_manager.disable_all_state_policy_checks = true;
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (persister_a, persister_b, chain_mon_a, chain_mon_b);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let (node_a, node_b);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let config = test_default_channel_config();
+	reload_node!(
+		nodes[0],
+		config.clone(),
+		&node_0_ser,
+		&[&mon_0_ser[..]],
+		persister_a,
+		chain_mon_a,
+		node_a
+	);
+	reload_node!(
+		nodes[1],
+		config,
+		&node_1_ser,
+		&[&mon_1_ser[..]],
+		persister_b,
+		chain_mon_b,
+		node_b
+	);
+
+	// Current reads the 0.2 splice: one negotiated candidate, no contribution recorded.
+	let channel_id = ChannelId(chan_id_bytes);
+	for node in nodes.iter() {
+		let channels = node.node.list_channels();
+		let details = channels.iter().find(|c| c.channel_id == channel_id).unwrap();
+		let splice = details.splice_details.as_ref().expect("pending splice");
+		assert_eq!(splice.candidates.len(), 1);
+		assert_eq!(splice.candidates[0].contribution, None);
+	}
+
+	// The inherited splice cannot be RBF'd -- 0.2 persisted neither its feerate nor our contribution
+	// to reconstruct the prior request -- so splice_channel returns a fresh template with no RBF
+	// feerate floor. Contributing from this template is tested below.
+	let node_id_1 = nodes[1].node.get_our_node_id();
+	let funding_template = nodes[0].node.splice_channel(&channel_id, &node_id_1).unwrap();
+	assert!(funding_template.min_rbf_feerate().is_none());
+}
+
+#[test]
+fn splice_inherited_across_0_2_checks_funding_transaction_for_overlap() {
+	// Negotiate a contributory splice on current, downgrade to LDK 0.2, then upgrade back. LDK 0.2
+	// persists neither our contribution nor the splice feerate. The splice therefore returns to
+	// current without separate contribution metadata, but its funding transaction still lets us
+	// distinguish a contribution which reuses pending funding from one which is safe to queue for a
+	// fresh splice.
+	// Same single-splice setup as the downgrade tests; we only need node 0 here.
+	let (v3_mgr, _, v3_mon, _, channel_id, overlapping_output, committed_contribution) =
+		downgrade_setup_single_splice();
+	let chan_id_bytes = channel_id.0;
+
+	// Downgrade node 0 to LDK 0.2 and re-serialize there, stripping the contribution and feerate.
+	let (v2_mgr, v2_mon);
+	{
+		let mut chanmon_cfgs = lightning_0_2_utils::create_chanmon_cfgs(2);
+		chanmon_cfgs[0].keys_manager.disable_all_state_policy_checks = true;
+		chanmon_cfgs[1].keys_manager.disable_all_state_policy_checks = true;
+		let node_cfgs = lightning_0_2_utils::create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = lightning_0_2_utils::create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = lightning_0_2_utils::create_network(2, &node_cfgs, &node_chanmgrs);
+		let mut config = lightning_0_2_utils::test_default_channel_config();
+		config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+		let mgr = lightning_0_2_utils::_reload_node(&nodes[0], config, &v3_mgr, &[&v3_mon[..]]);
+		assert_eq!(mgr.list_channels().len(), 1);
+		let v2_channel_id = lightning_0_2::ln::types::ChannelId(chan_id_bytes);
+		v2_mgr = mgr.encode();
+		v2_mon = get_monitor_0_2!(nodes[0], v2_channel_id).encode();
+	}
+
+	// Upgrade back to current and splice the channel carrying the inherited splice.
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+	chanmon_cfgs[0].keys_manager.disable_all_state_policy_checks = true;
+	chanmon_cfgs[1].keys_manager.disable_all_state_policy_checks = true;
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (persister, chain_mon, new_node);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let config = test_default_channel_config();
+	reload_node!(nodes[0], config, &v2_mgr, &[&v2_mon[..]], persister, chain_mon, new_node);
+
+	let channel_id = ChannelId(chan_id_bytes);
+	let node_id_1 = nodes[1].node.get_our_node_id();
+
+	// splice_channel returns a fresh template with no RBF feerate floor rather than refusing. Reuse
+	// an output from before the downgrade and add a unique output, verifying that the funding
+	// transaction catches the overlap and that only the unique output is discarded.
+	let funding_template = nodes[0].node.splice_channel(&channel_id, &node_id_1).unwrap();
+	assert!(funding_template.min_rbf_feerate().is_none());
+	let script_pubkey = nodes[1].wallet_source.get_change_script().unwrap();
+	let output = TxOut { value: Amount::from_sat(1_000), script_pubkey: script_pubkey.clone() };
+	let overlapping_contribution = build_splice_out_contribution(
+		&nodes[0],
+		&nodes[1],
+		channel_id,
+		vec![overlapping_output, output.clone()],
+	)
+	.unwrap();
+	assert_eq!(
+		nodes[0].node.funding_contributed(
+			&channel_id,
+			&node_id_1,
+			overlapping_contribution.clone(),
+			None,
+		),
+		Err(APIError::APIMisuseError {
+			err: format!("Channel {} cannot accept funding contribution", channel_id),
+		})
+	);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+
+	let (inputs, outputs) = expect_failed_rbf_events(
+		&nodes[0],
+		&channel_id,
+		&overlapping_contribution,
+		NegotiationFailureReason::CannotInitiateRbf,
+	);
+	assert!(inputs.is_empty());
+	assert_eq!(outputs, vec![script_pubkey]);
+
+	// A distinct contribution has no overlap with the inherited funding transaction, so it is safe
+	// to retain until that transaction locks and then negotiate as a fresh splice.
+	let unique_contribution =
+		build_splice_out_contribution(&nodes[0], &nodes[1], channel_id, vec![output]).unwrap();
+	nodes[0]
+		.node
+		.funding_contributed(&channel_id, &node_id_1, unique_contribution.clone(), None)
+		.unwrap();
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+
+	let channels = nodes[0].node.list_channels();
+	let splice = channels[0].splice_details.as_ref().unwrap();
+	assert_eq!(splice.candidates.len(), 2);
+	assert_eq!(splice.candidates[1].contribution, Some(unique_contribution));
+	assert_eq!(splice.candidates[1].status, SpliceCandidateStatus::WaitingOnLock);
+
+	// The original contribution remains committed to the inherited funding transaction. Even
+	// though its separately-persisted contribution metadata was stripped by LDK 0.2, submitting
+	// it again while the distinct contribution waits must not release any of its inputs or outputs.
+	assert_eq!(
+		nodes[0].node.funding_contributed(&channel_id, &node_id_1, committed_contribution, None,),
+		Err(APIError::APIMisuseError {
+			err: format!("Duplicate funding contribution for channel {}", channel_id),
+		})
+	);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+}
+
+#[test]
+fn upgrade_zero_fee_commitments_from_0_2() {
+	// LDK 0.2 negotiated `option_zero_fee_commitments` using a staging feature bit, which was
+	// later replaced by the bit the feature was ultimately assigned. Because the channel type is
+	// persisted rather than re-negotiated, test that a channel written by 0.2 is read back with
+	// the staging bit swapped for the final one, and remains usable.
+	let (node_a_ser, node_b_ser, mon_a_ser, mon_b_ser, chan_id_bytes, preimage);
+	{
+		let chanmon_cfgs = lightning_0_2_utils::create_chanmon_cfgs(2);
+		let node_cfgs = lightning_0_2_utils::create_node_cfgs(2, &chanmon_cfgs);
+
+		let mut cfg = lightning_0_2_utils::test_default_anchors_channel_config();
+		cfg.channel_handshake_config.negotiate_anchor_zero_fee_commitments = true;
+		let cfgs = &[Some(cfg.clone()), Some(cfg)];
+		let node_chanmgrs = lightning_0_2_utils::create_node_chanmgrs(2, &node_cfgs, cfgs);
+		let nodes = lightning_0_2_utils::create_network(2, &node_cfgs, &node_chanmgrs);
+
+		let chan_id = lightning_0_2_utils::create_announced_chan_between_nodes_with_value(
+			&nodes, 0, 1, 10_000_000, 0,
+		)
+		.2;
+		chan_id_bytes = chan_id.0;
+
+		// 0.2 negotiated the channel type with the staging bit, i.e. required bit 140.
+		let mut staging_flags = vec![0u8; 18];
+		staging_flags[17] = 1 << (140 - 8 * 17);
+		for node in nodes.iter() {
+			let channels = node.node.list_channels();
+			let channel_type = channels[0].channel_type.as_ref().unwrap();
+			assert_eq!(channel_type.le_flags(), &staging_flags[..]);
+		}
+
+		let payment_preimage =
+			lightning_0_2_utils::route_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+		preimage = PaymentPreimage(payment_preimage.0 .0);
+
+		node_a_ser = nodes[0].node.encode();
+		node_b_ser = nodes[1].node.encode();
+		mon_a_ser = get_monitor_0_2!(nodes[0], chan_id).encode();
+		mon_b_ser = get_monitor_0_2!(nodes[1], chan_id).encode();
+	}
+
+	let mut chanmon_cfgs = create_chanmon_cfgs(2);
+
+	// Our TestChannelSigner will fail as we're jumping ahead, so disable its state-based checks
+	chanmon_cfgs[0].keys_manager.disable_all_state_policy_checks = true;
+	chanmon_cfgs[1].keys_manager.disable_all_state_policy_checks = true;
+
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (persister_a, persister_b, chain_mon_a, chain_mon_b);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let (node_a, node_b);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let mut config = test_default_channel_config();
+	config.channel_handshake_config.negotiate_anchor_zero_fee_commitments = true;
+	let a_mons = &[&mon_a_ser[..]];
+	reload_node!(nodes[0], config.clone(), &node_a_ser, a_mons, persister_a, chain_mon_a, node_a);
+	reload_node!(nodes[1], config, &node_b_ser, &[&mon_b_ser], persister_b, chain_mon_b, node_b);
+
+	// Both the `ChannelManager` and the `ChannelMonitor` should now use the final feature bit.
+	let chan_id = ChannelId(chan_id_bytes);
+	let final_type = ChannelTypeFeatures::anchors_zero_fee_commitments();
+	for node in nodes.iter() {
+		let channels = node.node.list_channels();
+		let details = channels.iter().find(|c| c.channel_id == chan_id).unwrap();
+		assert_eq!(details.channel_type.as_ref(), Some(&final_type));
+		assert_eq!(get_monitor!(node, chan_id).channel_type_features(), final_type);
+	}
+
+	reconnect_nodes(ReconnectArgs::new(&nodes[0], &nodes[1]));
+
+	// The channel is still usable across the swap.
+	claim_payment(&nodes[0], &[&nodes[1]], preimage);
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
 }

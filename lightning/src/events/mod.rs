@@ -18,7 +18,7 @@ pub mod bump_transaction;
 
 pub use bump_transaction::BumpTransactionEvent;
 
-use crate::blinded_path::message::{BlindedMessagePath, OffersContext};
+use crate::blinded_path::message::{BlindedMessagePath, NextMessageHop, OffersContext};
 use crate::blinded_path::payment::{
 	Bolt12OfferContext, Bolt12RefundContext, PaymentContext, PaymentContextRef,
 };
@@ -32,6 +32,7 @@ use crate::ln::outbound_payment::RecipientOnionFields;
 use crate::ln::types::ChannelId;
 use crate::offers::invoice::Bolt12Invoice;
 use crate::offers::invoice_request::InvoiceRequest;
+pub use crate::offers::payer_proof::PaidBolt12Invoice;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::onion_message::messenger::Responder;
 use crate::routing::gossip::NetworkUpdate;
@@ -865,6 +866,9 @@ pub struct HTLCLocator {
 	/// The channel that the HTLC was sent or received on.
 	pub channel_id: ChannelId,
 
+	/// The amount, in milli-satoshis, of the HTLC that was sent or received, if known.
+	pub amount_msat: Option<u64>,
+
 	/// The `user_channel_id` for `channel_id`.
 	///
 	/// This will be `None` if the payment was settled via an on-chain transaction. It will also
@@ -882,6 +886,7 @@ impl_ser_tlv_based!(HTLCLocator, {
 	(1, channel_id, required),
 	(3, user_channel_id, option),
 	(5, node_id, option),
+	(7, amount_msat, option),
 });
 
 /// An Event which you should probably take some action in response to.
@@ -1133,8 +1138,8 @@ pub enum Event {
 	/// Indicates a [`Bolt12Invoice`] in response to an [`InvoiceRequest`] or a [`Refund`] was
 	/// received.
 	///
-	/// This event will only be generated if [`UserConfig::manually_handle_bolt12_invoices`] is set.
-	/// Use [`ChannelManager::send_payment_for_bolt12_invoice`] to pay the invoice or
+	/// This event will only be generated if [`UserConfig::manually_handle_bolt12_invoices`] is set
+	/// (deprecated). Use [`ChannelManager::send_payment_for_bolt12_invoice`] to pay the invoice or
 	/// [`ChannelManager::abandon_payment`] to abandon the associated payment. See those docs for
 	/// further details.
 	///
@@ -1201,21 +1206,18 @@ pub enum Event {
 		/// If the recipient or an intermediate node misbehaves and gives us free money, this may
 		/// overstate the amount paid, though this is unlikely.
 		///
-		/// This is only `None` for payments initiated on LDK versions prior to 0.0.103.
+		/// This is only `None` for payments abandoned but ultimately claimed when using LDK versions
+		/// prior to 0.3, 0.2.3, or 0.1.10.
 		///
 		/// [`Route::get_total_fees`]: crate::routing::router::Route::get_total_fees
 		fee_paid_msat: Option<u64>,
-		/// The BOLT 12 invoice that was paid. `None` if the payment was a non BOLT 12 payment.
+		/// The paid BOLT 12 invoice bundled with the data needed to construct a
+		/// [`PayerProof`], which selectively discloses invoice fields to prove payment to a
+		/// third party.
 		///
-		/// The BOLT 12 invoice is useful for proof of payment because it contains the
-		/// payment hash. A third party can verify that the payment was made by
-		/// showing the invoice and confirming that the payment hash matches
-		/// the hash of the payment preimage.
+		/// `None` for non-BOLT 12 payments.
 		///
-		/// However, the [`PaidBolt12Invoice`] can also be of type [`StaticInvoice`], which
-		/// is a special [`Bolt12Invoice`] where proof of payment is not possible.
-		///
-		/// [`StaticInvoice`]: crate::offers::static_invoice::StaticInvoice
+		/// [`PayerProof`]: crate::offers::payer_proof::PayerProof
 		bolt12_invoice: Option<PaidBolt12Invoice>,
 	},
 	/// Indicates an outbound payment failed. Individual [`Event::PaymentPathFailed`] events
@@ -1527,7 +1529,7 @@ pub enum Event {
 		/// The final amount forwarded, in milli-satoshis, after the fee is deducted.
 		///
 		/// The caveat described above the `total_fee_earned_msat` field applies here as well.
-		outbound_amount_forwarded_msat: Option<u64>,
+		outbound_amount_forwarded_msat: u64,
 	},
 	/// Used to indicate that a channel with the given `channel_id` is being opened and pending
 	/// confirmation on-chain.
@@ -1646,8 +1648,12 @@ pub enum Event {
 		/// [`ChainMonitor::get_claimable_balances`]: crate::chain::chainmonitor::ChainMonitor::get_claimable_balances
 		last_local_balance_msat: Option<u64>,
 	},
-	/// Used to indicate that a splice for the given `channel_id` has been negotiated and its
-	/// funding transaction has been broadcast.
+	/// Used to indicate that a splice for the given `channel_id` has been negotiated, its
+	/// funding transaction has been broadcast, and local inputs or outputs were contributed to
+	/// it.
+	///
+	/// This event is not emitted if the counterparty negotiated a splice without using a local
+	/// contribution.
 	///
 	/// The splice is then considered pending until both parties have seen enough confirmations to
 	/// consider the funding locked. Once this occurs, an [`Event::ChannelReady`] will be emitted.
@@ -1678,9 +1684,9 @@ pub enum Event {
 	},
 	/// Used to indicate that a splice negotiation round for the given `channel_id` has failed.
 	///
-	/// Each splice attempt (initial or RBF) resolves to either [`Event::SpliceNegotiated`] on
-	/// success or this event on failure. Prior successfully negotiated splice transactions are
-	/// unaffected.
+	/// Each splice attempt (initial or RBF) resolves to this event on failure. On success,
+	/// [`Event::SpliceNegotiated`] is emitted if the negotiated transaction includes local
+	/// inputs or outputs. Prior successfully negotiated splice transactions are unaffected.
 	///
 	/// Any UTXOs contributed to the failed round that are not committed to a prior negotiated
 	/// splice transaction will be returned via a preceding [`Event::DiscardFunding`].
@@ -1835,9 +1841,13 @@ pub enum Event {
 	/// [`ChannelHandshakeConfig::negotiate_anchor_zero_fee_commitments`]: crate::util::config::ChannelHandshakeConfig::negotiate_anchor_zero_fee_commitments
 	BumpTransaction(BumpTransactionEvent),
 	/// We received an onion message that is intended to be forwarded to a peer
-	/// that is currently offline. This event will only be generated if the
-	/// `OnionMessenger` was initialized with
-	/// [`OnionMessenger::new_with_offline_peer_interception`], see its docs.
+	/// that is currently offline *or* that is intended to be forwarded along a channel with an
+	/// SCID unknown to us.
+	///
+	/// This event will only be generated if the `OnionMessenger` was initialized with
+	/// [`OnionMessenger::new_with_offline_peer_interception`], see its docs. The
+	/// [`NextMessageHop::ShortChannelId`] variant is only generated if `intercept_for_unknown_scids`
+	/// was set when constructing the `OnionMessenger`.
 	///
 	/// The offline peer should be awoken if possible on receipt of this event, such as via the LSPS5
 	/// protocol.
@@ -1851,9 +1861,21 @@ pub enum Event {
 	///
 	/// [`OnionMessenger::new_with_offline_peer_interception`]: crate::onion_message::messenger::OnionMessenger::new_with_offline_peer_interception
 	OnionMessageIntercepted {
-		/// The node id of the offline peer.
-		peer_node_id: PublicKey,
-		/// The onion message intended to be forwarded to `peer_node_id`.
+		/// The node id of the peer that sent the message, if known.
+		///
+		/// This is `None` when the message is sent with
+		/// [`MessageSendInstructions::ForwardedMessage`] (e.g., when calling
+		/// [`OffersMessageFlow::enqueue_invoice_request_to_forward`]) rather than forwarded
+		/// internally by the `OnionMessenger`, as well as for events serialized prior to LDK 0.3.
+		/// Otherwise it is the node we received the message from.
+		///
+		/// [`MessageSendInstructions::ForwardedMessage`]: crate::onion_message::messenger::MessageSendInstructions::ForwardedMessage
+		/// [`OffersMessageFlow::enqueue_invoice_request_to_forward`]: crate::offers::flow::OffersMessageFlow::enqueue_invoice_request_to_forward
+		prev_hop: Option<PublicKey>,
+		/// The next hop (offline peer or unknown SCID).
+		next_hop: NextMessageHop,
+		/// The onion message intended to be forwarded to the offline peer or via the unknown
+		/// channel once established.
 		message: msgs::OnionMessage,
 	},
 	/// Indicates that an onion message supporting peer has come online and any messages previously
@@ -2197,6 +2219,7 @@ impl Writeable for Event {
 				);
 				let empty_locator = HTLCLocator {
 					channel_id: ChannelId::new_zero(),
+					amount_msat: None,
 					user_channel_id: None,
 					node_id: None,
 				};
@@ -2207,7 +2230,7 @@ impl Writeable for Event {
 					(1, Some(legacy_prev.channel_id), option),
 					(2, claim_from_onchain_tx, required),
 					(3, Some(legacy_next.channel_id), option),
-					(5, outbound_amount_forwarded_msat, option),
+					(5, outbound_amount_forwarded_msat, required),
 					(7, skimmed_fee_msat, option),
 					(9, legacy_prev.user_channel_id, option),
 					(11, legacy_next.user_channel_id, option),
@@ -2435,11 +2458,19 @@ impl Writeable for Event {
 				35u8.write(writer)?;
 				// Never write ConnectionNeeded events as buffered onion messages aren't serialized.
 			},
-			&Event::OnionMessageIntercepted { ref peer_node_id, ref message } => {
+			&Event::OnionMessageIntercepted { ref prev_hop, ref next_hop, ref message } => {
 				37u8.write(writer)?;
+				// 0 used to be peer_node_id in LDK v0.2 and prior; we keep writing it when the next
+				// hop is a node id for backwards compatibility.
+				let legacy_peer_node_id = match next_hop {
+					NextMessageHop::NodeId(node_id) => Some(node_id),
+					NextMessageHop::ShortChannelId(_) => None,
+				};
 				write_tlv_fields!(writer, {
-					(0, peer_node_id, required),
+					(0, legacy_peer_node_id, option),
+					(1, next_hop, required),
 					(2, message, required),
+					(3, prev_hop, option),
 				});
 			},
 			&Event::OnionMessagePeerConnected { ref peer_node_id } => {
@@ -2737,7 +2768,7 @@ impl MaybeReadable for Event {
 					let mut total_fee_earned_msat = None;
 					let mut skimmed_fee_msat = None;
 					let mut claim_from_onchain_tx = false;
-					let mut outbound_amount_forwarded_msat = None;
+					let mut outbound_amount_forwarded_msat = 0;
 					let mut prev_htlcs = vec![];
 					let mut next_htlcs = vec![];
 					read_tlv_fields!(reader, {
@@ -2745,7 +2776,7 @@ impl MaybeReadable for Event {
 						(1, prev_channel_id_legacy, option),
 						(2, claim_from_onchain_tx, required),
 						(3, next_channel_id_legacy, option),
-						(5, outbound_amount_forwarded_msat, option),
+						(5, outbound_amount_forwarded_msat, required),
 						(7, skimmed_fee_msat, option),
 						(9, prev_user_channel_id_legacy, option),
 						(11, next_user_channel_id_legacy, option),
@@ -2756,11 +2787,14 @@ impl MaybeReadable for Event {
 						// with pending forwards to 0.1 for any version 0.0.123 or earlier.
 						(17, prev_htlcs, (default_value, vec![HTLCLocator{
 							channel_id: prev_channel_id_legacy.ok_or(DecodeError::InvalidValue)?,
+							amount_msat: total_fee_earned_msat
+								.map(|fee| outbound_amount_forwarded_msat + fee),
 							user_channel_id: prev_user_channel_id_legacy,
 							node_id: prev_node_id_legacy,
 						}])),
 						(19, next_htlcs, (default_value, vec![HTLCLocator{
 							channel_id: next_channel_id_legacy.ok_or(DecodeError::InvalidValue)?,
+							amount_msat: Some(outbound_amount_forwarded_msat),
 							user_channel_id: next_user_channel_id_legacy,
 							node_id: next_node_id_legacy,
 						}])),
@@ -3068,11 +3102,18 @@ impl MaybeReadable for Event {
 			37u8 => {
 				let mut f = || {
 					_init_and_read_len_prefixed_tlv_fields!(reader, {
-						(0, peer_node_id, required),
+						(0, peer_node_id, option),
+						(1, next_hop, option),
 						(2, message, required),
+						(3, prev_hop, option),
 					});
+
+					let next_hop = next_hop
+						.or(peer_node_id.map(NextMessageHop::NodeId))
+						.ok_or(msgs::DecodeError::InvalidValue)?;
 					Ok(Some(Event::OnionMessageIntercepted {
-						peer_node_id: peer_node_id.0.unwrap(),
+						prev_hop,
+						next_hop,
 						message: message.0.unwrap(),
 					}))
 				};
@@ -3195,6 +3236,48 @@ impl MaybeReadable for Event {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn legacy_payment_forwarded_preserves_unknown_inbound_htlc_amount() {
+		let prev_channel_id = ChannelId::from_bytes([1; 32]);
+		let next_channel_id = ChannelId::from_bytes([2; 32]);
+		let mut encoded_legacy_event = vec![
+			7,  // Event::PaymentForwarded
+			81, // TLV stream length
+			1, 32, // prev_channel_id
+		];
+		encoded_legacy_event.extend_from_slice(&[1; 32]);
+		encoded_legacy_event.extend_from_slice(&[2, 1, 0]); // claim_from_onchain_tx
+		encoded_legacy_event.extend_from_slice(&[3, 32]); // next_channel_id
+		encoded_legacy_event.extend_from_slice(&[2; 32]);
+		// outbound_amount_forwarded_msat
+		encoded_legacy_event.extend_from_slice(&[5, 8, 0, 0, 0, 0, 0, 45, 198, 192]);
+
+		match Event::read(&mut &encoded_legacy_event[..]).unwrap().unwrap() {
+			Event::PaymentForwarded {
+				prev_htlcs,
+				next_htlcs,
+				total_fee_earned_msat,
+				outbound_amount_forwarded_msat,
+				..
+			} => {
+				assert_eq!(total_fee_earned_msat, None);
+				assert_eq!(outbound_amount_forwarded_msat, 3_000_000);
+				assert_eq!(prev_htlcs.len(), 1);
+				assert_eq!(prev_htlcs[0].channel_id, prev_channel_id);
+				assert_eq!(prev_htlcs[0].amount_msat, None);
+				assert_eq!(next_htlcs.len(), 1);
+				assert_eq!(next_htlcs[0].channel_id, next_channel_id);
+				assert_eq!(next_htlcs[0].amount_msat, Some(3_000_000));
+			},
+			_ => panic!("expected PaymentForwarded event"),
+		}
+	}
+}
+
 /// A trait indicating an object may generate events.
 ///
 /// Events are processed by passing an [`EventHandler`] to [`process_pending_events`].
@@ -3278,19 +3361,3 @@ impl<T: EventHandler> EventHandler for Arc<T> {
 		self.deref().handle_event(event)
 	}
 }
-
-/// The BOLT 12 invoice that was paid, surfaced in [`Event::PaymentSent::bolt12_invoice`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum PaidBolt12Invoice {
-	/// The BOLT 12 invoice specified by the BOLT 12 specification,
-	/// allowing the user to perform proof of payment.
-	Bolt12Invoice(Bolt12Invoice),
-	/// The Static invoice, used in the async payment specification update proposal,
-	/// where the user cannot perform proof of payment.
-	StaticInvoice(StaticInvoice),
-}
-
-impl_ser_tlv_based_enum!(PaidBolt12Invoice,
-	{0, Bolt12Invoice} => (),
-	{2, StaticInvoice} => (),
-);

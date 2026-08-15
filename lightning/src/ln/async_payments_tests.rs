@@ -877,6 +877,7 @@ fn ignore_unexpected_static_invoice() {
 }
 
 #[test]
+#[allow(deprecated)] // Tests the deprecated send_payment_for_bolt12_invoice.
 fn ignore_duplicate_invoice() {
 	// When a sender tries to pay an async recipient it could potentially end up receiving two
 	// invoices: one static invoice that it received from always-online node and a fresh invoice
@@ -2449,6 +2450,25 @@ fn refresh_static_invoices_for_used_offers() {
 		.onion_messenger
 		.handle_onion_message(server.node.get_our_node_id(), &invoice_persisted_om);
 	assert_eq!(recipient.node.flow.test_get_async_receive_offers().len(), 1);
+
+	// The invoice was just refreshed and persisted. A later timer tick must wait until the next
+	// refresh threshold before generating another invoice for the same offer.
+	recipient.node.timer_tick_occurred();
+	let pending_oms_after = recipient.onion_messenger.release_pending_msgs();
+	let mut extra_serve_invoices = 0;
+	if let Some(msgs) = pending_oms_after.get(&server.node.get_our_node_id()) {
+		for msg in msgs {
+			if let PeeledOnion::AsyncPayments(AsyncPaymentsMessage::ServeStaticInvoice(_), _, _) =
+				server.onion_messenger.peel_onion_message(&msg).unwrap()
+			{
+				extra_serve_invoices += 1;
+			}
+		}
+	}
+	assert_eq!(
+		extra_serve_invoices, 0,
+		"used offer invoice was refreshed again immediately after a successful refresh"
+	);
 
 	// Remove the peer restriction added above.
 	server.message_router.peers_override.lock().unwrap().clear();

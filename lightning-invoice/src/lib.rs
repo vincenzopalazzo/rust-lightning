@@ -159,6 +159,10 @@ pub const DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA: u64 = 18;
 /// consistency is more important.
 pub const MAX_LENGTH: usize = 7089;
 
+/// The maximum length of a tagged field in a BOLT11 invoice. This is 1023 * 5 bits (i.e., 639
+/// bytes).
+pub const MAX_TAGGED_FIELD_DATA_BYTES: usize = 639;
+
 /// The [`bech32::Bech32`] checksum algorithm, with extended max length suitable
 /// for BOLT11 invoices.
 pub enum Bolt11Bech32 {}
@@ -886,7 +890,11 @@ impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, S: tb::Bool>
 	pub fn optional_payment_metadata(
 		mut self, payment_metadata: Vec<u8>,
 	) -> InvoiceBuilder<D, H, T, C, S, tb::True> {
-		self.tagged_fields.push(TaggedField::PaymentMetadata(payment_metadata));
+		if payment_metadata.len() > MAX_TAGGED_FIELD_DATA_BYTES {
+			self.error = Some(CreationError::PaymentMetadataTooLong);
+		} else {
+			self.tagged_fields.push(TaggedField::PaymentMetadata(payment_metadata));
+		}
 		let mut found_features = false;
 		for field in self.tagged_fields.iter_mut() {
 			if let TaggedField::Features(f) = field {
@@ -1478,7 +1486,7 @@ impl Bolt11Invoice {
 		unreachable!("ensured by constructor");
 	}
 
-	/// Get the payee's public key if one was included in the invoice
+	/// Get the payee's public key if one was explicitly included in the invoice's `n` field.
 	pub fn payee_pub_key(&self) -> Option<&PublicKey> {
 		self.signed_invoice.payee_pub_key().map(|x| &x.0)
 	}
@@ -1498,17 +1506,21 @@ impl Bolt11Invoice {
 		self.signed_invoice.features()
 	}
 
-	/// Recover the payee's public key (only to be used if none was included in the invoice)
-	pub fn recover_payee_pub_key(&self) -> PublicKey {
-		self.signed_invoice.recover_payee_pub_key().expect("was checked by constructor").0
+	/// Recover the payee's public key from the invoice signature.
+	///
+	/// This attempts signature recovery regardless of whether a payee public key was explicitly
+	/// included in the invoice's `n` field. Recovery can fail for a valid invoice with an included
+	/// `n` field, so [`Self::get_payee_pub_key`] should be used to obtain the invoice's payee key.
+	pub fn recover_payee_pub_key(&self) -> Option<PublicKey> {
+		self.signed_invoice.recover_payee_pub_key().ok().map(|p| p.0)
 	}
 
-	/// Recover the payee's public key if one was included in the invoice, otherwise return the
-	/// recovered public key from the signature
+	/// Get the invoice's payee public key, preferring an explicitly included payee public key and
+	/// falling back to recovering the key from the signature.
 	pub fn get_payee_pub_key(&self) -> PublicKey {
 		match self.payee_pub_key() {
 			Some(pk) => *pk,
-			None => self.recover_payee_pub_key(),
+			None => self.recover_payee_pub_key().expect("was checked by constructor"),
 		}
 	}
 
@@ -1561,7 +1573,7 @@ impl Bolt11Invoice {
 	pub fn would_expire(&self, at_time: Duration) -> bool {
 		self.duration_since_epoch()
 			.checked_add(self.expiry_time())
-			.unwrap_or_else(|| Duration::new(u64::max_value(), 1_000_000_000 - 1))
+			.unwrap_or_else(|| Duration::new(u64::MAX, 1_000_000_000 - 1))
 			< at_time
 	}
 
@@ -1672,12 +1684,12 @@ impl TaggedField {
 }
 
 impl Description {
-	/// Creates a new `Description` if `description` is at most 1023 * 5 bits (i.e., 639 bytes)
+	/// Creates a new `Description` if `description` is at most [`MAX_TAGGED_FIELD_DATA_BYTES`]
 	/// long, and returns [`CreationError::DescriptionTooLong`] otherwise.
 	///
 	/// Please note that single characters may use more than one byte due to UTF8 encoding.
 	pub fn new(description: String) -> Result<Description, CreationError> {
-		if description.len() > 639 {
+		if description.len() > MAX_TAGGED_FIELD_DATA_BYTES {
 			Err(CreationError::DescriptionTooLong)
 		} else {
 			Ok(Description(UntrustedString(description)))
@@ -1794,6 +1806,9 @@ pub enum CreationError {
 	/// The supplied description string was longer than 639 __bytes__ (see [`Description::new`])
 	DescriptionTooLong,
 
+	/// The supplied payment metadata was longer than 639 __bytes__
+	PaymentMetadataTooLong,
+
 	/// The specified route has too many hops and can't be encoded
 	RouteTooLong,
 
@@ -1816,6 +1831,7 @@ impl Display for CreationError {
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self {
 			CreationError::DescriptionTooLong => f.write_str("The supplied description string was longer than 639 bytes"),
+			CreationError::PaymentMetadataTooLong => f.write_str("The supplied payment metadata was longer than 639 bytes"),
 			CreationError::RouteTooLong => f.write_str("The specified route has too many hops and can't be encoded"),
 			CreationError::TimestampOutOfBounds => f.write_str("The Unix timestamp of the supplied date is less than zero or greater than 35-bits"),
 			CreationError::InvalidAmount => f.write_str("The supplied millisatoshi amount was greater than the total bitcoin supply"),
@@ -2058,6 +2074,58 @@ mod test {
 	}
 
 	#[test]
+	fn recover_payee_pub_key_returns_signature_recovery_result() {
+		use crate::{
+			Bolt11Invoice, Bolt11InvoiceSignature, Currency, InvoiceBuilder, PaymentHash,
+			PaymentSecret, SignedRawBolt11Invoice,
+		};
+		use bitcoin::secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
+		use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+		use core::time::Duration;
+
+		let secp_ctx = Secp256k1::new();
+		let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
+		let public_key = PublicKey::from_secret_key(&secp_ctx, &private_key);
+
+		let invoice_without_payee_pub_key = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("Test".to_string())
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([21; 32]))
+			.min_final_cltv_expiry_delta(144)
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_signed(|hash| secp_ctx.sign_ecdsa_recoverable(hash, &private_key))
+			.unwrap();
+		assert_eq!(invoice_without_payee_pub_key.recover_payee_pub_key(), Some(public_key));
+		assert_eq!(invoice_without_payee_pub_key.get_payee_pub_key(), public_key);
+
+		let invoice_with_payee_pub_key = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("Test".to_string())
+			.payment_hash(PaymentHash([1; 32]))
+			.payment_secret(PaymentSecret([21; 32]))
+			.payee_pub_key(public_key)
+			.min_final_cltv_expiry_delta(144)
+			.duration_since_epoch(Duration::from_secs(1234567))
+			.build_signed(|hash| secp_ctx.sign_ecdsa_recoverable(hash, &private_key))
+			.unwrap();
+
+		let signed_raw = invoice_with_payee_pub_key.into_signed_raw();
+		let (raw_invoice, hash, signature) = signed_raw.into_parts();
+		let (_orig_rid, sig_bytes) = signature.0.serialize_compact();
+		let bad_rid = RecoveryId::from_i32(2).unwrap();
+		let bad_sig = RecoverableSignature::from_compact(&sig_bytes, bad_rid).unwrap();
+		let bad_signed_raw = SignedRawBolt11Invoice {
+			raw_invoice,
+			hash,
+			signature: Bolt11InvoiceSignature(bad_sig),
+		};
+		let bad_invoice = Bolt11Invoice::from_signed(bad_signed_raw).unwrap();
+
+		assert_eq!(bad_invoice.payee_pub_key(), Some(&public_key));
+		assert_eq!(bad_invoice.recover_payee_pub_key(), None);
+		assert_eq!(bad_invoice.get_payee_pub_key(), public_key);
+	}
+
+	#[test]
 	fn test_check_feature_bits() {
 		use crate::TaggedField::*;
 		use crate::{
@@ -2219,6 +2287,10 @@ mod test {
 
 		let long_desc_res = builder.clone().description(too_long_string).build_raw();
 		assert_eq!(long_desc_res, Err(CreationError::DescriptionTooLong));
+
+		let long_metadata_res =
+			builder.clone().description("Test".into()).payment_metadata(vec![0u8; 640]).build_raw();
+		assert_eq!(long_metadata_res, Err(CreationError::PaymentMetadataTooLong));
 
 		let route_hop = RouteHintHop {
 			src_node_id: PublicKey::from_slice(

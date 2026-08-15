@@ -192,7 +192,7 @@ pub fn aggregated_htlc_timeout_input_output_pair_weight(
 }
 
 /// Describes the type of HTLC claim as determined by analyzing the witness.
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum HTLCClaim {
 	/// Claims an offered output on a commitment transaction through the timeout path.
 	OfferedTimeout,
@@ -668,6 +668,18 @@ impl TxCreationKeys {
 // on-chain funds.
 pub const REVOKEABLE_REDEEMSCRIPT_MAX_LENGTH: usize = 6 + 4 + 34 * 2;
 
+/// The exact length of the script returned by [`get_revokeable_redeemscript`] for a given
+/// `contest_delay`.
+///
+/// This is always at most [`REVOKEABLE_REDEEMSCRIPT_MAX_LENGTH`], and shorter when `contest_delay`
+/// encodes to fewer than the maximum 4 bytes.
+pub fn revokeable_redeemscript_len(contest_delay: u16) -> usize {
+	// 6 bytes of opcodes + the `OP_CSV` value push + two 33-byte public keys (each with a 1-byte
+	// push).
+	let contest_delay_push_len = Builder::new().push_int(contest_delay as i64).into_script().len();
+	6 + contest_delay_push_len + 34 * 2
+}
+
 /// A script either spendable by the revocation
 /// key or the broadcaster_delayed_payment_key and satisfying the relative-locktime OP_CSV constrain.
 /// Encumbering a `to_holder` output on a commitment transaction or 2nd-stage HTLC transactions.
@@ -683,7 +695,7 @@ pub fn get_revokeable_redeemscript(revocation_key: &RevocationKey, contest_delay
 	              .push_opcode(opcodes::all::OP_ENDIF)
 	              .push_opcode(opcodes::all::OP_CHECKSIG)
 	              .into_script();
-	debug_assert!(res.len() <= REVOKEABLE_REDEEMSCRIPT_MAX_LENGTH);
+	debug_assert_eq!(res.len(), revokeable_redeemscript_len(contest_delay));
 	res
 }
 
@@ -1224,7 +1236,9 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 
 		let mut additional_features = ChannelTypeFeatures::empty();
 		additional_features.set_anchors_nonzero_fee_htlc_tx_required();
-		chain::package::verify_channel_type_features(&channel_type_features, Some(&additional_features))?;
+		let channel_type_features = chain::package::verify_channel_type_features(
+			channel_type_features, Some(&additional_features)
+		)?;
 
 		Ok(Self {
 			holder_pubkeys: holder_pubkeys.0.unwrap(),
@@ -1233,7 +1247,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			counterparty_parameters,
 			funding_outpoint,
 			splice_parent_funding_txid,
-			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key()),
+			channel_type_features,
 			channel_value_satoshis,
 		})
 	}
@@ -1666,7 +1680,9 @@ impl Readable for CommitmentTransaction {
 
 		let mut additional_features = ChannelTypeFeatures::empty();
 		additional_features.set_anchors_nonzero_fee_htlc_tx_required();
-		chain::package::verify_channel_type_features(&channel_type_features, Some(&additional_features))?;
+		let channel_type_features = chain::package::verify_channel_type_features(
+			channel_type_features, Some(&additional_features)
+		)?;
 
 		Ok(Self {
 			commitment_number: commitment_number.0.unwrap(),
@@ -1677,7 +1693,7 @@ impl Readable for CommitmentTransaction {
 			keys: keys.0.unwrap(),
 			built: built.0.unwrap(),
 			nondust_htlcs,
-			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key())
+			channel_type_features,
 		})
 	}
 }

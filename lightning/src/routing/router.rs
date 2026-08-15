@@ -253,6 +253,143 @@ impl Router for FixedRouter {
 	}
 }
 
+/// Builds a probe [`Path`] by walking randomly through the public gossip graph.
+///
+/// Picks a usable channel from `first_hops`, then walks announced channels that are enabled in
+/// both directions and can carry `amount_msat`, without revisiting the payer or any previous hop.
+/// Walk edges whose CLTV would push the path over [`DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA`] (plus the
+/// final hop's CLTV) are skipped. `max_hops` is clamped to `[2, MAX_PATH_LENGTH_ESTIMATE]` and used
+/// as the target path length. The amount is not clamped into HTLC bounds — callers should retry
+/// with a smaller amount on failure.
+pub fn build_random_walk_probe_path<L: Logger, GL: Logger, ES: EntropySource>(
+	network_graph: &NetworkGraph<GL>, entropy_source: &ES, logger: L, payer: &PublicKey,
+	first_hops: &[&ChannelDetails], amount_msat: u64, max_hops: u8,
+) -> Result<Path, &'static str> {
+	let target_hops = max_hops.clamp(2, MAX_PATH_LENGTH_ESTIMATE) as usize;
+
+	let payer_id = NodeId::from_pubkey(payer);
+	let usable_first_hop = |c: &&&ChannelDetails| {
+		c.is_usable
+			&& c.get_outbound_payment_scid().is_some()
+			&& amount_msat >= c.next_outbound_htlc_minimum_msat
+			// Leave room for fees on later hops.
+			&& amount_msat.saturating_mul(2) <= c.next_outbound_htlc_limit_msat
+	};
+	let usable_count = first_hops.iter().filter(usable_first_hop).count();
+	if usable_count == 0 {
+		return Err("no usable first hops for random-walk probe");
+	}
+	let first_hop = *first_hops
+		.iter()
+		.filter(usable_first_hop)
+		.nth(random_in_range(entropy_source, 0, usable_count as u64 - 1) as usize)
+		.unwrap();
+
+	let first_peer = first_hop.counterparty.node_id;
+	let mut hop_pubkeys = Vec::with_capacity(target_hops);
+	hop_pubkeys.push(first_peer);
+
+	let graph = network_graph.read_only();
+	let mut current_node_id = NodeId::from_pubkey(&first_peer);
+	let mut cltv_so_far = 0u32;
+
+	for _ in 1..target_hops {
+		let Some(node_info) = graph.node(&current_node_id) else {
+			break;
+		};
+		let candidate = |&scid: &u64| {
+			let channel = graph.channel(scid)?;
+			random_walk_next_hop(
+				channel,
+				&current_node_id,
+				amount_msat,
+				&payer_id,
+				&hop_pubkeys,
+				cltv_so_far,
+			)
+		};
+		let candidate_count = node_info.channels.iter().filter_map(candidate).count();
+		if candidate_count == 0 {
+			break;
+		}
+		let (next_id, next_pubkey, edge_cltv) = node_info
+			.channels
+			.iter()
+			.filter_map(candidate)
+			.nth(random_in_range(entropy_source, 0, candidate_count as u64 - 1) as usize)
+			.unwrap();
+		hop_pubkeys.push(next_pubkey);
+		cltv_so_far = cltv_so_far.saturating_add(edge_cltv);
+		current_node_id = next_id;
+	}
+
+	if hop_pubkeys.len() < target_hops {
+		return Err("random-walk probe path dead-ended before reaching hop count");
+	}
+
+	let route_params =
+		RouteParameters::from_probe_target(*hop_pubkeys.last().unwrap(), amount_msat);
+	let random_seed_bytes = entropy_source.get_secure_random_bytes();
+	let mut route = build_route_from_hops_internal(
+		payer,
+		&hop_pubkeys,
+		&route_params,
+		&graph,
+		logger,
+		&random_seed_bytes,
+		Some(&[first_hop]),
+	)?;
+	add_random_cltv_offset(&mut route, &route_params.payment_params, &graph, &random_seed_bytes);
+	route.paths.into_iter().next().ok_or("random-walk probe built an empty route")
+}
+
+fn random_in_range<ES: EntropySource>(
+	entropy_source: &ES, min_inclusive: u64, max_inclusive: u64,
+) -> u64 {
+	debug_assert!(min_inclusive <= max_inclusive);
+	let range = max_inclusive.saturating_sub(min_inclusive).saturating_add(1);
+	let seed = entropy_source.get_secure_random_bytes();
+	let mut buf = [0u8; 8];
+	buf.copy_from_slice(&seed[..8]);
+	min_inclusive + u64::from_be_bytes(buf) % range
+}
+
+fn random_walk_next_hop(
+	channel: &crate::routing::gossip::ChannelInfo, from: &NodeId, amount_msat: u64,
+	payer_id: &NodeId, hop_pubkeys: &[PublicKey], cltv_so_far: u32,
+) -> Option<(NodeId, PublicKey, u32)> {
+	let (directed, next_node_id) = channel.as_directed_from(from)?;
+	if next_node_id == payer_id
+		|| hop_pubkeys.iter().any(|pk| NodeId::from_pubkey(pk) == *next_node_id)
+	{
+		return None;
+	}
+	let one_to_two = channel.one_to_two.as_ref()?;
+	let two_to_one = channel.two_to_one.as_ref()?;
+	if !one_to_two.enabled || !two_to_one.enabled {
+		return None;
+	}
+	let update = directed.direction();
+	if amount_msat < update.htlc_minimum_msat || amount_msat > update.htlc_maximum_msat {
+		return None;
+	}
+	if amount_msat > directed.effective_capacity().as_msat() {
+		return None;
+	}
+	let fee = compute_fees(amount_msat, update.fees)?;
+	if fee > amount_msat / 2 {
+		return None;
+	}
+	let edge_cltv = update.cltv_expiry_delta as u32;
+	if cltv_so_far.saturating_add(edge_cltv).saturating_add(MIN_FINAL_CLTV_EXPIRY_DELTA as u32)
+		> DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA
+	{
+		return None;
+	}
+	let next_pubkey = PublicKey::try_from(*next_node_id).ok()?;
+	Some((*next_node_id, next_pubkey, edge_cltv))
+}
+
 /// A trait defining behavior for routing a payment.
 pub trait Router {
 	/// Finds a [`Route`] for a payment between the given `payer` and a payee.
@@ -682,9 +819,7 @@ pub struct Route {
 	/// The `route_params` parameter passed to [`find_route`].
 	///
 	/// This is used by `ChannelManager` to track information which may be required for retries.
-	///
-	/// Will be `None` for objects serialized with LDK versions prior to 0.0.117.
-	pub route_params: Option<RouteParameters>,
+	pub route_params: RouteParameters,
 }
 
 impl Route {
@@ -697,8 +832,8 @@ impl Route {
 	/// [`htlc_minimum_msat`]: https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#the-channel_update-message
 	#[rustfmt::skip]
 	pub fn get_total_fees(&self) -> u64 {
-		let overpaid_value_msat = self.route_params.as_ref()
-			.map_or(0, |p| self.get_total_amount().saturating_sub(p.final_value_msat));
+		let overpaid_value_msat =
+			self.get_total_amount().saturating_sub(self.route_params.final_value_msat);
 		overpaid_value_msat + self.paths.iter().map(|path| path.fee_msat()).sum::<u64>()
 	}
 
@@ -713,105 +848,102 @@ impl Route {
 	}
 
 	pub(crate) fn debug_assert_route_meets_params<L: Logger>(&self, logger: L) -> Result<(), ()> {
-		if let Some(route_params) = self.route_params.as_ref() {
-			// Check that we actually pay less than the max fee we set.
-			if let Some(max_total_fee) = route_params.max_total_routing_fee_msat {
-				let total_fee = self.get_total_fees();
-				if total_fee > max_total_fee {
-					let err = format!("Router returned an attempt to pay with a higher fee ({total_fee}msat) than we allowed ({max_total_fee}msat). Your router is critically buggy!");
-					debug_assert!(false, "{}", err);
-					log_error!(logger, "{}", err);
-					return Err(());
-				}
+		let route_params = &self.route_params;
+		// Check that we actually pay less than the max fee we set.
+		if let Some(max_total_fee) = route_params.max_total_routing_fee_msat {
+			let total_fee = self.get_total_fees();
+			if total_fee > max_total_fee {
+				let err = format!("Router returned an attempt to pay with a higher fee ({total_fee}msat) than we allowed ({max_total_fee}msat). Your router is critically buggy!");
+				debug_assert!(false, "{}", err);
+				log_error!(logger, "{}", err);
+				return Err(());
 			}
+		}
 
-			if self.paths.is_empty() {
-				let err = "Selected route had no paths. Your router is buggy!";
+		if self.paths.is_empty() {
+			let err = "Selected route had no paths. Your router is buggy!";
+			debug_assert!(false, "{}", err);
+			log_error!(logger, "{}", err);
+			return Err(());
+		}
+
+		for path in self.paths.iter() {
+			if path.hops.is_empty() {
+				let err = "Unusable path in route (path.hops.len() must be at least 1)";
 				debug_assert!(false, "{}", err);
 				log_error!(logger, "{}", err);
 				return Err(());
 			}
 
-			for path in self.paths.iter() {
-				if path.hops.is_empty() {
-					let err = "Unusable path in route (path.hops.len() must be at least 1)";
-					debug_assert!(false, "{}", err);
-					log_error!(logger, "{}", err);
-					return Err(());
-				}
-
-				let total_cltv_delta = path.total_cltv_expiry_delta();
-				if total_cltv_delta > route_params.payment_params.max_total_cltv_expiry_delta {
-					let err = format!(
-						"Path had a total CLTV of {total_cltv_delta} which is greater than the maximum we're allowed {}",
-						route_params.payment_params.max_total_cltv_expiry_delta,
-					);
-					debug_assert!(false, "{}", err);
-					log_error!(logger, "{}", err);
-					return Err(());
-				}
-
-				if path.hops.len() > route_params.payment_params.max_path_length.into() {
-					let err = format!(
-						"Path had a length of {}, which is greater than the maximum we're allowed ({})",
-						path.hops.len(),
-						route_params.payment_params.max_path_length,
-					);
-					#[cfg(any(test, feature = "_test_utils"))]
-					debug_assert!(false, "{}", err);
-					log_error!(logger, "{}", err);
-					// This is a bug, but there's not a material safety risk to making this
-					// payment, so we don't bother to error here.
-				}
-
-				if let Some(tail) = &path.blinded_tail {
-					let trampoline_cltv_sum: u32 =
-						tail.trampoline_hops.iter().map(|hop| hop.cltv_expiry_delta).sum();
-					let last_hop_cltv_delta = path.hops.last().unwrap().cltv_expiry_delta;
-					if !tail.trampoline_hops.is_empty()
-						&& trampoline_cltv_sum != last_hop_cltv_delta
-					{
-						let err = format!(
-							"Path had a total trampoline CLTV of {trampoline_cltv_sum}, which is not equal to the total last-hop CLTV delta of {last_hop_cltv_delta}"
-						);
-						debug_assert!(false, "{}", err);
-						log_error!(logger, "{}", err);
-					}
-					let last_trampoline_cltv_opt =
-						tail.trampoline_hops.last().map(|h| h.cltv_expiry_delta);
-					let last_trampoline_cltv = last_trampoline_cltv_opt.unwrap_or(u32::MAX);
-					if tail.excess_final_cltv_expiry_delta > last_trampoline_cltv {
-						let err = format!(
-							"Last trampoline CLTV of {last_trampoline_cltv} is less than the excess blinded path cltv of {}",
-							tail.excess_final_cltv_expiry_delta
-						);
-						debug_assert!(false, "{}", err);
-						log_error!(logger, "{}", err);
-					}
-					if tail.excess_final_cltv_expiry_delta > last_hop_cltv_delta {
-						let err = format!(
-							"Last path hop CLTV of {last_hop_cltv_delta} is less than the excess blinded path cltv of {}",
-							tail.excess_final_cltv_expiry_delta
-						);
-						debug_assert!(false, "{}", err);
-						log_error!(logger, "{}", err);
-					}
-				}
-			}
-
-			// Test that we don't contain any "extra" MPP parts - while we're allowed to overshoot
-			// the `final_value_msat` specified in the `route_params`, we aren't allowed to have
-			// any MPP parts which aren't needed to meet `route_params.final_value_msat`.
-			let min_mpp_part = self.paths.iter().map(|h| h.final_value_msat()).min().unwrap_or(0);
-			if self.get_total_amount() - min_mpp_part >= route_params.final_value_msat {
+			let total_cltv_delta = path.total_cltv_expiry_delta();
+			if total_cltv_delta > route_params.payment_params.max_total_cltv_expiry_delta {
 				let err = format!(
-					"Router returned an attempt to include more MPP parts than needed. The smallest MPP part ({min_mpp_part}msat) was not needed for a payment of {}msat. Your router is critically buggy!",
-					route_params.final_value_msat
+					"Path had a total CLTV of {total_cltv_delta} which is greater than the maximum we're allowed {}",
+					route_params.payment_params.max_total_cltv_expiry_delta,
 				);
 				debug_assert!(false, "{}", err);
 				log_error!(logger, "{}", err);
 				return Err(());
 			}
+
+			if path.hops.len() > route_params.payment_params.max_path_length.into() {
+				let err = format!(
+					"Path had a length of {}, which is greater than the maximum we're allowed ({})",
+					path.hops.len(),
+					route_params.payment_params.max_path_length,
+				);
+				#[cfg(any(test, feature = "_test_utils"))]
+				debug_assert!(false, "{}", err);
+				log_error!(logger, "{}", err);
+				// This is a bug, but there's not a material safety risk to making this
+				// payment, so we don't bother to error here.
+			}
+
+			if let Some(tail) = &path.blinded_tail {
+				let trampoline_cltv_sum: u32 =
+					tail.trampoline_hops.iter().map(|hop| hop.cltv_expiry_delta).sum();
+				let last_hop_cltv_delta = path.hops.last().unwrap().cltv_expiry_delta;
+				if !tail.trampoline_hops.is_empty() && trampoline_cltv_sum != last_hop_cltv_delta {
+					let err = format!(
+						"Path had a total trampoline CLTV of {trampoline_cltv_sum}, which is not equal to the total last-hop CLTV delta of {last_hop_cltv_delta}"
+					);
+					debug_assert!(false, "{}", err);
+					log_error!(logger, "{}", err);
+				}
+				let last_trampoline_cltv_opt =
+					tail.trampoline_hops.last().map(|h| h.cltv_expiry_delta);
+				let last_trampoline_cltv = last_trampoline_cltv_opt.unwrap_or(u32::MAX);
+				if tail.excess_final_cltv_expiry_delta > last_trampoline_cltv {
+					let err = format!(
+						"Last trampoline CLTV of {last_trampoline_cltv} is less than the excess blinded path cltv of {}",
+						tail.excess_final_cltv_expiry_delta
+					);
+					debug_assert!(false, "{}", err);
+					log_error!(logger, "{}", err);
+				}
+				if tail.excess_final_cltv_expiry_delta > last_hop_cltv_delta {
+					let err = format!(
+						"Last path hop CLTV of {last_hop_cltv_delta} is less than the excess blinded path cltv of {}",
+						tail.excess_final_cltv_expiry_delta
+					);
+					debug_assert!(false, "{}", err);
+					log_error!(logger, "{}", err);
+				}
+			}
+		}
+
+		// Test that we don't contain any "extra" MPP parts - while we're allowed to overshoot
+		// the `final_value_msat` specified in the `route_params`, we aren't allowed to have
+		// any MPP parts which aren't needed to meet `route_params.final_value_msat`.
+		let min_mpp_part = self.paths.iter().map(|h| h.final_value_msat()).min().unwrap_or(0);
+		if self.get_total_amount() - min_mpp_part >= route_params.final_value_msat {
+			let err = format!(
+				"Router returned an attempt to include more MPP parts than needed. The smallest MPP part ({min_mpp_part}msat) was not needed for a payment of {}msat. Your router is critically buggy!",
+				route_params.final_value_msat
+			);
+			debug_assert!(false, "{}", err);
+			log_error!(logger, "{}", err);
+			return Err(());
 		}
 
 		Ok(())
@@ -849,12 +981,10 @@ impl Writeable for Route {
 			} else if !blinded_tails.is_empty() { blinded_tails.push(None); }
 		}
 		write_tlv_fields!(writer, {
-			// For compatibility with LDK versions prior to 0.0.117, we take the individual
-			// RouteParameters' fields and reconstruct them on read.
-			(1, self.route_params.as_ref().map(|p| &p.payment_params), option),
+			(1, self.route_params.payment_params, required),
 			(2, blinded_tails, optional_vec),
-			(3, self.route_params.as_ref().map(|p| p.final_value_msat), option),
-			(5, self.route_params.as_ref().and_then(|p| p.max_total_routing_fee_msat), option),
+			(3, self.route_params.final_value_msat, required),
+			(5, self.route_params.max_total_routing_fee_msat, option),
 		});
 		Ok(())
 	}
@@ -867,7 +997,7 @@ impl Readable for Route {
 		let path_count: u64 = Readable::read(reader)?;
 		if path_count == 0 { return Err(DecodeError::InvalidValue); }
 		let mut paths = Vec::with_capacity(cmp::min(path_count, 128) as usize);
-		let mut min_final_cltv_expiry_delta = u32::max_value();
+		let mut min_final_cltv_expiry_delta = u32::MAX;
 		for _ in 0..path_count {
 			let hop_count: u8 = Readable::read(reader)?;
 			let mut hops: Vec<RouteHop> = Vec::with_capacity(hop_count as usize);
@@ -880,9 +1010,9 @@ impl Readable for Route {
 			paths.push(Path { hops, blinded_tail: None });
 		}
 		_init_and_read_len_prefixed_tlv_fields!(reader, {
-			(1, payment_params, (option: ReadableArgs, min_final_cltv_expiry_delta)),
+			(1, payment_params, (required: ReadableArgs, min_final_cltv_expiry_delta)),
 			(2, blinded_tails, optional_vec),
-			(3, final_value_msat, option),
+			(3, final_value_msat, required),
 			(5, max_total_routing_fee_msat, option)
 		});
 		let blinded_tails = blinded_tails.unwrap_or(Vec::new());
@@ -893,12 +1023,10 @@ impl Readable for Route {
 			}
 		}
 
-		// If we previously wrote the corresponding fields, reconstruct RouteParameters.
-		let route_params = match (payment_params, final_value_msat) {
-			(Some(payment_params), Some(final_value_msat)) => {
-				Some(RouteParameters { payment_params, final_value_msat, max_total_routing_fee_msat })
-			}
-			_ => None,
+		let route_params = RouteParameters {
+			payment_params: payment_params.0.unwrap(),
+			final_value_msat: final_value_msat.0.unwrap(),
+			max_total_routing_fee_msat,
 		};
 
 		Ok(Route { paths, route_params })
@@ -932,6 +1060,14 @@ impl RouteParameters {
 	#[rustfmt::skip]
 	pub fn from_payment_params_and_value(payment_params: PaymentParameters, final_value_msat: u64) -> Self {
 		Self { payment_params, final_value_msat, max_total_routing_fee_msat: Some(final_value_msat / 100 + 50_000) }
+	}
+
+	/// Constructs single-path [`RouteParameters`] to `target_node_id` with no fee cap.
+	pub(crate) fn from_probe_target(target_node_id: PublicKey, amount_msat: u64) -> Self {
+		let payment_params =
+			PaymentParameters::from_node_id(target_node_id, MIN_FINAL_CLTV_EXPIRY_DELTA as u32)
+				.with_max_path_count(1);
+		Self { payment_params, final_value_msat: amount_msat, max_total_routing_fee_msat: None }
 	}
 
 	/// Sets the maximum number of hops that can be included in a payment path, based on the provided
@@ -1177,7 +1313,7 @@ impl PaymentParameters {
 	/// [`PaymentParameters::expiry_time`].
 	pub fn from_bolt11_invoice(invoice: &Bolt11Invoice) -> Self {
 		let mut payment_params = Self::from_node_id(
-			invoice.recover_payee_pub_key(),
+			invoice.get_payee_pub_key(),
 			invoice.min_final_cltv_expiry_delta() as u32,
 		)
 		.with_route_hints(invoice.route_hints())
@@ -2181,7 +2317,7 @@ fn max_htlc_from_capacity(capacity: EffectiveCapacity, max_channel_saturation_po
 	let saturation_shift: u32 = max_channel_saturation_power_of_half as u32;
 	match capacity {
 		EffectiveCapacity::ExactLiquidity { liquidity_msat } => liquidity_msat,
-		EffectiveCapacity::Infinite => u64::max_value(),
+		EffectiveCapacity::Infinite => u64::MAX,
 		EffectiveCapacity::Unknown => EffectiveCapacity::Unknown.as_msat(),
 		EffectiveCapacity::AdvertisedMaxHTLC { amount_msat } =>
 			amount_msat.checked_shr(saturation_shift).unwrap_or(0),
@@ -2299,7 +2435,7 @@ impl<'a> PaymentPath<'a> {
 	}
 
 	fn get_path_penalty_msat(&self) -> u64 {
-		self.hops.first().map(|h| h.0.path_penalty_msat).unwrap_or(u64::max_value())
+		self.hops.first().map(|h| h.0.path_penalty_msat).unwrap_or(u64::MAX)
 	}
 
 	fn get_total_fee_paid_msat(&self) -> u64 {
@@ -2427,10 +2563,12 @@ impl<'a> PaymentPath<'a> {
 	/// contribution this path can make to the final value of the payment.
 	/// May be slightly lower than the actual max due to rounding errors when aggregating fees
 	/// along the path.
+	/// Returns an error with the index of a later hop to discard if the following hops' aggregate
+	/// fees overflow.
 	#[rustfmt::skip]
 	fn max_final_value_msat(
 		&self, used_liquidities: &HashMap<CandidateHopId, u64>, channel_saturation_pow_half: u8
-	) -> (usize, u64) {
+	) -> Result<(usize, u64), usize> {
 		let mut max_path_contribution = (0, u64::MAX);
 		for (idx, (hop, _)) in self.hops.iter().enumerate() {
 			let hop_effective_capacity_msat = hop.candidate.effective_capacity();
@@ -2446,7 +2584,8 @@ impl<'a> PaymentPath<'a> {
 			// Aggregate the fees of the hops that come after this one, and use those fees to compute the
 			// maximum amount that this hop can contribute to the final value received by the payee.
 			let (next_hops_aggregated_base, next_hops_aggregated_prop) =
-				crate::blinded_path::payment::compute_aggregated_base_prop_fee(next_hops_feerates_iter).unwrap();
+				crate::blinded_path::payment::compute_aggregated_base_prop_fee(next_hops_feerates_iter)
+					.map_err(|_| idx + 1)?;
 
 			// floor(((hop_max_msat - agg_base) * 1_000_000) / (1_000_000 + agg_prop))
 			let hop_max_final_value_contribution = (hop_max_msat as u128)
@@ -2463,7 +2602,19 @@ impl<'a> PaymentPath<'a> {
 			} else { debug_assert!(false); }
 		}
 
-		max_path_contribution
+		Ok(max_path_contribution)
+	}
+}
+
+fn mark_candidate_liquidity_exhausted(
+	used_liquidities: &mut HashMap<CandidateHopId, u64>, candidate: &CandidateRouteHop,
+) {
+	let exhausted = u64::MAX;
+	if let Some(scid) = candidate.short_channel_id() {
+		*used_liquidities.entry(CandidateHopId::Clear((scid, false))).or_default() = exhausted;
+		*used_liquidities.entry(CandidateHopId::Clear((scid, true))).or_default() = exhausted;
+	} else {
+		*used_liquidities.entry(candidate.id()).or_default() = exhausted;
 	}
 }
 
@@ -2477,11 +2628,11 @@ pub(crate) fn compute_fees(amount_msat: u64, channel_fees: RoutingFees) -> Optio
 
 #[inline(always)]
 /// Calculate the fees required to route the given amount over a channel with the given fees,
-/// saturating to [`u64::max_value`].
+/// saturating to [`u64::MAX`].
 #[rustfmt::skip]
 fn compute_fees_saturating(amount_msat: u64, channel_fees: RoutingFees) -> u64 {
 	amount_msat.checked_mul(channel_fees.proportional_millionths as u64)
-		.map(|prop| prop / 1_000_000).unwrap_or(u64::max_value())
+		.map(|prop| prop / 1_000_000).unwrap_or(u64::MAX)
 		.saturating_add(channel_fees.base_msat as u64)
 }
 
@@ -2740,7 +2891,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 		network_nodes.get(&payee).is_some_and(|node| node.announcement_info.as_ref().is_some_and(|info| info.features().supports_basic_mpp()))
 	} else { false };
 
-	let max_total_routing_fee_msat = route_params.max_total_routing_fee_msat.unwrap_or(u64::max_value());
+	let max_total_routing_fee_msat = route_params.max_total_routing_fee_msat.unwrap_or(u64::MAX);
 
 	let first_hop_count = first_hops.map(|hops| hops.len()).unwrap_or(0);
 	log_trace!(logger, "Searching for a route from payer {} to {} {} MPP and {} first hops {}overriding the network graph of {} nodes and {} channels with a fee limit of {} msat",
@@ -3119,11 +3270,11 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 							*dist_entry = Some(PathBuildingHop {
 								candidate: $candidate.clone(),
 								fee_msat: 0,
-								next_hops_fee_msat: u64::max_value(),
-								hop_use_fee_msat: u64::max_value(),
-								total_fee_msat: u64::max_value(),
+								next_hops_fee_msat: u64::MAX,
+								hop_use_fee_msat: u64::MAX,
+								total_fee_msat: u64::MAX,
 								path_htlc_minimum_msat,
-								path_penalty_msat: u64::max_value(),
+								path_penalty_msat: u64::MAX,
 								was_processed: false,
 								is_first_hop_target: false,
 								is_last_hop_target: false,
@@ -3150,7 +3301,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 							// Ignore hop_use_fee_msat for channel-from-us as we assume all channels-from-us
 							// will have the same effective-fee
 							if src_node_id != our_node_id {
-								// Note that `u64::max_value` means we'll always fail the
+								// Note that `u64::MAX` means we'll always fail the
 								// `old_entry.total_fee_msat > total_fee_msat` check below
 								hop_use_fee_msat = compute_fees_saturating(amount_to_transfer_over_msat, candidate_fees);
 								total_fee_msat = total_fee_msat.saturating_add(hop_use_fee_msat);
@@ -3431,15 +3582,15 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 				candidate: CandidateRouteHop::FirstHop(FirstHopCandidate {
 					details: &chans[0],
 					payer_node_id: &our_node_id,
-					target_node_counter: u32::max_value(),
-					payer_node_counter: u32::max_value(),
+					target_node_counter: u32::MAX,
+					payer_node_counter: u32::MAX,
 				}),
 				fee_msat: 0,
-				next_hops_fee_msat: u64::max_value(),
-				hop_use_fee_msat: u64::max_value(),
-				total_fee_msat: u64::max_value(),
-				path_htlc_minimum_msat: u64::max_value(),
-				path_penalty_msat: u64::max_value(),
+				next_hops_fee_msat: u64::MAX,
+				hop_use_fee_msat: u64::MAX,
+				total_fee_msat: u64::MAX,
+				path_htlc_minimum_msat: u64::MAX,
+				path_penalty_msat: u64::MAX,
 				was_processed: false,
 				is_first_hop_target: true,
 				is_last_hop_target: false,
@@ -3464,11 +3615,11 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 				*entry = Some(PathBuildingHop {
 					candidate: candidates[0].clone(),
 					fee_msat: 0,
-					next_hops_fee_msat: u64::max_value(),
-					hop_use_fee_msat: u64::max_value(),
-					total_fee_msat: u64::max_value(),
-					path_htlc_minimum_msat: u64::max_value(),
-					path_penalty_msat: u64::max_value(),
+					next_hops_fee_msat: u64::MAX,
+					hop_use_fee_msat: u64::MAX,
+					total_fee_msat: u64::MAX,
+					path_htlc_minimum_msat: u64::MAX,
+					path_penalty_msat: u64::MAX,
 					was_processed: false,
 					is_first_hop_target: false,
 					is_last_hop_target: true,
@@ -3643,7 +3794,17 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 				// underpaid htlc_minimum_msat with fees.
 				debug_assert_eq!(payment_path.get_value_msat(), value_contribution_msat);
 				let (lowest_value_contrib_hop, max_path_contribution_msat) =
-					payment_path.max_final_value_msat(&used_liquidities, channel_saturation_pow_half);
+					match payment_path.max_final_value_msat(&used_liquidities, channel_saturation_pow_half) {
+						Ok(contribution) => contribution,
+						Err(candidate_idx_to_skip) => {
+							let candidate = &payment_path.hops[candidate_idx_to_skip].0.candidate;
+							log_trace!(logger,
+								"Ignoring path because aggregate fees including hop {} overflow.",
+								LoggedCandidateHop(candidate));
+							mark_candidate_liquidity_exhausted(&mut used_liquidities, candidate);
+							continue 'paths_collection;
+						}
+					};
 				let desired_value_contribution = cmp::min(max_path_contribution_msat, final_value_msat);
 				value_contribution_msat = payment_path.update_value_and_recompute_fees(desired_value_contribution);
 
@@ -3671,7 +3832,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 					// we'll probably end up picking the same path again on the next iteration.
 					// Decrease the available liquidity of a hop in the middle of the path.
 					let victim_candidate = &payment_path.hops[(payment_path.hops.len()) / 2].0.candidate;
-					let exhausted = u64::max_value();
+					let exhausted = u64::MAX;
 					log_trace!(logger,
 						"Disabling route candidate {} for future path building iterations to avoid duplicates.",
 						LoggedCandidateHop(victim_candidate));
@@ -3907,7 +4068,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 		}
 	}
 
-	let route = Route { paths, route_params: Some(route_params.clone()) };
+	let route = Route { paths, route_params: route_params.clone() };
 
 	// Make sure we would never create a route whose total fees exceed max_total_routing_fee_msat.
 	if let Some(max_total_routing_fee_msat) = route_params.max_total_routing_fee_msat {
@@ -4022,7 +4183,7 @@ pub fn build_route_from_hops<L: Logger, GL: Logger>(
 ) -> Result<Route, &'static str> {
 	let graph_lock = network_graph.read_only();
 	let mut route = build_route_from_hops_internal(our_node_pubkey, hops, &route_params,
-		&graph_lock, logger, random_seed_bytes)?;
+		&graph_lock, logger, random_seed_bytes, None)?;
 	add_random_cltv_offset(&mut route, &route_params.payment_params, &graph_lock, random_seed_bytes);
 	Ok(route)
 }
@@ -4031,6 +4192,7 @@ pub fn build_route_from_hops<L: Logger, GL: Logger>(
 fn build_route_from_hops_internal<L: Logger>(
 	our_node_pubkey: &PublicKey, hops: &[PublicKey], route_params: &RouteParameters,
 	network_graph: &ReadOnlyNetworkGraph, logger: L, random_seed_bytes: &[u8; 32],
+	first_hops: Option<&[&ChannelDetails]>,
 ) -> Result<Route, &'static str> {
 
 	struct HopScorer {
@@ -4054,7 +4216,7 @@ fn build_route_from_hops_internal<L: Logger>(
 					break;
 				}
 			}
-			u64::max_value()
+			u64::MAX
 		}
 	}
 
@@ -4078,7 +4240,7 @@ fn build_route_from_hops_internal<L: Logger>(
 
 	let scorer = HopScorer { our_node_id, hop_ids };
 
-	get_route(our_node_pubkey, route_params, network_graph, None, logger, &scorer, &Default::default(), random_seed_bytes)
+	get_route(our_node_pubkey, route_params, network_graph, first_hops, logger, &scorer, &Default::default(), random_seed_bytes)
 }
 
 #[cfg(test)]
@@ -4093,10 +4255,10 @@ mod tests {
 	use crate::ln::types::ChannelId;
 	use crate::routing::gossip::{EffectiveCapacity, NetworkGraph, NodeId, P2PGossipSync};
 	use crate::routing::router::{
-		add_random_cltv_offset, build_route_from_hops_internal, default_node_features, get_route,
-		BlindedPathCandidate, BlindedTail, CandidateRouteHop, InFlightHtlcs, Path,
-		PaymentParameters, PublicHopCandidate, Route, RouteHint, RouteHintHop, RouteHop,
-		RouteParameters, RoutingFees, ScorerAccountingForInFlightHtlcs,
+		add_random_cltv_offset, build_random_walk_probe_path, build_route_from_hops_internal,
+		default_node_features, get_route, BlindedPathCandidate, BlindedTail, CandidateRouteHop,
+		InFlightHtlcs, Path, Payee, PaymentParameters, PublicHopCandidate, Route, RouteHint,
+		RouteHintHop, RouteHop, RouteParameters, RoutingFees, ScorerAccountingForInFlightHtlcs,
 		DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA, MAX_PATH_LENGTH_ESTIMATE,
 	};
 	use crate::routing::scoring::{
@@ -4111,8 +4273,11 @@ mod tests {
 	use crate::util::ser::Writer;
 	use crate::util::ser::{FixedLengthReader, Readable, ReadableArgs, Writeable};
 	use crate::util::test_utils as ln_test_utils;
+	use alloc::collections::VecDeque;
 
 	use bitcoin::amount::Amount;
+	use bitcoin::bech32::primitives::decode::CheckedHrpstring;
+	use bitcoin::bech32::{ByteIterExt, Fe32IterExt};
 	use bitcoin::constants::ChainHash;
 	use bitcoin::hashes::Hash;
 	use bitcoin::hex::FromHex;
@@ -4124,10 +4289,58 @@ mod tests {
 	use bitcoin::transaction::TxOut;
 	use chacha20_poly1305::chacha20::ChaCha20;
 	use chacha20_poly1305::{Key, Nonce};
+	use lightning_invoice::{Bolt11Bech32, Bolt11Invoice, Currency, InvoiceBuilder};
 
 	use crate::io::Cursor;
 	use crate::prelude::*;
 	use crate::sync::{Arc, Mutex};
+	use crate::types::payment::{PaymentHash, PaymentSecret};
+
+	fn invoice_with_included_payee_pub_key_and_bad_recovery_id() -> (Bolt11Invoice, PublicKey) {
+		let secp_ctx = Secp256k1::new();
+		let private_key = SecretKey::from_slice(&[42; 32]).unwrap();
+		let public_key = PublicKey::from_secret_key(&secp_ctx, &private_key);
+
+		let invoice = InvoiceBuilder::new(Currency::Bitcoin)
+			.description("Test".to_string())
+			.amount_milli_satoshis(1000)
+			.payment_hash(PaymentHash([0; 32]))
+			.payment_secret(PaymentSecret([21; 32]))
+			.payee_pub_key(public_key)
+			.min_final_cltv_expiry_delta(144)
+			.duration_since_epoch(core::time::Duration::from_secs(1234567))
+			.build_signed(|hash| secp_ctx.sign_ecdsa_recoverable(hash, &private_key))
+			.unwrap();
+
+		let invoice_string = invoice.to_string();
+		let parsed = CheckedHrpstring::new::<Bolt11Bech32>(&invoice_string).unwrap();
+		let hrp = parsed.hrp();
+		let mut data: Vec<_> = parsed.fe32_iter::<&mut dyn Iterator<Item = u8>>().collect();
+		let signature_start = data.len() - 104;
+		let mut signature_bytes: Vec<u8> =
+			data[signature_start..].iter().copied().fes_to_bytes().collect();
+		signature_bytes[64] = 2;
+		let signature_data: Vec<_> = signature_bytes.into_iter().bytes_to_fes().collect();
+		data.splice(signature_start.., signature_data);
+
+		let bad_invoice_string = data
+			.into_iter()
+			.with_checksum::<bitcoin::bech32::Bech32>(&hrp)
+			.chars()
+			.collect::<String>();
+		(bad_invoice_string.parse().unwrap(), public_key)
+	}
+
+	#[test]
+	fn payment_params_from_bolt11_invoice_uses_included_payee_pub_key() {
+		let (invoice, public_key) = invoice_with_included_payee_pub_key_and_bad_recovery_id();
+		let payment_params = PaymentParameters::from_bolt11_invoice(&invoice);
+
+		match payment_params.payee {
+			Payee::Clear { node_id, .. } => assert_eq!(node_id, public_key),
+			Payee::Blinded { .. } => panic!("BOLT11 invoice should create a clear payee"),
+		}
+	}
 
 	#[rustfmt::skip]
 	fn get_channel_details(short_channel_id: Option<u64>, node_id: PublicKey,
@@ -4173,6 +4386,7 @@ mod tests {
 			pending_inbound_htlcs: Vec::new(),
 			pending_outbound_htlcs: Vec::new(),
 			current_dust_exposure_msat: None,
+			splice_details: None,
 		}
 	}
 
@@ -4197,6 +4411,93 @@ mod tests {
 			],
 			payinfo
 		)
+	}
+
+	fn probe_first_hop_to_node1(nodes: &[PublicKey]) -> ChannelDetails {
+		get_channel_details(Some(2), nodes[1], InitFeatures::from_le_bytes(vec![0b11]), 1_000_000)
+	}
+
+	#[test]
+	fn random_walk_probe_path_on_real_graph() {
+		let logger = ln_test_utils::TestLogger::new();
+		let (network_graph, _) = match super::bench_utils::read_graph_scorer(&logger) {
+			Ok(res) => res,
+			Err(e) => {
+				eprintln!("{}", e);
+				return;
+			},
+		};
+		let payer = super::bench_utils::payer_pubkey();
+		let entropy = ln_test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
+		let amount_msat = 100_000;
+		let max_hops = 4u8;
+
+		let mut nodes = network_graph.read_only().nodes().clone();
+		let node_ids: Vec<NodeId> = nodes.range(..).map(|(id, _)| *id).collect();
+		assert!(!node_ids.is_empty());
+
+		let mut path = None;
+		for i in 0..64 {
+			let peer = PublicKey::from_slice(node_ids[i % node_ids.len()].as_slice()).unwrap();
+			let first_hop = super::bench_utils::first_hop(peer);
+			if let Ok(built) = build_random_walk_probe_path(
+				&*network_graph,
+				&entropy,
+				&logger,
+				&payer,
+				&[&first_hop],
+				amount_msat,
+				max_hops,
+			) {
+				path = Some(built);
+				break;
+			}
+		}
+		let path = path.expect("failed to build a random-walk probe on the real graph");
+		assert_eq!(path.final_value_msat(), amount_msat);
+		assert_eq!(path.hops.len(), max_hops as usize);
+		assert!(path.total_cltv_expiry_delta() <= DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA);
+		assert!(!path.hops.iter().any(|h| h.pubkey == payer));
+	}
+
+	#[test]
+	fn random_walk_rejects_amount_outside_first_hop_limit() {
+		let (secp_ctx, network_graph, _, _, logger) = build_graph();
+		let (_, our_id, _, nodes) = get_nodes(&secp_ctx);
+		let entropy = ln_test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
+		let mut ch = probe_first_hop_to_node1(&nodes);
+		ch.next_outbound_htlc_limit_msat = 1_000;
+		let err = build_random_walk_probe_path(
+			&network_graph,
+			&entropy,
+			logger,
+			&our_id,
+			&[&ch],
+			10_000,
+			2,
+		)
+		.unwrap_err();
+		assert!(err.contains("no usable first hops"), "{}", err);
+	}
+
+	#[test]
+	fn random_walk_unusable_first_hop_errors() {
+		let (secp_ctx, network_graph, _, _, logger) = build_graph();
+		let (_, our_id, _, nodes) = get_nodes(&secp_ctx);
+		let entropy = ln_test_utils::TestKeysInterface::new(&[42; 32], Network::Testnet);
+		let mut ch = probe_first_hop_to_node1(&nodes);
+		ch.is_usable = false;
+		let err = build_random_walk_probe_path(
+			&network_graph,
+			&entropy,
+			logger,
+			&our_id,
+			&[&ch],
+			10_000,
+			2,
+		)
+		.unwrap_err();
+		assert!(err.contains("no usable first hops"), "{}", err);
 	}
 
 	#[test]
@@ -6752,8 +7053,8 @@ mod tests {
 			cltv_expiry_delta: (5 << 4) | 5,
 			htlc_minimum_msat: 0,
 			htlc_maximum_msat: 99_000,
-			fee_base_msat: u32::max_value(),
-			fee_proportional_millionths: u32::max_value(),
+			fee_base_msat: u32::MAX,
+			fee_proportional_millionths: u32::MAX,
 			excess_data: Vec::new()
 		});
 		update_channel(&gossip_sync, &secp_ctx, &our_privkey, UnsignedChannelUpdate {
@@ -6765,8 +7066,8 @@ mod tests {
 			cltv_expiry_delta: (5 << 4) | 3,
 			htlc_minimum_msat: 0,
 			htlc_maximum_msat: 99_000,
-			fee_base_msat: u32::max_value(),
-			fee_proportional_millionths: u32::max_value(),
+			fee_base_msat: u32::MAX,
+			fee_proportional_millionths: u32::MAX,
 			excess_data: Vec::new()
 		});
 		update_channel(&gossip_sync, &secp_ctx, &privkeys[1], UnsignedChannelUpdate {
@@ -7419,7 +7720,7 @@ mod tests {
 		type ScoreParams = ();
 		#[rustfmt::skip]
 		fn channel_penalty_msat(&self, candidate: &CandidateRouteHop, _: ChannelUsage, _score_params:&Self::ScoreParams) -> u64 {
-			if candidate.short_channel_id() == Some(self.short_channel_id) { u64::max_value()  } else { 0  }
+			if candidate.short_channel_id() == Some(self.short_channel_id) { u64::MAX  } else { 0  }
 		}
 	}
 
@@ -7437,7 +7738,7 @@ mod tests {
 		type ScoreParams = ();
 		#[rustfmt::skip]
 		fn channel_penalty_msat(&self, candidate: &CandidateRouteHop, _: ChannelUsage, _score_params:&Self::ScoreParams) -> u64 {
-			if candidate.target() == Some(self.node_id) { u64::max_value() } else { 0 }
+			if candidate.target() == Some(self.node_id) { u64::MAX } else { 0 }
 		}
 	}
 
@@ -7503,7 +7804,7 @@ mod tests {
 					short_channel_id: 0, fee_msat: 225, cltv_expiry_delta: 0, maybe_announced_channel: true,
 				},
 			], blinded_tail: None }],
-			route_params: None,
+			route_params: RouteParameters::from_payment_params_and_value(PaymentParameters::from_node_id(ln_test_utils::pubkey(42), 0), 225),
 		};
 
 		assert_eq!(route.get_total_fees(), 250);
@@ -7536,7 +7837,7 @@ mod tests {
 					short_channel_id: 0, fee_msat: 150, cltv_expiry_delta: 0, maybe_announced_channel: true,
 				},
 			], blinded_tail: None }],
-			route_params: None,
+			route_params: RouteParameters::from_payment_params_and_value(PaymentParameters::from_node_id(ln_test_utils::pubkey(42), 0), 300),
 		};
 
 		assert_eq!(route.get_total_fees(), 200);
@@ -7548,7 +7849,13 @@ mod tests {
 		// In an earlier version of `Route::get_total_fees` and `Route::get_total_amount`, they
 		// would both panic if the route was completely empty. We test to ensure they return 0
 		// here, even though its somewhat nonsensical as a route.
-		let route = Route { paths: Vec::new(), route_params: None };
+		let route = Route {
+			paths: Vec::new(),
+			route_params: RouteParameters::from_payment_params_and_value(
+				PaymentParameters::from_node_id(ln_test_utils::pubkey(42), 0),
+				0,
+			),
+		};
 
 		assert_eq!(route.get_total_fees(), 0);
 		assert_eq!(route.get_total_amount(), 0);
@@ -7775,7 +8082,7 @@ mod tests {
 		let hops = [nodes[1], nodes[2], nodes[4], nodes[3]];
 		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 100);
 		let route = build_route_from_hops_internal(&our_id, &hops, &route_params, &network_graph,
-			Arc::clone(&logger), &random_seed_bytes).unwrap();
+			Arc::clone(&logger), &random_seed_bytes, None).unwrap();
 		let route_hop_pubkeys = route.paths[0].hops.iter().map(|hop| hop.pubkey).collect::<Vec<_>>();
 		assert_eq!(hops.len(), route.paths[0].hops.len());
 		for (idx, hop_pubkey) in hops.iter().enumerate() {
@@ -8143,7 +8450,7 @@ mod tests {
 				cltv_expiry_delta: 0,
 				maybe_announced_channel: true,
 			}], blinded_tail: None }],
-			route_params: None,
+			route_params: RouteParameters::from_payment_params_and_value(PaymentParameters::from_node_id(ln_test_utils::pubkey(42), 0), 200),
 		};
 		let encoded_route = route.encode();
 		let decoded_route: Route = Readable::read(&mut Cursor::new(&encoded_route[..])).unwrap();
@@ -8339,7 +8646,7 @@ mod tests {
 				excess_final_cltv_expiry_delta: 0,
 				final_value_msat: 200,
 			}),
-		}], route_params: None};
+		}], route_params: RouteParameters::from_payment_params_and_value(PaymentParameters::from_node_id(ln_test_utils::pubkey(42), 0), 200)};
 
 		let payment_params = PaymentParameters::from_node_id(ln_test_utils::pubkey(47), 18);
 		let (_, network_graph, _, _, _) = build_line_graph();
@@ -9187,7 +9494,7 @@ mod tests {
 		assert_eq!(route.paths.len(), 1);
 		assert_eq!(route.get_total_amount(), amt_msat);
 		assert_eq!(route.paths[0].hops.len(), 2);
-		assert_eq!(route.paths[0].hops[0].short_channel_id, 1);
+		assert_eq!(route.paths[0].hops[0].short_channel_id, 44);
 		assert_eq!(route.paths[0].hops[1].short_channel_id, 45);
 		assert_eq!(route.get_total_fees(), 123);
 	}
@@ -9336,6 +9643,67 @@ mod tests {
 		assert_eq!(route.paths[0].hops.len(), 1);
 
 		assert_eq!(route.paths[0].hops[0].short_channel_id, 44);
+	}
+
+	#[test]
+	fn aggregated_prop_fee_overflow_fails_route() {
+		// If the fee cap is disabled, we may consider invoice hints with very large
+		// proportional fees. Aggregating those fees can overflow, in which case we should fail
+		// routing cleanly rather than panic.
+		let secp_ctx = Secp256k1::new();
+		let logger = Arc::new(ln_test_utils::TestLogger::new());
+		let network_graph = Arc::new(NetworkGraph::new(Network::Testnet, Arc::clone(&logger)));
+		let scorer = ln_test_utils::TestScorer::new();
+		let random_seed_bytes = [42; 32];
+		let config = UserConfig::default();
+
+		let (_, our_node_id, _, nodes) = get_nodes(&secp_ctx);
+		let route_hint = RouteHint(vec![
+			RouteHintHop {
+				src_node_id: nodes[0],
+				short_channel_id: 100,
+				fees: RoutingFees { base_msat: 0, proportional_millionths: u32::MAX },
+				cltv_expiry_delta: 10,
+				htlc_minimum_msat: None,
+				htlc_maximum_msat: None,
+			},
+			RouteHintHop {
+				src_node_id: nodes[1],
+				short_channel_id: 101,
+				fees: RoutingFees { base_msat: 0, proportional_millionths: u32::MAX },
+				cltv_expiry_delta: 10,
+				htlc_minimum_msat: None,
+				htlc_maximum_msat: None,
+			},
+		]);
+
+		let payment_params = PaymentParameters::from_node_id(nodes[2], 42)
+			.with_route_hints(vec![route_hint])
+			.unwrap()
+			.with_bolt11_features(channelmanager::provided_bolt11_invoice_features(&config))
+			.unwrap();
+		let first_hops = [get_channel_details(
+			Some(1),
+			nodes[0],
+			channelmanager::provided_init_features(&config),
+			100_000_000,
+		)];
+		let route_params = RouteParameters {
+			payment_params,
+			final_value_msat: 1,
+			max_total_routing_fee_msat: None,
+		};
+		let route = get_route(
+			&our_node_id,
+			&route_params,
+			&network_graph.read_only(),
+			Some(&first_hops.iter().collect::<Vec<_>>()),
+			Arc::clone(&logger),
+			&scorer,
+			&Default::default(),
+			&random_seed_bytes,
+		);
+		assert!(route.is_err());
 	}
 
 	#[test]
@@ -9676,6 +10044,7 @@ pub(crate) mod bench_utils {
 			pending_inbound_htlcs: Vec::new(),
 			pending_outbound_htlcs: Vec::new(),
 			current_dust_exposure_msat: None,
+			splice_details: None,
 		}
 	}
 

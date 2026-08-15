@@ -234,7 +234,7 @@ impl Readable for LSPSRequestId {
 }
 
 /// An object representing datetimes as described in bLIP-50 / LSPS0.
-#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct LSPSDateTime(pub chrono::DateTime<chrono::Utc>);
 
@@ -256,10 +256,9 @@ impl LSPSDateTime {
 		now_seconds_since_epoch > datetime_seconds_since_epoch
 	}
 
-	/// Returns the absolute difference between two datetimes as a `Duration`.
+	/// Returns the elapsed duration from `other` to `self`, or zero if `other` is later.
 	pub fn duration_since(&self, other: &Self) -> Duration {
-		let diff_secs = self.0.timestamp().abs_diff(other.0.timestamp());
-		Duration::from_secs(diff_secs)
+		self.0.signed_duration_since(other.0).to_std().unwrap_or(Duration::ZERO)
 	}
 
 	/// Returns the time in seconds since the unix epoch.
@@ -271,8 +270,23 @@ impl LSPSDateTime {
 impl FromStr for LSPSDateTime {
 	type Err = ();
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let datetime = chrono::DateTime::parse_from_rfc3339(s).map_err(|_| ())?;
-		Ok(Self(datetime.into()))
+		let datetime: chrono::DateTime<chrono::Utc> =
+			chrono::DateTime::parse_from_rfc3339(s).map_err(|_| ())?.into();
+		// Reject pre-epoch datetimes here so peer-controlled `valid_until` /
+		// `expires_at` fields can never produce an `LSPSDateTime` with a negative
+		// UNIX timestamp, which would otherwise panic the `i64 -> u64` cast in
+		// `is_past`.
+		if datetime.timestamp() < 0 {
+			return Err(());
+		}
+		Ok(Self(datetime))
+	}
+}
+
+impl<'de> Deserialize<'de> for LSPSDateTime {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let s = String::deserialize(deserializer)?;
+		Self::from_str(&s).map_err(|()| de::Error::custom("invalid LSPSDateTime"))
 	}
 }
 
@@ -971,6 +985,8 @@ pub(crate) mod u32_fee_rate {
 mod tests {
 	use super::*;
 
+	use core::time::Duration;
+
 	use lightning::io::Cursor;
 
 	#[test]
@@ -980,5 +996,28 @@ mod tests {
 		expected_datetime.write(&mut buf).unwrap();
 		let decoded_datetime: LSPSDateTime = Readable::read(&mut Cursor::new(buf)).unwrap();
 		assert_eq!(expected_datetime, decoded_datetime);
+	}
+
+	#[test]
+	fn datetime_duration_since_is_directional() {
+		let earlier = LSPSDateTime::new_from_duration_since_epoch(Duration::from_secs(30));
+		let later = LSPSDateTime::new_from_duration_since_epoch(Duration::from_secs(90));
+		let later_with_millis =
+			LSPSDateTime::new_from_duration_since_epoch(Duration::from_millis(90_100));
+
+		assert_eq!(later.duration_since(&earlier), Duration::from_secs(60));
+		assert_eq!(later_with_millis.duration_since(&later), Duration::from_millis(100));
+		assert_eq!(earlier.duration_since(&later), Duration::ZERO);
+	}
+
+	#[test]
+	fn is_past_handles_pre_epoch_datetime() {
+		// A peer-controlled RFC3339 datetime before 1970 must be rejected at parse
+		// time, so it can never reach `is_past` (or any other consumer) and panic.
+		assert!(LSPSDateTime::from_str("1900-01-01T00:00:00Z").is_err());
+
+		// JSON deserialization (the path peer messages take) must reject it too.
+		let json = "\"1900-01-01T00:00:00Z\"";
+		assert!(serde_json::from_str::<LSPSDateTime>(json).is_err());
 	}
 }

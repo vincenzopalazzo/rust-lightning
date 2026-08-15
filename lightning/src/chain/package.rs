@@ -86,30 +86,40 @@ pub(crate) fn weight_received_htlc(channel_type_features: &ChannelTypeFeatures) 
 	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_RECEIVED_HTLC_ANCHORS } else { WEIGHT_RECEIVED_HTLC }
 }
 
-/// Verifies deserializable channel type features
-#[rustfmt::skip]
-pub(crate) fn verify_channel_type_features(channel_type_features: &Option<ChannelTypeFeatures>, additional_permitted_features: Option<&ChannelTypeFeatures>) -> Result<(), DecodeError> {
-	if let Some(features) = channel_type_features.as_ref() {
-		if features.requires_unknown_bits() {
-			return Err(DecodeError::UnknownRequiredFeature);
-		}
+/// Resolves and verifies a just-deserialized channel type features field.
+///
+/// `None` is mapped to [`ChannelTypeFeatures::only_static_remote_key`].
+pub(crate) fn verify_channel_type_features(
+	channel_type_features: Option<ChannelTypeFeatures>,
+	additional_permitted_features: Option<&ChannelTypeFeatures>,
+) -> Result<ChannelTypeFeatures, DecodeError> {
+	let mut features =
+		channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key());
 
-		let mut supported_feature_set = ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
-		supported_feature_set.set_scid_privacy_required();
-		supported_feature_set.set_zero_conf_required();
-		supported_feature_set.set_anchor_zero_fee_commitments_required();
-
-		// allow the passing of an additional necessary permitted flag
-		if let Some(additional_permitted_features) = additional_permitted_features {
-			supported_feature_set |= additional_permitted_features;
-		}
-
-		if features.requires_unknown_bits_from(&supported_feature_set) {
-			return Err(DecodeError::UnknownRequiredFeature);
-		}
+	if features.supports_anchor_zero_fee_commitments_staging() {
+		features.clear_anchor_zero_fee_commitments_staging();
+		features.set_anchor_zero_fee_commitments_required();
 	}
 
-	Ok(())
+	if features.requires_unknown_bits() {
+		return Err(DecodeError::UnknownRequiredFeature);
+	}
+
+	let mut supported_feature_set = ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
+	supported_feature_set.set_scid_privacy_required();
+	supported_feature_set.set_zero_conf_required();
+	supported_feature_set.set_anchor_zero_fee_commitments_required();
+
+	// allow the passing of an additional necessary permitted flag
+	if let Some(additional_permitted_features) = additional_permitted_features {
+		supported_feature_set |= additional_permitted_features;
+	}
+
+	if features.requires_unknown_bits_from(&supported_feature_set) {
+		return Err(DecodeError::UnknownRequiredFeature);
+	}
+
+	Ok(features)
 }
 
 // number_of_witness_elements + sig_length + revocation_sig + true_length + op_true + witness_script_length + witness_script
@@ -338,9 +348,7 @@ impl Readable for CounterpartyOfferedHTLCOutput {
 			(13, channel_parameters, (option: ReadableArgs, None)), // Added in 0.2.
 		});
 
-		verify_channel_type_features(&channel_type_features, None)?;
-		let channel_type_features =
-			channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key());
+		let channel_type_features = verify_channel_type_features(channel_type_features, None)?;
 
 		Ok(Self {
 			per_commitment_point: per_commitment_point.0.unwrap(),
@@ -435,9 +443,7 @@ impl Readable for CounterpartyReceivedHTLCOutput {
 			(11, channel_parameters, (option: ReadableArgs, None)), // Added in 0.2.
 		});
 
-		verify_channel_type_features(&channel_type_features, None)?;
-		let channel_type_features =
-			channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key());
+		let channel_type_features = verify_channel_type_features(channel_type_features, None)?;
 
 		Ok(Self {
 			per_commitment_point: per_commitment_point.0.unwrap(),
@@ -610,9 +616,7 @@ impl Readable for HolderHTLCOutput {
 			(9, htlc_descriptor, option), // Added in 0.2.
 		});
 
-		verify_channel_type_features(&channel_type_features, None)?;
-		let channel_type_features =
-			channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key());
+		let channel_type_features = verify_channel_type_features(channel_type_features, None)?;
 
 		Ok(Self {
 			amount_msat: amount_msat.0.unwrap(),
@@ -710,9 +714,7 @@ impl Readable for HolderFundingOutput {
 			(7, channel_parameters, (option: ReadableArgs, None)), // Added in 0.2.
 		});
 
-		verify_channel_type_features(&channel_type_features, None)?;
-		let channel_type_features =
-			channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key());
+		let channel_type_features = verify_channel_type_features(channel_type_features, None)?;
 
 		Ok(Self {
 			funding_redeemscript: funding_redeemscript.0.unwrap(),
@@ -1543,7 +1545,7 @@ impl PackageTemplate {
 	) -> u32 {
 		let feerate_estimate = fee_estimator.bounded_sat_per_1000_weight(conf_target);
 		if self.feerate_previous != 0 {
-			let previous_feerate = self.feerate_previous.try_into().unwrap_or(u32::max_value());
+			let previous_feerate = self.feerate_previous.try_into().unwrap_or(u32::MAX);
 			match feerate_strategy {
 				FeerateStrategy::RetryPrevious => previous_feerate,
 				FeerateStrategy::HighestOfPreviousOrNew => cmp::max(previous_feerate, feerate_estimate),
@@ -1555,7 +1557,7 @@ impl PackageTemplate {
 					// so we choose to bump our previous feerate by 25%, making sure we don't use a
 					// lower feerate or overpay by a large margin by limiting it to 5x the new fee
 					// estimate.
-					let previous_feerate = self.feerate_previous.try_into().unwrap_or(u32::max_value());
+					let previous_feerate = self.feerate_previous.try_into().unwrap_or(u32::MAX);
 					let mut new_feerate = previous_feerate.saturating_add(previous_feerate / 4);
 					if new_feerate > feerate_estimate * 5 {
 						new_feerate = cmp::max(feerate_estimate * 5, previous_feerate);

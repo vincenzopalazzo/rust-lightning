@@ -89,6 +89,9 @@
 //!   vulnerable (see this
 //!   [mailing list post](https://lists.linuxfoundation.org/pipermail/lightning-dev/2020-September/002796.html)
 //!   for more information).
+//! - `AnchorZeroFeeCommitmentsStaging` - this is equivalent to `ZeroFeeCommitments` but was used
+//!   prior to spec finalization. New channels cannot be established with this feature but existing
+//!   channels of this type can be read and are silently converted to `ZeroFeeCommitments`.
 //!
 //! [BOLT #9]: https://github.com/lightning/bolts/blob/master/09-features.md
 
@@ -259,6 +262,10 @@ mod sealed {
 		AnchorZeroFeeCommitments | SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
+		// Byte 7 - 16
+		,,,,,,,,,,
+		// Byte 17
+		AnchorZeroFeeCommitmentsStaging,
 	]);
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
@@ -706,6 +713,17 @@ mod sealed {
 	// By default, allocate enough bytes to cover up to Splice. Update this as new features are
 	// added which we expect to appear commonly across contexts.
 	pub(super) const MIN_FEATURES_ALLOCATION_BYTES: usize = 63_usize.div_ceil(8);
+	define_feature!(
+		141, // The BOLTs PR used feature bit 40/41, so this staging bit was assigned +100
+		AnchorZeroFeeCommitmentsStaging,
+		[ChannelTypeContext],
+		"A flag for `option_zero_fee_commitments` which was used prior to standardization. It is equivalent to `option_zero_fee_commitments`.",
+		set_anchor_zero_fee_commitments_staging_optional,
+		set_anchor_zero_fee_commitments_staging_required,
+		clear_anchor_zero_fee_commitments_staging,
+		supports_anchor_zero_fee_commitments_staging,
+		requires_anchor_zero_fee_commitments_staging
+	);
 	define_feature!(
 		153, // The BOLTs PR uses feature bit 52/53, so add +100 for the experimental bit
 		HtlcHold,
@@ -1268,6 +1286,9 @@ impl<T: sealed::Context> Features<T> {
 	fn set_bit(&mut self, bit: usize, custom: bool) -> Result<(), ()> {
 		let byte_offset = bit / 8;
 		let mask = 1 << (bit - 8 * byte_offset);
+		if byte_offset >= u16::MAX as usize {
+			return Err(());
+		}
 		if byte_offset < T::KNOWN_FEATURE_MASK.len() && custom {
 			if (T::KNOWN_FEATURE_MASK[byte_offset] & mask) != 0 {
 				return Err(());

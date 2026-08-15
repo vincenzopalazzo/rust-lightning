@@ -1,0 +1,60 @@
+name: CI Build Job
+
+on:
+  workflow_call:
+    inputs:
+      script:
+        description: CI script to run (relative to repo root)
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: >-
+          ${{ github.event_name == 'push' && github.ref == 'refs/heads/main'
+            && fromJSON('["debian-trixie","windows","macos"]')
+            || fromJSON('["debian-trixie"]') }}
+        toolchain: >-
+          ${{ github.event_name == 'push' && github.ref == 'refs/heads/main'
+            && fromJSON('["stable","beta","1.75.0"]')
+            || fromJSON('["1.75.0"]') }}
+        exclude:
+          - platform: windows
+          - platform: macos
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout source code
+        uses: https://data.forgejo.org/actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Select Rust toolchain
+        run: |
+          rustup default ${{ matrix.toolchain }}
+      - name: Use rust-lld linker on Windows
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: echo "RUSTFLAGS=-C linker=rust-lld" >> "$GITHUB_ENV"
+      - name: Set RUSTFLAGS to deny warnings
+        if: "matrix.toolchain == '1.75.0'"
+        run: echo "RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+      - name: Install no-std-check dependencies for ARM Embedded
+        if: matrix.platform == 'debian-trixie'
+        run: |
+          rustup target add thumbv7m-none-eabi
+      - name: Download bitcoind/electrs
+        if: matrix.platform != 'windows'
+        run: |
+            CACHE_PATH=/home/ci/dl-cache
+            source ./contrib/download_bitcoind_electrs.sh
+            mkdir bin
+            mv "$BITCOIND_EXE" bin/bitcoind-${{ runner.os }}-${{ runner.arch }}
+            mv "$ELECTRS_EXE" bin/electrs-${{ runner.os }}-${{ runner.arch }}
+      - name: Set bitcoind/electrs environment variables
+        if: matrix.platform != 'windows'
+        run: |
+            echo "BITCOIND_EXE=$( pwd )/bin/bitcoind-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_ENV"
+            echo "ELECTRS_EXE=$( pwd )/bin/electrs-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_ENV"
+      - name: Run CI script
+        shell: bash
+        run: CI_ENV=1 CI_MINIMIZE_DISK_USAGE=1 ./${{ inputs.script }}

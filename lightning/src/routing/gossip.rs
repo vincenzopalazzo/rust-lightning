@@ -862,7 +862,7 @@ impl<G: Deref<Target = NetworkGraph<L>>, U: UtxoLookup, L: Logger> BaseMessageHa
 			msg: GossipTimestampFilter {
 				chain_hash: self.network_graph.chain_hash,
 				first_timestamp: gossip_start_time as u32, // 2106 issue!
-				timestamp_range: u32::max_value(),
+				timestamp_range: u32::MAX,
 			},
 		});
 		Ok(())
@@ -1188,8 +1188,8 @@ impl Readable for ChannelInfo {
 				announcement_received_time,
 				(default_value, 0)
 			),
-			node_one_counter: u32::max_value(),
-			node_two_counter: u32::max_value(),
+			node_one_counter: u32::MAX,
+			node_two_counter: u32::MAX,
 		})
 	}
 }
@@ -1344,7 +1344,7 @@ impl EffectiveCapacity {
 			EffectiveCapacity::AdvertisedMaxHTLC { amount_msat } => *amount_msat,
 			EffectiveCapacity::Total { capacity_msat, .. } => *capacity_msat,
 			EffectiveCapacity::HintMaxHTLC { amount_msat } => *amount_msat,
-			EffectiveCapacity::Infinite => u64::max_value(),
+			EffectiveCapacity::Infinite => u64::MAX,
 			EffectiveCapacity::Unknown => UNKNOWN_CHANNEL_CAPACITY_MSAT,
 		}
 	}
@@ -1624,7 +1624,7 @@ impl Readable for NodeInfo {
 		Ok(NodeInfo {
 			announcement_info: announcement_info_wrap.map(|w| w.0),
 			channels,
-			node_counter: u32::max_value(),
+			node_counter: u32::MAX,
 		})
 	}
 }
@@ -1683,7 +1683,7 @@ impl<L: Logger> ReadableArgs<L> for NetworkGraph<L> {
 		let nodes_count: u64 = Readable::read(reader)?;
 		// There shouldn't be anywhere near `u32::MAX` nodes, and we need some headroom to insert
 		// new nodes during sync, so reject any graphs claiming more than `u32::MAX / 2` nodes.
-		if nodes_count > u32::max_value() as u64 / 2 {
+		if nodes_count > u32::MAX as u64 / 2 {
 			return Err(DecodeError::InvalidValue);
 		}
 		// Pre-allocate 115% of the known channel count to avoid unnecessary reallocations.
@@ -1765,12 +1765,13 @@ impl<L: Logger> PartialEq for NetworkGraph<L> {
 ///
 /// We over-allocate by a bit because ~15% more is better than the double we get if we're slightly
 /// too low.
-const CHAN_COUNT_ESTIMATE: usize = 63_000;
+pub const CHAN_COUNT_ESTIMATE: usize = 63_000;
+
 /// In Jan, 2026 there were about 17K nodes
 ///
 /// We over-allocate by a bit because 15% more is better than the double we get if we're slightly
 /// too low.
-const NODE_COUNT_ESTIMATE: usize = 20_000;
+pub const NODE_COUNT_ESTIMATE: usize = 20_000;
 
 impl<L: Logger> NetworkGraph<L> {
 	/// Creates a new, empty, network graph.
@@ -1803,7 +1804,7 @@ impl<L: Logger> NetworkGraph<L> {
 			let nodes = self.nodes.read().unwrap();
 			let removed_node_counters = self.removed_node_counters.lock().unwrap();
 			let next_counter = self.next_node_counter.load(Ordering::Acquire);
-			assert!(next_counter < (u32::max_value() as usize) / 2);
+			assert!(next_counter < (u32::MAX as usize) / 2);
 			let mut used_node_counters = vec![0u8; next_counter / 8 + 1];
 
 			for counter in removed_node_counters.iter() {
@@ -2030,8 +2031,8 @@ impl<L: Logger> NetworkGraph<L> {
 			capacity_sats,
 			announcement_message: None,
 			announcement_received_time: timestamp,
-			node_one_counter: u32::max_value(),
-			node_two_counter: u32::max_value(),
+			node_one_counter: u32::MAX,
+			node_two_counter: u32::MAX,
 		};
 
 		self.add_channel_between_nodes(short_channel_id, channel_info, None)
@@ -2113,22 +2114,37 @@ impl<L: Logger> NetworkGraph<L> {
 		Ok(())
 	}
 
-	/// If we already have all the information for a channel that we're gonna get, there's no
-	/// reason to redundantly process it.
+	/// If an announcement is trivially bogus, or we already have all the information for a channel
+	/// that we're gonna get, there's no reason to redundantly process it (or check its
+	/// signatures).
 	///
 	/// In those cases, this will return an `Err` that we can return immediately. Otherwise it will
 	/// return an `Ok(())`.
 	fn pre_channel_announcement_validation_check<U: UtxoLookup>(
 		&self, msg: &msgs::UnsignedChannelAnnouncement, utxo_lookup: &Option<U>,
 	) -> Result<(), LightningError> {
-		let channels = self.channels.read().unwrap();
-
 		if msg.node_id_1 >= msg.node_id_2 {
 			return Err(LightningError {
 				err: "node_ids in channel_announcements must be sorted".to_owned(),
 				action: ErrorAction::IgnoreError,
 			});
 		}
+
+		if msg.bitcoin_key_1 == msg.bitcoin_key_2 {
+			return Err(LightningError {
+				err: "Channel announcement node had a channel with itself".to_owned(),
+				action: ErrorAction::IgnoreError,
+			});
+		}
+
+		if msg.chain_hash != self.chain_hash {
+			return Err(LightningError {
+				err: "Channel announcement chain hash does not match genesis hash".to_owned(),
+				action: ErrorAction::IgnoreAndLog(Level::Debug),
+			});
+		}
+
+		let channels = self.channels.read().unwrap();
 
 		if let Some(chan) = channels.get(&msg.short_channel_id) {
 			if chan.capacity_sats.is_some() {
@@ -2170,20 +2186,6 @@ impl<L: Logger> NetworkGraph<L> {
 		&self, msg: &msgs::UnsignedChannelAnnouncement,
 		full_msg: Option<&msgs::ChannelAnnouncement>, utxo_lookup: &Option<U>,
 	) -> Result<(), LightningError> {
-		if msg.node_id_1 == msg.node_id_2 || msg.bitcoin_key_1 == msg.bitcoin_key_2 {
-			return Err(LightningError {
-				err: "Channel announcement node had a channel with itself".to_owned(),
-				action: ErrorAction::IgnoreError,
-			});
-		}
-
-		if msg.chain_hash != self.chain_hash {
-			return Err(LightningError {
-				err: "Channel announcement chain hash does not match genesis hash".to_owned(),
-				action: ErrorAction::IgnoreAndLog(Level::Debug),
-			});
-		}
-
 		{
 			let removed_channels = self.removed_channels.lock().unwrap();
 			let removed_nodes = self.removed_nodes.lock().unwrap();
@@ -2223,8 +2225,8 @@ impl<L: Logger> NetworkGraph<L> {
 				None
 			},
 			announcement_received_time,
-			node_one_counter: u32::max_value(),
-			node_two_counter: u32::max_value(),
+			node_one_counter: u32::MAX,
+			node_two_counter: u32::MAX,
 		};
 
 		self.add_channel_between_nodes(msg.short_channel_id, chan_info, utxo_value)?;
@@ -2355,7 +2357,7 @@ impl<L: Logger> NetworkGraph<L> {
 	pub fn remove_stale_channels_and_tracking_with_time(&self, current_time_unix: u64) {
 		let mut channels = self.channels.write().unwrap();
 		// Time out if we haven't received an update in at least 14 days.
-		if current_time_unix > u32::max_value() as u64 {
+		if current_time_unix > u32::MAX as u64 {
 			return;
 		} // Remove by 2106
 		if current_time_unix < STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS {
@@ -3932,7 +3934,7 @@ pub(crate) mod tests {
 						(msg.first_timestamp as u64)
 							< expected_timestamp - 60 * 60 * 24 * 7 * 2 + 10
 					);
-					assert_eq!(msg.timestamp_range, u32::max_value());
+					assert_eq!(msg.timestamp_range, u32::MAX);
 				},
 				_ => panic!("Expected MessageSendEvent::SendChannelRangeQuery"),
 			};

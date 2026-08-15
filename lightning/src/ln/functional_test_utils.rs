@@ -20,14 +20,14 @@ use crate::events::bump_transaction::sync::BumpTransactionEventHandlerSync;
 use crate::events::bump_transaction::BumpTransactionEvent;
 use crate::events::{
 	ClaimedHTLC, ClosureReason, Event, FundingInfo, HTLCHandlingFailureType,
-	NegotiationFailureReason, PaidBolt12Invoice, PathFailure, PaymentFailureReason, PaymentPurpose,
+	NegotiationFailureReason, PathFailure, PaymentFailureReason, PaymentPurpose,
 };
 use crate::ln::chan_utils::{
 	commitment_tx_base_weight, COMMITMENT_TX_WEIGHT_PER_HTLC, TRUC_MAX_WEIGHT,
 };
 use crate::ln::channelmanager::{
 	AChannelManager, ChainParameters, ChannelManager, ChannelManagerReadArgs, PaymentId,
-	RAACommitmentOrder, TrustedChannelFeatures, MIN_CLTV_EXPIRY_DELTA,
+	RAACommitmentOrder, TrustedChannelFeatures, TxSignaturesOrder, MIN_CLTV_EXPIRY_DELTA,
 };
 use crate::ln::funding::FundingContribution;
 use crate::ln::msgs::{self, OpenChannel};
@@ -39,6 +39,7 @@ use crate::ln::outbound_payment::RecipientOnionFields;
 use crate::ln::outbound_payment::Retry;
 use crate::ln::peer_handler::IgnoringMessageHandler;
 use crate::ln::types::ChannelId;
+use crate::offers::payer_proof::PaidBolt12Invoice;
 use crate::onion_message::messenger::OnionMessenger;
 use crate::routing::gossip::{NetworkGraph, NetworkUpdate, P2PGossipSync};
 use crate::routing::router::{self, PaymentParameters, Route, RouteParameters};
@@ -70,6 +71,7 @@ use bitcoin::script::ScriptBuf;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::transaction::{self, Version as TxVersion};
 use bitcoin::transaction::{Transaction, TxIn, TxOut};
+use bitcoin::OutPoint as BitcoinOutPoint;
 use bitcoin::WPubkeyHash;
 
 use crate::io;
@@ -203,6 +205,9 @@ pub enum ConnectStyle {
 	/// Provides the full block via the `chain::Listen` interface. In the current code this is
 	/// equivalent to `TransactionsFirst` with some additional assertions.
 	FullBlockViaListen,
+	/// Provides the full block via the `chain::Listen` interface, but replays it a second time
+	/// similar to what a filtering client might do.
+	ReplayedFullBlockViaListen,
 	/// Provides the full block via the `chain::Listen` interface, condensing multiple block
 	/// disconnections into a single `blocks_disconnected` call.
 	FullBlockDisconnectionsSkippingViaListen,
@@ -220,6 +225,7 @@ impl ConnectStyle {
 			ConnectStyle::HighlyRedundantTransactionsFirstSkippingBlocks => true,
 			ConnectStyle::TransactionsFirstReorgsOnlyTip => true,
 			ConnectStyle::FullBlockViaListen => false,
+			ConnectStyle::ReplayedFullBlockViaListen => false,
 			ConnectStyle::FullBlockDisconnectionsSkippingViaListen => false,
 		}
 	}
@@ -235,6 +241,7 @@ impl ConnectStyle {
 			ConnectStyle::HighlyRedundantTransactionsFirstSkippingBlocks => false,
 			ConnectStyle::TransactionsFirstReorgsOnlyTip => false,
 			ConnectStyle::FullBlockViaListen => false,
+			ConnectStyle::ReplayedFullBlockViaListen => true,
 			ConnectStyle::FullBlockDisconnectionsSkippingViaListen => false,
 		}
 	}
@@ -243,7 +250,7 @@ impl ConnectStyle {
 		use core::hash::{BuildHasher, Hasher};
 		// Get a random value using the only std API to do so - the DefaultHasher
 		let rand_val = std::collections::hash_map::RandomState::new().build_hasher().finish();
-		let res = match rand_val % 10 {
+		let res = match rand_val % 11 {
 			0 => ConnectStyle::BestBlockFirst,
 			1 => ConnectStyle::BestBlockFirstSkippingBlocks,
 			2 => ConnectStyle::BestBlockFirstReorgsOnlyTip,
@@ -253,7 +260,8 @@ impl ConnectStyle {
 			6 => ConnectStyle::HighlyRedundantTransactionsFirstSkippingBlocks,
 			7 => ConnectStyle::TransactionsFirstReorgsOnlyTip,
 			8 => ConnectStyle::FullBlockViaListen,
-			9 => ConnectStyle::FullBlockDisconnectionsSkippingViaListen,
+			9 => ConnectStyle::ReplayedFullBlockViaListen,
+			10 => ConnectStyle::FullBlockDisconnectionsSkippingViaListen,
 			_ => unreachable!(),
 		};
 		eprintln!("Using Block Connection Style: {:?}", res);
@@ -315,11 +323,25 @@ fn do_connect_block_with_consistency_checks<'a, 'b, 'c, 'd>(
 fn do_connect_block_without_consistency_checks<'a, 'b, 'c, 'd>(
 	node: &'a Node<'b, 'c, 'd>, block: Block, skip_intermediaries: bool,
 ) {
-	let height = node.best_block_info().1 + 1;
 	eprintln!("Connecting block using Block Connection Style: {:?}", *node.connect_style.borrow());
-	// Update the block internally before handing it over to LDK, to ensure our assertions regarding
-	// transaction broadcast are correct.
-	node.blocks.lock().unwrap().push((block.clone(), height));
+	let (new_block, height) = {
+		let mut blocks = node.blocks.lock().unwrap();
+		let existing =
+			blocks.iter().rev().find(|(candidate, _)| candidate == &block).map(|(_, h)| *h);
+		if let Some(height) = existing {
+			// We're being handed a block we've already connected, i.e. this is a redundant rescan
+			// rather than a new block. Reuse the height it was originally connected at rather than
+			// extending the chain.
+			(false, height)
+		} else {
+			let height = blocks.last().unwrap().1 + 1;
+			// Update the block internally before handing it over to LDK, to ensure our assertions
+			// regarding transaction broadcast are correct.
+			blocks.push((block.clone(), height));
+			(true, height)
+		}
+	};
+
 	if !skip_intermediaries {
 		let txdata: Vec<_> = block.txdata.iter().enumerate().collect();
 		match *node.connect_style.borrow() {
@@ -389,17 +411,26 @@ fn do_connect_block_without_consistency_checks<'a, 'b, 'c, 'd>(
 				node.chain_monitor.chain_monitor.block_connected(&block, height);
 				node.node.block_connected(&block, height);
 			},
+			ConnectStyle::ReplayedFullBlockViaListen => {
+				let header = &block.header;
+				node.chain_monitor.chain_monitor.filtered_block_connected(header, &[], height);
+				node.node.filtered_block_connected(header, &[], height);
+				node.chain_monitor.chain_monitor.block_connected(&block, height);
+				node.node.block_connected(&block, height);
+			},
 		}
 	}
 
-	for tx in &block.txdata {
-		for input in &tx.input {
-			node.wallet_source.remove_utxo(input.previous_output);
-		}
-		let wallet_script = node.wallet_source.get_change_script().unwrap();
-		for (idx, output) in tx.output.iter().enumerate() {
-			if output.script_pubkey == wallet_script {
-				node.wallet_source.add_utxo(tx.clone(), idx as u32);
+	if new_block {
+		for tx in &block.txdata {
+			for input in &tx.input {
+				node.wallet_source.remove_utxo(input.previous_output);
+			}
+			let wallet_script = node.wallet_source.get_change_script().unwrap();
+			for (idx, output) in tx.output.iter().enumerate() {
+				if output.script_pubkey == wallet_script {
+					node.wallet_source.add_utxo(tx.clone(), idx as u32);
+				}
 			}
 		}
 	}
@@ -446,7 +477,7 @@ pub fn disconnect_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, count: u32)
 		let prev = node.blocks.lock().unwrap().last().unwrap().clone();
 
 		match *node.connect_style.borrow() {
-			ConnectStyle::FullBlockViaListen => {
+			ConnectStyle::FullBlockViaListen | ConnectStyle::ReplayedFullBlockViaListen => {
 				let best_block = BlockLocator::new(orig.0.header.prev_blockhash, orig.1 - 1);
 				node.chain_monitor.chain_monitor.blocks_disconnected(best_block);
 				Listen::blocks_disconnected(node.node, best_block);
@@ -1023,7 +1054,7 @@ pub fn get_updates_and_revoke<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 macro_rules! get_event_msg {
 	($node: expr, $event_type: path, $node_id: expr) => {{
 		let events = $node.node.get_and_clear_pending_msg_events();
-		assert_eq!(events.len(), 1);
+		assert_eq!(events.len(), 1, "{events:?}");
 		match events[0] {
 			$event_type { ref node_id, ref msg } => {
 				assert_eq!(*node_id, $node_id);
@@ -3016,6 +3047,7 @@ pub fn expect_payment_sent<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 			ref amount_msat,
 			ref fee_paid_msat,
 			ref bolt12_invoice,
+			..
 		} => {
 			assert_eq!(expected_payment_preimage, *payment_preimage);
 			assert_eq!(expected_payment_hash, *payment_hash);
@@ -3095,6 +3127,7 @@ pub fn expect_payment_forwarded<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 			total_fee_earned_msat,
 			skimmed_fee_msat,
 			claim_from_onchain_tx,
+			outbound_amount_forwarded_msat,
 			..
 		} => {
 			assert_eq!(prev_htlcs.len(), 1);
@@ -3113,6 +3146,19 @@ pub fn expect_payment_forwarded<CM: AChannelManager, H: NodeHolder<CM = CM>>(
 			// Check that the (knowingly) withheld amount is always less or equal to the expected
 			// overpaid amount.
 			assert!(skimmed_fee_msat == expected_extra_fees_msat);
+			match expected_fee {
+				Some(_) => {
+					let actual_fee = total_fee_earned_msat.unwrap();
+					assert_eq!(next_htlcs[0].amount_msat, Some(outbound_amount_forwarded_msat));
+					assert_eq!(
+						prev_htlcs[0].amount_msat,
+						Some(next_htlcs[0].amount_msat.unwrap() + actual_fee)
+					);
+				},
+				None => {
+					assert_eq!(total_fee_earned_msat, None);
+				},
+			}
 			if !upstream_force_closed {
 				let prev_node_id = prev_htlcs[0].node_id.unwrap();
 				let prev_channel_id = prev_htlcs[0].channel_id;
@@ -3231,33 +3277,44 @@ pub fn expect_splice_pending_event<'a, 'b, 'c, 'd>(
 }
 
 #[cfg(any(test, ldk_bench, feature = "_test_utils"))]
-pub fn expect_splice_failed_events<'a, 'b, 'c, 'd>(
-	node: &'a Node<'b, 'c, 'd>, expected_channel_id: &ChannelId,
-	funding_contribution: FundingContribution, expected_reason: NegotiationFailureReason,
-) {
+pub fn expect_failed_rbf_events<'a, 'b, 'c>(
+	node: &Node<'a, 'b, 'c>, expected_channel_id: &ChannelId,
+	expected_contribution: &FundingContribution, expected_reason: NegotiationFailureReason,
+) -> (Vec<BitcoinOutPoint>, Vec<ScriptBuf>) {
 	let events = node.node.get_and_clear_pending_events();
-	assert_eq!(events.len(), 2);
-	match &events[0] {
-		Event::DiscardFunding { funding_info, .. } => {
-			if let FundingInfo::Contribution { inputs, outputs } = &funding_info {
-				let (expected_inputs, expected_outputs) =
-					funding_contribution.clone().into_contributed_inputs_and_outputs();
-				assert_eq!(*inputs, expected_inputs);
-				assert_eq!(*outputs, expected_outputs);
-			} else {
-				panic!("Expected FundingInfo::Contribution");
-			}
+	assert_eq!(events.len(), 2, "{events:?}");
+	let discarded = match &events[0] {
+		Event::DiscardFunding {
+			channel_id,
+			funding_info: FundingInfo::Contribution { inputs, outputs },
+		} => {
+			assert_eq!(channel_id, expected_channel_id);
+			(inputs.clone(), outputs.clone())
 		},
-		_ => panic!("Unexpected event"),
-	}
+		other => panic!("Expected DiscardFunding, got {other:?}"),
+	};
 	match &events[1] {
 		Event::SpliceNegotiationFailed { channel_id, reason, contribution, .. } => {
-			assert_eq!(*expected_channel_id, *channel_id);
-			assert_eq!(expected_reason, *reason);
-			assert_eq!(contribution.as_ref(), Some(&funding_contribution));
+			assert_eq!(channel_id, expected_channel_id);
+			assert_eq!(*reason, expected_reason);
+			assert_eq!(contribution.as_ref(), Some(expected_contribution));
 		},
-		_ => panic!("Unexpected event"),
+		other => panic!("Expected SpliceNegotiationFailed, got {other:?}"),
 	}
+	discarded
+}
+
+#[cfg(any(test, ldk_bench, feature = "_test_utils"))]
+pub fn expect_splice_failed_events<'a, 'b, 'c>(
+	node: &Node<'a, 'b, 'c>, expected_channel_id: &ChannelId,
+	funding_contribution: FundingContribution, expected_reason: NegotiationFailureReason,
+) {
+	let (discarded_inputs, discarded_outputs) =
+		expect_failed_rbf_events(node, expected_channel_id, &funding_contribution, expected_reason);
+	let (expected_inputs, expected_outputs) =
+		funding_contribution.into_contributed_inputs_and_outputs();
+	assert_eq!(discarded_inputs, expected_inputs);
+	assert_eq!(discarded_outputs, expected_outputs);
 }
 
 #[cfg(any(test, ldk_bench, feature = "_test_utils"))]
@@ -3492,14 +3549,14 @@ pub fn send_along_route_with_secret<'a, 'b, 'c>(
 	recv_value: u64, our_payment_hash: PaymentHash, our_payment_secret: PaymentSecret,
 ) -> PaymentId {
 	let payment_id = PaymentId(origin_node.keys_manager.backing.get_secure_random_bytes());
-	origin_node.router.expect_find_route(route.route_params.clone().unwrap(), Ok(route.clone()));
+	origin_node.router.expect_find_route(route.route_params.clone(), Ok(route.clone()));
 	origin_node
 		.node
 		.send_payment(
 			our_payment_hash,
 			RecipientOnionFields::secret_only(our_payment_secret, recv_value),
 			payment_id,
-			route.route_params.unwrap(),
+			route.route_params,
 			Retry::Attempts(0),
 		)
 		.unwrap();
@@ -4779,6 +4836,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(
 			},
 			"TRANSACTIONS_FIRST_REORGS_ONLY_TIP" => ConnectStyle::TransactionsFirstReorgsOnlyTip,
 			"FULL_BLOCK_VIA_LISTEN" => ConnectStyle::FullBlockViaListen,
+			"REPLAYED_FULL_BLOCK_VIA_LISTEN" => ConnectStyle::ReplayedFullBlockViaListen,
 			"FULL_BLOCK_DISCONNECTIONS_SKIPPING_VIA_LISTEN" => {
 				ConnectStyle::FullBlockDisconnectionsSkippingViaListen
 			},
@@ -4799,6 +4857,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(
 			&chan_mgrs[i],
 			IgnoringMessageHandler {},
 			IgnoringMessageHandler {},
+			true,
 		);
 		let gossip_sync = P2PGossipSync::new(cfgs[i].network_graph.as_ref(), None, cfgs[i].logger);
 		let wallet_source = Arc::new(test_utils::TestWalletSource::new(
@@ -5197,6 +5256,18 @@ macro_rules! handle_chan_reestablish_msgs {
 			stfu = Some(msg.clone());
 		}
 
+		let mut tx_signatures = None;
+		let mut tx_signatures_order =
+			$crate::ln::channelmanager::TxSignaturesOrder::CommitmentFirst;
+		if let Some(&MessageSendEvent::SendTxSignatures { ref node_id, ref msg }) =
+			msg_events.get(idx)
+		{
+			assert_eq!(*node_id, $dst_node.node.get_our_node_id());
+			tx_signatures = Some(msg.clone());
+			tx_signatures_order = $crate::ln::channelmanager::TxSignaturesOrder::SignaturesFirst;
+			idx += 1;
+		}
+
 		let mut revoke_and_ack = None;
 		let mut commitment_update = None;
 		let order = if let Some(ev) = msg_events.get(idx) {
@@ -5245,13 +5316,14 @@ macro_rules! handle_chan_reestablish_msgs {
 			}
 		}
 
-		let mut tx_signatures = None;
-		if let Some(&MessageSendEvent::SendTxSignatures { ref node_id, ref msg }) =
-			msg_events.get(idx)
-		{
-			assert_eq!(*node_id, $dst_node.node.get_our_node_id());
-			tx_signatures = Some(msg.clone());
-			idx += 1;
+		if tx_signatures.is_none() {
+			if let Some(&MessageSendEvent::SendTxSignatures { ref node_id, ref msg }) =
+				msg_events.get(idx)
+			{
+				assert_eq!(*node_id, $dst_node.node.get_our_node_id());
+				tx_signatures = Some(msg.clone());
+				idx += 1;
+			}
 		}
 
 		if let Some(&MessageSendEvent::SendAnnouncementSignatures { ref node_id, ref msg }) =
@@ -5281,6 +5353,7 @@ macro_rules! handle_chan_reestablish_msgs {
 			tx_signatures,
 			stfu,
 			tx_abort,
+			tx_signatures_order,
 		)
 	}};
 }
@@ -5436,8 +5509,25 @@ pub fn reconnect_nodes<'a, 'b, 'c, 'd>(args: ReconnectArgs<'a, 'b, 'c, 'd>) {
 				&& pending_cell_htlc_claims.1 == 0
 				&& pending_cell_htlc_fails.1 == 0)
 	);
+	let pending_commitment_update = (
+		pending_htlc_adds.0 != 0
+			|| pending_htlc_claims.0 != 0
+			|| pending_htlc_fails.0 != 0
+			|| pending_cell_htlc_claims.0 != 0
+			|| pending_cell_htlc_fails.0 != 0
+			|| pending_responding_commitment_signed.0,
+		pending_htlc_adds.1 != 0
+			|| pending_htlc_claims.1 != 0
+			|| pending_htlc_fails.1 != 0
+			|| pending_cell_htlc_claims.1 != 0
+			|| pending_cell_htlc_fails.1 != 0
+			|| pending_responding_commitment_signed.1,
+	);
 
 	for mut chan_msgs in resp_1.drain(..) {
+		if send_interactive_tx_sigs.0 && pending_commitment_update.0 {
+			assert_eq!(chan_msgs.8, TxSignaturesOrder::SignaturesFirst);
+		}
 		if send_channel_ready.0 {
 			node_a.node.handle_channel_ready(node_b_id, &chan_msgs.0.unwrap());
 			let announcement_event = node_a.node.get_and_clear_pending_msg_events();
@@ -5499,13 +5589,7 @@ pub fn reconnect_nodes<'a, 'b, 'c, 'd>(args: ReconnectArgs<'a, 'b, 'c, 'd>) {
 		} else {
 			assert!(chan_msgs.1.is_none());
 		}
-		if pending_htlc_adds.0 != 0
-			|| pending_htlc_claims.0 != 0
-			|| pending_htlc_fails.0 != 0
-			|| pending_cell_htlc_claims.0 != 0
-			|| pending_cell_htlc_fails.0 != 0
-			|| pending_responding_commitment_signed.0
-		{
+		if pending_commitment_update.0 {
 			let commitment_update = chan_msgs.2.unwrap();
 			assert_eq!(commitment_update.update_add_htlcs.len(), pending_htlc_adds.0);
 			assert_eq!(
@@ -5554,6 +5638,9 @@ pub fn reconnect_nodes<'a, 'b, 'c, 'd>(args: ReconnectArgs<'a, 'b, 'c, 'd>) {
 	}
 
 	for mut chan_msgs in resp_2.drain(..) {
+		if send_interactive_tx_sigs.1 && pending_commitment_update.1 {
+			assert_eq!(chan_msgs.8, TxSignaturesOrder::SignaturesFirst);
+		}
 		if send_channel_ready.1 {
 			node_b.node.handle_channel_ready(node_a_id, &chan_msgs.0.unwrap());
 			let announcement_event = node_b.node.get_and_clear_pending_msg_events();
@@ -5615,13 +5702,7 @@ pub fn reconnect_nodes<'a, 'b, 'c, 'd>(args: ReconnectArgs<'a, 'b, 'c, 'd>) {
 		} else {
 			assert!(chan_msgs.1.is_none());
 		}
-		if pending_htlc_adds.1 != 0
-			|| pending_htlc_claims.1 != 0
-			|| pending_htlc_fails.1 != 0
-			|| pending_cell_htlc_claims.1 != 0
-			|| pending_cell_htlc_fails.1 != 0
-			|| pending_responding_commitment_signed.1
-		{
+		if pending_commitment_update.1 {
 			let commitment_update = chan_msgs.2.unwrap();
 			assert_eq!(commitment_update.update_add_htlcs.len(), pending_htlc_adds.1);
 			assert_eq!(
@@ -5779,25 +5860,29 @@ pub fn get_scid_from_channel_id<'a, 'b, 'c>(node: &Node<'a, 'b, 'c>, channel_id:
 ///
 /// The resulting tail contains blinded hops built from `intermediate_nodes` plus a dummy receive
 /// TLV, with the `TrampolineHop` fee and CLTV derived from the blinded path's aggregated payinfo.
+/// The constructed [`BlindedPaymentPath`] is also returned so callers can register it in
+/// [`PaymentParameters`].
+///
+/// [`PaymentParameters`]: crate::routing::router::PaymentParameters
 pub fn create_trampoline_forward_blinded_tail<ES: EntropySource>(
 	secp_ctx: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>, entropy_source: ES,
 	intermediate_nodes: &[ForwardNode<TrampolineForwardTlvs>], payee_node_id: PublicKey,
 	payee_receive_key: ReceiveAuthKey, payee_tlvs: ReceiveTlvs, min_final_cltv_expiry_delta: u32,
 	excess_final_cltv_delta: u32, final_value_msat: u64,
-) -> BlindedTail {
+) -> (BlindedTail, BlindedPaymentPath) {
 	let blinded_path = BlindedPaymentPath::new_for_trampoline(
 		intermediate_nodes,
 		payee_node_id,
 		payee_receive_key,
 		payee_tlvs,
-		u64::max_value(),
+		u64::MAX,
 		min_final_cltv_expiry_delta as u16,
 		entropy_source,
 		secp_ctx,
 	)
 	.unwrap();
 
-	BlindedTail {
+	let tail = BlindedTail {
 		trampoline_hops: vec![TrampolineHop {
 			pubkey: intermediate_nodes.first().map(|n| n.node_id).unwrap_or(payee_node_id),
 			node_features: types::features::Features::empty(),
@@ -5816,5 +5901,6 @@ pub fn create_trampoline_forward_blinded_tail<ES: EntropySource>(
 		blinding_point: blinded_path.blinding_point(),
 		excess_final_cltv_expiry_delta: excess_final_cltv_delta,
 		final_value_msat,
-	}
+	};
+	(tail, blinded_path)
 }
