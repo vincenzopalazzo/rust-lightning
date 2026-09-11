@@ -609,17 +609,6 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		})
 	}
 
-	/// Re-derives the signing keys of an offer created by this flow with `offer_nonce`.
-	///
-	/// Used to produce `invreq_payer_bip_353_signature` when revealing a BIP 353 name.
-	pub fn derive_offer_signing_keys(
-		&self, offer: &Offer, offer_nonce: Nonce,
-	) -> Result<bitcoin::secp256k1::Keypair, Bolt12SemanticError> {
-		offer
-			.derive_issuer_signing_keys(offer_nonce, &self.inbound_payment_key, &self.secp_ctx)
-			.map_err(|()| Bolt12SemanticError::InvalidMetadata)
-	}
-
 	/// Computes the BLIP 42 contact secret shared between us and a contact, deterministically
 	/// derived from one of our offers and the contact's offer.
 	///
@@ -637,14 +626,19 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	pub fn compute_contact_secret(
 		&self, our_offer: &Offer, our_offer_nonce: Nonce, their_offer: &Offer,
 	) -> Result<ContactSecrets, Bolt12SemanticError> {
-		let expanded_key = &self.inbound_payment_key;
-		let secp_ctx = &self.secp_ctx;
+		let keys = self.derive_offer_signing_keys(our_offer, our_offer_nonce)?;
+		compute_contact_secret(&keys.secret_key(), their_offer)
+	}
 
-		let keys = our_offer
-			.derive_issuer_signing_keys(our_offer_nonce, expanded_key, secp_ctx)
-			.map_err(|()| Bolt12SemanticError::InvalidMetadata)?;
-
-		compute_contact_secret(secp_ctx, &keys.secret_key(), their_offer)
+	/// Re-derives the signing keys of an offer created by this flow with `offer_nonce`.
+	///
+	/// Used to produce `invreq_payer_bip_353_signature` when revealing a BIP 353 name.
+	pub fn derive_offer_signing_keys(
+		&self, offer: &Offer, offer_nonce: Nonce,
+	) -> Result<bitcoin::secp256k1::Keypair, Bolt12SemanticError> {
+		offer
+			.derive_issuer_signing_keys(offer_nonce, &self.inbound_payment_key, &self.secp_ctx)
+			.map_err(|()| Bolt12SemanticError::InvalidMetadata)
 	}
 
 	/// Creates an [`OfferBuilder`] such that the [`Offer`] it builds is recognized by the
