@@ -15,9 +15,8 @@ use crate::io;
 use crate::ln::inbound_payment::ExpandedKey;
 use crate::ln::msgs::DecodeError;
 use crate::offers::invoice::{
-	check_invoice_signing_pubkey, construct_payment_paths, filter_fallbacks,
-	ExperimentalInvoiceTlvStream, ExperimentalInvoiceTlvStreamRef, FallbackAddress,
-	InvoiceTlvStream, InvoiceTlvStreamRef,
+	construct_payment_paths, filter_fallbacks, ExperimentalInvoiceTlvStream,
+	ExperimentalInvoiceTlvStreamRef, FallbackAddress, InvoiceTlvStream, InvoiceTlvStreamRef,
 };
 #[cfg(test)]
 use crate::offers::invoice_macros::invoice_builder_methods_test_common;
@@ -711,11 +710,6 @@ impl TryFrom<PartialInvoiceTlvStream> for InvoiceContents {
 		let features = features.unwrap_or_else(Bolt12InvoiceFeatures::empty);
 
 		let signing_pubkey = node_id.ok_or(Bolt12SemanticError::MissingSigningPubkey)?;
-		check_invoice_signing_pubkey(
-			&signing_pubkey,
-			offer_tlv_stream.issuer_id.as_ref(),
-			offer_tlv_stream.paths.as_deref(),
-		)?;
 
 		if offer_tlv_stream.paths.is_none() {
 			return Err(Bolt12SemanticError::MissingPaths);
@@ -724,8 +718,13 @@ impl TryFrom<PartialInvoiceTlvStream> for InvoiceContents {
 			return Err(Bolt12SemanticError::UnexpectedChain);
 		}
 
+		let offer = OfferContents::try_from((offer_tlv_stream, experimental_offer_tlv_stream))?;
+		if !offer.key_can_sign_invoice(&signing_pubkey) {
+			return Err(Bolt12SemanticError::InvalidSigningPubkey);
+		}
+
 		Ok(InvoiceContents {
-			offer: OfferContents::try_from((offer_tlv_stream, experimental_offer_tlv_stream))?,
+			offer,
 			payment_paths,
 			held_htlc_available_paths,
 			created_at,

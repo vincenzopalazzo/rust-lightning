@@ -1,0 +1,3 @@
+# API Updates
+ * `Offer::key_can_sign_invoice` answers whether a key can sign an invoice for the offer: the
+   issuer id when the offer has one, otherwise a path's final blinded node id.

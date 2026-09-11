@@ -1806,12 +1806,6 @@ impl TryFrom<PartialInvoiceTlvStream> for InvoiceContents {
 			experimental_baz,
 		};
 
-		check_invoice_signing_pubkey(
-			&fields.signing_pubkey,
-			offer_tlv_stream.issuer_id.as_ref(),
-			offer_tlv_stream.paths.as_deref(),
-		)?;
-
 		if offer_tlv_stream.issuer_id.is_none() && offer_tlv_stream.paths.is_none() {
 			let refund = RefundContents::try_from((
 				payer_tlv_stream,
@@ -1834,6 +1828,10 @@ impl TryFrom<PartialInvoiceTlvStream> for InvoiceContents {
 				experimental_offer_tlv_stream,
 				experimental_invoice_request_tlv_stream,
 			))?;
+
+			if !invoice_request.inner.offer.key_can_sign_invoice(&fields.signing_pubkey) {
+				return Err(Bolt12SemanticError::InvalidSigningPubkey);
+			}
 
 			if let Some(requested_amount_msats) = invoice_request.amount_msats() {
 				if amount_msats != requested_amount_msats {
@@ -1862,30 +1860,6 @@ pub(super) fn construct_payment_paths(
 			.map(|(payinfo, path)| BlindedPaymentPath::from_parts(path, payinfo))
 			.collect::<Vec<_>>()),
 	}
-}
-
-pub(super) fn check_invoice_signing_pubkey(
-	invoice_signing_pubkey: &PublicKey, issuer_id: Option<&PublicKey>,
-	paths: Option<&[BlindedMessagePath]>,
-) -> Result<(), Bolt12SemanticError> {
-	match (issuer_id, paths) {
-		(Some(issuer_signing_pubkey), _) => {
-			if invoice_signing_pubkey != issuer_signing_pubkey {
-				return Err(Bolt12SemanticError::InvalidSigningPubkey);
-			}
-		},
-		(None, Some(paths)) => {
-			if !paths
-				.iter()
-				.filter_map(|path| path.blinded_hops().last())
-				.any(|last_hop| invoice_signing_pubkey == &last_hop.blinded_node_id)
-			{
-				return Err(Bolt12SemanticError::InvalidSigningPubkey);
-			}
-		},
-		_ => {},
-	}
-	Ok(())
 }
 
 #[cfg(test)]
