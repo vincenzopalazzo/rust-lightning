@@ -42,9 +42,9 @@ use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::util::ser::{Readable, Writeable, Writer};
 use bitcoin::hashes::cmp::fixed_time_eq;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
+use bitcoin::secp256k1::ecdh::shared_secret_point;
 use bitcoin::secp256k1::schnorr;
-use bitcoin::secp256k1::Scalar;
-use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{PublicKey, SecretKey};
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -63,7 +63,7 @@ pub(super) const INVREQ_PAYER_BIP_353_NAME_TYPE: u64 = 2_000_001_733;
 
 /// TLV record type for the `invreq_payer_bip_353_signature` field defined in
 /// [BLIP 42](https://github.com/lightning/blips/blob/master/blip-0042.md).
-pub(super) const INVREQ_PAYER_BIP_353_SIGNATURE_TYPE: u64 = 2_000_001_735;
+pub(crate) const INVREQ_PAYER_BIP_353_SIGNATURE_TYPE: u64 = 2_000_001_735;
 
 /// Tag of the [`TaggedHash`] signed by `invreq_payer_bip_353_signature`, covering all invoice
 /// request TLV records except the top-level signature and the `invreq_payer_bip_353_signature`
@@ -260,17 +260,15 @@ impl PayerBip353Name {
 	/// Verifies that the offer obtained by resolving [`Self::name`] via BIP 353 is controlled by
 	/// the key that signed the invoice request.
 	///
-	/// If this returns `false`, either the name doesn't belong to the payer or they changed the
-	/// signing key of the offer associated with it. Since the latter should be infrequent, the
-	/// payer is more likely to be malicious and should not be stored as a contact.
-	pub fn matches_offer(&self, offer: &Offer) -> bool {
-		if offer.issuer_signing_pubkey() == Some(self.offer_signing_key) {
-			return true;
+	/// Returns `Ok(())` if the name belongs to the payer. Returns `Err(())` if the name doesn't
+	/// belong to the payer or they changed the signing key of the offer associated with it. Since
+	/// the latter should be infrequent, the payer is more likely to be malicious and should not be
+	/// stored as a contact.
+	pub fn matches_offer(&self, offer: &Offer) -> Result<(), ()> {
+		match offer_node_id(offer) {
+			Ok(node_id) if node_id == self.offer_signing_key => Ok(()),
+			_ => Err(()),
 		}
-		offer.paths().iter().any(|path| {
-			path.blinded_hops().last().map(|hop| hop.blinded_node_id)
-				== Some(self.offer_signing_key)
-		})
 	}
 }
 
@@ -326,39 +324,44 @@ impl Writeable for PayerBip353Signature {
 ///
 /// [`OffersMessageFlow::create_compact_offer_builder`]: crate::offers::flow::OffersMessageFlow::create_compact_offer_builder
 /// [`OffersMessageFlow::compute_contact_secret`]: crate::offers::flow::OffersMessageFlow::compute_contact_secret
-pub fn compute_contact_secret<T: secp256k1::Verification>(
-	secp_ctx: &Secp256k1<T>, our_offer_signing_key: &SecretKey, their_offer: &Offer,
+pub fn compute_contact_secret(
+	our_offer_signing_key: &SecretKey, their_offer: &Offer,
 ) -> Result<ContactSecrets, Bolt12SemanticError> {
-	let offer_node_id = if let Some(issuer) = their_offer.issuer_signing_pubkey() {
-		issuer
+	let offer_node_id = offer_node_id(their_offer)?;
+	// ECDH of our offer private key and their `offer_node_id`. We hash the compressed shared
+	// point (33 bytes) so the result matches the bLIP 42 test vectors. `SharedSecret::new` is
+	// not used: it SHA-256s the x-coordinate internally, which would replace that tagged hash.
+	let xy = shared_secret_point(&offer_node_id, our_offer_signing_key);
+	let mut compressed = [0u8; 33];
+	compressed[0] = if xy[63] & 1 == 1 { 0x03 } else { 0x02 };
+	compressed[1..].copy_from_slice(&xy[..32]);
+	let mut engine = sha256::Hash::engine();
+	engine.input(b"blip42_contact_secret");
+	engine.input(&compressed);
+	let primary_secret = ContactSecret::new(sha256::Hash::from_engine(engine).to_byte_array());
+
+	Ok(ContactSecrets::new(primary_secret))
+}
+
+/// The `offer_node_id` of a Bolt 12 offer, as defined by BLIP 42: `offer_issuer_id` if
+/// present, otherwise the last `blinded_node_id` of the first path.
+pub(super) fn offer_node_id(offer: &Offer) -> Result<PublicKey, Bolt12SemanticError> {
+	if let Some(issuer) = offer.issuer_signing_pubkey() {
+		Ok(issuer)
 	} else {
-		// Otherwise, use the last node in the first blinded path (if any)
-		their_offer
+		offer
 			.paths()
 			.first()
 			.and_then(|path| path.blinded_hops().last())
 			.map(|hop| hop.blinded_node_id)
-			.ok_or(Bolt12SemanticError::MissingSigningPubkey)?
-	};
-	// Compute ECDH shared secret (multiply their public key by our private key)
-	let scalar: Scalar = (*our_offer_signing_key).into();
-	let ecdh = offer_node_id
-		.mul_tweak(secp_ctx, &scalar)
-		.map_err(|_| Bolt12SemanticError::InvalidSigningPubkey)?;
-	// Hash the shared secret with the bLIP 42 tag
-	let mut engine = sha256::Hash::engine();
-	engine.input(b"blip42_contact_secret");
-	engine.input(&ecdh.serialize());
-	let primary_secret = ContactSecret::new(sha256::Hash::from_engine(engine).to_byte_array());
-
-	Ok(ContactSecrets::new(primary_secret))
+			.ok_or(Bolt12SemanticError::MissingSigningPubkey)
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use bitcoin::hex::DisplayHex;
-	use bitcoin::secp256k1::Secp256k1;
 	use core::str::FromStr;
 
 	const ALICE_OFFER: &str = "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzrcsesp0grlulxv3jygx83h7tghy3233sqd6xlcccvpar2l8jshxrtwvtcsrejlwh4vyz70s46r62vtakl4sxztqj6gxjged0wx0ly8qtrygufcsyq5agaes6v605af5rr9ydnj9srneudvrmc73n7evp72tzpqcnd28puqr8a3wmcff9wfjwgk32650vl747m2ev4zsjagzucntctlmcpc6vhmdnxlywneg5caqz0ansr45z2faxq7unegzsnyuduzys7kzyugpwcmhdqqj0h70zy92p75pseunclwsrwhaelvsqy9zsejcytxulndppmykcznn7y5h";
@@ -394,7 +397,6 @@ mod tests {
 
 	#[test]
 	fn computes_contact_secret_test_vectors() {
-		let secp_ctx = Secp256k1::verification_only();
 		let alice_offer = Offer::from_str(ALICE_OFFER).unwrap();
 		let alice_key = SecretKey::from_str(ALICE_SECRET).unwrap();
 
@@ -421,8 +423,8 @@ mod tests {
 			});
 			assert_eq!(bob_offer_node_id.to_string(), vector.bob_offer_node_id);
 
-			let alice_computed = compute_contact_secret(&secp_ctx, &alice_key, &bob_offer).unwrap();
-			let bob_computed = compute_contact_secret(&secp_ctx, &bob_key, &alice_offer).unwrap();
+			let alice_computed = compute_contact_secret(&alice_key, &bob_offer).unwrap();
+			let bob_computed = compute_contact_secret(&bob_key, &alice_offer).unwrap();
 
 			assert_eq!(
 				alice_computed.primary_secret().as_bytes().to_hex_string(bitcoin::hex::Case::Lower),
@@ -451,5 +453,46 @@ mod tests {
 
 		let from_remote = ContactSecrets::from_remote_secret(remote);
 		assert_eq!(*from_remote.primary_secret(), remote);
+	}
+
+	#[test]
+	fn matches_offer_checks_issuer_or_blinded_path_key() {
+		let alice_offer = Offer::from_str(ALICE_OFFER).unwrap();
+		let alice_key = alice_offer
+			.paths()
+			.first()
+			.and_then(|path| path.blinded_hops().last())
+			.map(|hop| hop.blinded_node_id)
+			.unwrap();
+		let name = HumanReadableName::new("alice", "example.com").unwrap();
+		assert!(PayerBip353Name { name: name.clone(), offer_signing_key: alice_key }
+			.matches_offer(&alice_offer)
+			.is_ok());
+
+		let other_key = PublicKey::from_str(TEST_VECTORS[1].bob_offer_node_id).unwrap();
+		assert!(PayerBip353Name { name, offer_signing_key: other_key }
+			.matches_offer(&alice_offer)
+			.is_err());
+	}
+
+	#[test]
+	fn matches_offer_uses_issuer_id_not_path_last_hop() {
+		let bob_offer = Offer::from_str(TEST_VECTORS[1].bob_offer).unwrap();
+		let issuer = bob_offer.issuer_signing_pubkey().unwrap();
+		let path_last_hop = bob_offer
+			.paths()
+			.first()
+			.and_then(|path| path.blinded_hops().last())
+			.map(|hop| hop.blinded_node_id)
+			.unwrap();
+		assert_ne!(issuer, path_last_hop);
+
+		let name = HumanReadableName::new("bob", "example.com").unwrap();
+		assert!(PayerBip353Name { name: name.clone(), offer_signing_key: issuer }
+			.matches_offer(&bob_offer)
+			.is_ok());
+		assert!(PayerBip353Name { name, offer_signing_key: path_last_hop }
+			.matches_offer(&bob_offer)
+			.is_err());
 	}
 }
