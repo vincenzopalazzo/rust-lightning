@@ -588,6 +588,11 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	/// below [`PAYER_OFFER_MAX_BYTES`]. The intro node must be a public peer (routable via
 	/// gossip) with an outbound channel.
 	///
+	/// When `intro_short_channel_id` is provided (the SCID our intro peer uses to forward onion
+	/// messages to us), the blinded path encodes that hop compactly instead of with a full
+	/// pubkey. Prefer passing it whenever a channel to the intro peer exists — without it, offers
+	/// on non-Bitcoin chains can land a few bytes over the 300-byte BLIP 42 payer-offer budget.
+	///
 	/// Persist the returned [`Nonce`] alongside the built offer: it is needed by
 	/// [`Self::compute_contact_secret`] to re-derive the offer's signing keys.
 	///
@@ -599,10 +604,13 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	///
 	/// [`PAYER_OFFER_MAX_BYTES`]: crate::offers::contacts::PAYER_OFFER_MAX_BYTES
 	pub fn create_compact_offer_builder<ES: EntropySource>(
-		&self, entropy_source: ES, intro_node_id: PublicKey,
+		&self, entropy_source: ES, intro_node_id: PublicKey, intro_short_channel_id: Option<u64>,
 	) -> Result<(OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Nonce), Bolt12SemanticError> {
 		self.create_offer_builder_intern(&entropy_source, |_, context, _| {
-			let peers = vec![MessageForwardNode { node_id: intro_node_id, short_channel_id: None }];
+			let peers = vec![MessageForwardNode {
+				node_id: intro_node_id,
+				short_channel_id: intro_short_channel_id,
+			}];
 			self.create_blinded_paths(peers, context)
 				.map(|paths| paths.into_iter().take(1))
 				.map_err(|_| Bolt12SemanticError::MissingPaths)

@@ -813,7 +813,14 @@ fn pays_for_offer_with_blip42_contact_fields() {
 	let (bob_offer_builder, bob_offer_nonce) =
 		bob.node.create_compact_offer_builder(alice_id).unwrap();
 	let bob_offer = bob_offer_builder.build().unwrap();
-	assert!(bob_offer.as_ref().len() <= PAYER_OFFER_MAX_BYTES);
+	// Compact builder must attach the Alice↔Bob inbound SCID so the path stays under the
+	// BLIP 42 payer-offer budget (pubkey next-hop encoding overshoots on non-Bitcoin chains).
+	assert!(
+		bob_offer.as_ref().len() <= PAYER_OFFER_MAX_BYTES,
+		"compact payer offer is {} bytes (max {})",
+		bob_offer.as_ref().len(),
+		PAYER_OFFER_MAX_BYTES,
+	);
 	let bob_secrets =
 		bob.node.compute_contact_secret(&bob_offer, bob_offer_nonce, &alice_offer).unwrap();
 

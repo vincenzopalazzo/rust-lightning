@@ -14961,6 +14961,11 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 	/// privacy. The intro node must be a public peer (routable via gossip) with an outbound
 	/// channel.
 	///
+	/// When a channel to `intro_node_id` is available, its inbound payment SCID is included in the
+	/// blinded path so the hop can be encoded compactly. That is required to keep non-Bitcoin
+	/// chain offers (which carry an explicit `offer_chains` TLV) under the 300-byte BLIP 42
+	/// payer-offer budget.
+	///
 	/// Persist the returned [`Nonce`] alongside the built offer: it is needed by
 	/// [`Self::compute_contact_secret`] to re-derive the offer's signing keys.
 	///
@@ -14977,8 +14982,17 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 	pub fn create_compact_offer_builder(
 		&$self, intro_node_id: PublicKey,
 	) -> Result<($builder, Nonce), Bolt12SemanticError> {
+		// Prefer an SCID the intro peer already uses to reach us so DefaultMessageRouter can
+		// build a size-constrained hop (pubkey next-hop encoding is what pushes signet offers
+		// over PAYER_OFFER_MAX_BYTES).
+		let intro_short_channel_id = $self
+			.list_channels()
+			.into_iter()
+			.find(|chan| chan.counterparty.node_id == intro_node_id)
+			.and_then(|chan| chan.get_inbound_payment_scid());
+
 		let (builder, nonce) = $self.flow.create_compact_offer_builder(
-			&$self.entropy_source, intro_node_id
+			&$self.entropy_source, intro_node_id, intro_short_channel_id,
 		)?;
 
 		Ok((builder.into(), nonce))
