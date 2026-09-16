@@ -45,7 +45,7 @@
 use alloc::collections::BTreeMap;
 
 use bitcoin::network::Network;
-use bitcoin::secp256k1::{PublicKey, Secp256k1};
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use core::time::Duration;
 use crate::blinded_path::IntroductionNode;
 use crate::blinded_path::message::BlindedMessagePath;
@@ -1518,6 +1518,141 @@ fn creates_offer_with_blinded_path_using_unannounced_introduction_node() {
 	// Include the 1,000-msat introduction-node fee and the sender-paid dummy-hop fee.
 	claim_bolt12_payment(bob, &[alice], payment_context, &invoice, Some(1050));
 	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+/// Compact offers use a caller-chosen introduction node and a single blinded path so the
+/// encoding stays small enough for a QR code. When a channel to that intro exists, its inbound
+/// payment SCID is attached so the hop can be encoded compactly.
+#[test]
+fn creates_compact_offer_through_chosen_intro_node() {
+	// wallet (unannounced) --private--> trampoline --public--> peer
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+	create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 10_000_000, 0);
+
+	let wallet = &nodes[0];
+	let wallet_id = wallet.node.get_our_node_id();
+	let trampoline = &nodes[1];
+	let trampoline_id = trampoline.node.get_our_node_id();
+
+	assert!(wallet.node.test_get_peers_for_blinded_path().iter().any(|peer| {
+		peer.node_id == trampoline_id && peer.short_channel_id.is_some()
+	}));
+
+	let (builder, _nonce) = wallet.node.create_compact_offer_builder(trampoline_id).unwrap();
+	let offer = builder.amount_msats(10_000_000).build().unwrap();
+	assert_ne!(offer.issuer_signing_pubkey(), Some(wallet_id));
+	assert_eq!(offer.paths().len(), 1);
+	assert_eq!(offer.paths()[0].introduction_node(), &IntroductionNode::NodeId(trampoline_id));
+	assert_eq!(offer.paths()[0].blinded_hops().len(), QR_CODED_DUMMY_HOPS_PATH_LENGTH);
+
+	let payment_id = PaymentId([1; 32]);
+	trampoline.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+	expect_recent_payment!(trampoline, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let onion_message = trampoline.onion_messenger.next_onion_message_for_peer(wallet_id).unwrap();
+	wallet.onion_messenger.handle_onion_message(trampoline_id, &onion_message);
+
+	let (invoice_request, _) = extract_invoice_request(wallet, &onion_message);
+	assert_eq!(invoice_request.amount_msats(), Some(10_000_000));
+
+	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
+		offer_id: offer.id(),
+		invoice_request: PayerFields {
+			payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
+			quantity: None,
+			payer_note_truncated: None,
+			human_readable_name: None,
+		},
+		payment_metadata: None,
+	});
+
+	let onion_message = wallet.onion_messenger.next_onion_message_for_peer(trampoline_id).unwrap();
+	trampoline.onion_messenger.handle_onion_message(wallet_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(trampoline, &onion_message);
+	route_bolt12_payment(trampoline, &[wallet], &invoice);
+	expect_recent_payment!(trampoline, RecentPaymentDetails::Pending, payment_id);
+
+	claim_bolt12_payment(trampoline, &[wallet], payment_context, &invoice, Some(1050));
+	expect_recent_payment!(trampoline, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+#[test]
+fn creates_compact_offer_through_announced_intro_node() {
+	// Announced issuer must still honor the caller-chosen intro instead of a one-hop path to self.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let (builder, _nonce) = alice.node.create_compact_offer_builder(bob_id).unwrap();
+	let offer = builder.amount_msats(10_000_000).build().unwrap();
+	assert_ne!(offer.issuer_signing_pubkey(), Some(alice_id));
+	assert_eq!(offer.paths().len(), 1);
+	assert_eq!(offer.paths()[0].introduction_node(), &IntroductionNode::NodeId(bob_id));
+	assert_eq!(offer.paths()[0].blinded_hops().len(), QR_CODED_DUMMY_HOPS_PATH_LENGTH);
+
+	let payment_id = PaymentId([1; 32]);
+	bob.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+
+	let (invoice_request, _) = extract_invoice_request(alice, &onion_message);
+	assert_eq!(invoice_request.amount_msats(), Some(10_000_000));
+
+	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
+		offer_id: offer.id(),
+		invoice_request: PayerFields {
+			payer_signing_pubkey: invoice_request.payer_signing_pubkey(),
+			quantity: None,
+			payer_note_truncated: None,
+			human_readable_name: None,
+		},
+		payment_metadata: None,
+	});
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	route_bolt12_payment(bob, &[alice], &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	claim_bolt12_payment(bob, &[alice], payment_context, &invoice, Some(50));
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+#[test]
+fn compact_offer_builder_rejects_unknown_intro_node() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let unknown_id = PublicKey::from_secret_key(
+		&Secp256k1::new(),
+		&SecretKey::from_slice(&[3; 32]).unwrap(),
+	);
+	match nodes[0].node.create_compact_offer_builder(unknown_id) {
+		Err(e) => assert_eq!(e, Bolt12SemanticError::MissingPaths),
+		Ok(_) => panic!("expected MissingPaths for an intro that is not a connected peer"),
+	}
 }
 
 /// Checks that a refund can be created using an unannounced node as a blinded path's introduction

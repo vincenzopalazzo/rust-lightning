@@ -1,0 +1,10 @@
+API Updates
+===========
+
+ * `ChannelManager::create_compact_offer_builder` / `OffersMessageFlow::create_compact_offer_builder`
+   build an offer with a single blinded path through a caller-chosen introduction
+   node and return the derivation [`Nonce`]. The chosen intro is used even when
+   we are announced. `ChannelManager` returns [`Bolt12SemanticError::MissingPaths`]
+   if the intro is not a currently connected onion-message peer. When a channel
+   to that intro exists, its inbound payment SCID is included so the hop can be
+   encoded compactly.

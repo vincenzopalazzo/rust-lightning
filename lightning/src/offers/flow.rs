@@ -615,6 +615,48 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		.map(|(builder, _)| builder)
 	}
 
+	/// Creates a compact [`OfferBuilder`] with a single blinded path through `intro_node_id`.
+	///
+	/// Unlike [`Self::create_offer_builder`], the introduction node is chosen by the caller rather
+	/// than selected from the current peer set. Use this when the offer must stay small (for
+	/// example a QR code) or when a specific public peer should be the introduction node (for
+	/// example an LSP). The path is built directly, so `intro_node_id` is the introduction node
+	/// even when we are announced.
+	///
+	/// When `intro_short_channel_id` is provided (the inbound payment SCID the intro peer uses to
+	/// reach us), the blinded hop is encoded compactly instead of with a full pubkey. Prefer
+	/// passing it whenever a channel to the intro peer exists.
+	///
+	/// Persist the returned [`Nonce`] with the built offer if you later need to re-derive the
+	/// offer's signing keys (the same pattern as [`Self::create_async_receive_offer_builder`]).
+	///
+	/// # Privacy
+	///
+	/// Uses a derived signing pubkey in the offer for recipient privacy. The introduction node
+	/// learns that we are the offer's recipient, so choose a trusted peer.
+	///
+	/// This is not exported to bindings users as builder patterns don't map outside of move semantics.
+	pub fn create_compact_offer_builder<ES: EntropySource>(
+		&self, entropy_source: ES, intro_node_id: PublicKey, intro_short_channel_id: Option<u64>,
+	) -> Result<(OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Nonce), Bolt12SemanticError> {
+		self.create_offer_builder_intern(&entropy_source, |node_id, context, secp_ctx| {
+			let hop = MessageForwardNode {
+				node_id: intro_node_id,
+				short_channel_id: intro_short_channel_id,
+			};
+			let path = BlindedMessagePath::new(
+				&[hop],
+				node_id,
+				self.get_receive_auth_key(),
+				context,
+				true,
+				&entropy_source,
+				secp_ctx,
+			);
+			Ok(core::iter::once(path))
+		})
+	}
+
 	/// Same as [`Self::create_offer_builder`], but allows specifying a custom [`MessageRouter`]
 	/// instead of using the one provided via the [`OffersMessageFlow`] parameterization.
 	///
