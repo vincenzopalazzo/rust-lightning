@@ -15295,6 +15295,47 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 		Ok(builder.into())
 	}
 
+	/// Creates a compact [`OfferBuilder`] with a single blinded path through `intro_node_id`.
+	///
+	/// Unlike [`Self::create_offer_builder`], the introduction node is chosen by the caller rather
+	/// than selected from the current peer set. Use this when the offer must stay small (for
+	/// example a QR code) or when a specific public peer should be the introduction node (for
+	/// example an LSP). The path is built directly, so `intro_node_id` is the introduction node
+	/// even when we are announced.
+	///
+	/// When a usable onion-message channel to `intro_node_id` is available, its inbound payment
+	/// SCID is included so the hop can be encoded compactly.
+	///
+	/// Persist the returned [`Nonce`] with the built offer if you later need to re-derive the
+	/// offer's signing keys.
+	///
+	/// # Privacy
+	///
+	/// Uses a derived signing pubkey in the offer for recipient privacy. The introduction node
+	/// learns that we are the offer's recipient, so choose a trusted peer.
+	///
+	/// # Errors
+	///
+	/// Returns [`Bolt12SemanticError::MissingPaths`] if `intro_node_id` is not a currently
+	/// connected onion-message peer.
+	///
+	/// [`Offer`]: crate::offers::offer::Offer
+	pub fn create_compact_offer_builder(
+		&$self, intro_node_id: PublicKey,
+	) -> Result<($builder, Nonce), Bolt12SemanticError> {
+		let intro = $self
+			.get_peers_for_blinded_path()
+			.into_iter()
+			.find(|peer| peer.node_id == intro_node_id)
+			.ok_or(Bolt12SemanticError::MissingPaths)?;
+
+		let (builder, nonce) = $self.flow.create_compact_offer_builder(
+			&$self.entropy_source, intro_node_id, intro.short_channel_id,
+		)?;
+
+		Ok((builder.into(), nonce))
+	}
+
 	/// Creates an [`OfferBuilder`] such that the [`Offer`] it builds is recognized by any
 	/// [`ChannelManager`] (or [`OffersMessageFlow`]) using the same [`ExpandedKey`] (as returned
 	/// from [`NodeSigner::get_expanded_key`]). This allows any nodes participating in a BOLT 11
