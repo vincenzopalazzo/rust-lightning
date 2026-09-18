@@ -233,6 +233,12 @@ pub enum Bolt12SemanticError {
 	///
 	/// [`Refund`]: super::refund::Refund
 	UnexpectedHumanReadableName,
+	/// An `invreq_contact_secret` was set without a return path (`invreq_payer_offer`).
+	InvalidPayerContact,
+	/// An `invreq_payer_offer` was malformed or larger than [`PAYER_OFFER_MAX_BYTES`].
+	///
+	/// [`PAYER_OFFER_MAX_BYTES`]: super::contacts::PAYER_OFFER_MAX_BYTES
+	InvalidPayerOffer,
 }
 
 impl From<CheckedHrpstringError> for Bolt12ParseError {
