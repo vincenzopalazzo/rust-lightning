@@ -36,6 +36,7 @@ use crate::ln::channel_state::ChannelDetails;
 use crate::ln::channelmanager::{InterceptId, PaymentId, CLTV_FAR_FAR_AWAY};
 use crate::ln::inbound_payment;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
+use crate::offers::contacts::{self, ContactSecrets};
 use crate::offers::invoice::{
 	Bolt12Invoice, DerivedSigningPubkey, ExplicitSigningPubkey, InvoiceBuilder,
 	DEFAULT_RELATIVE_EXPIRY,
@@ -635,6 +636,30 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				.map_err(|_| Bolt12SemanticError::MissingPaths)
 		})
 		.map(|(builder, _)| builder)
+	}
+
+	/// Computes the bLIP 42 contact secret shared between us and a contact, deterministically
+	/// derived from one of our offers and the contact's offer.
+	///
+	/// `our_offer` must have been created by this flow with blinded paths and `our_offer_nonce`
+	/// (for example via [`Self::create_async_receive_offer_builder`]) so that the keys behind its
+	/// signing pubkey can be re-derived. Persist that nonce with the offer.
+	///
+	/// If the wallet already has a secret from this contact, use
+	/// [`ContactSecrets::from_remote_secret`] instead of this method.
+	///
+	/// # Errors
+	///
+	/// Returns [`Bolt12SemanticError::InvalidMetadata`] if `our_offer` was not created by this
+	/// flow using `our_offer_nonce`, and [`Bolt12SemanticError::MissingSigningPubkey`] if
+	/// `their_offer` has neither an issuer signing pubkey nor a blinded path.
+	pub fn compute_contact_secret(
+		&self, our_offer: &Offer, our_offer_nonce: Nonce, their_offer: &Offer,
+	) -> Result<ContactSecrets, Bolt12SemanticError> {
+		let keys = our_offer
+			.derive_issuer_signing_keys(our_offer_nonce, &self.inbound_payment_key, &self.secp_ctx)
+			.map_err(|()| Bolt12SemanticError::InvalidMetadata)?;
+		contacts::compute_contact_secret(&keys.secret_key(), their_offer)
 	}
 
 	/// Create an offer for receiving async payments as an often-offline recipient.
