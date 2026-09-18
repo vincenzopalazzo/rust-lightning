@@ -43,6 +43,25 @@ use bitcoin::secp256k1::{PublicKey, SecretKey};
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+/// TLV type for `invreq_contact_secret` in [bLIP 42].
+///
+/// [bLIP 42]: https://github.com/lightning/blips/blob/master/blip-0042.md
+pub(super) const INVREQ_CONTACT_SECRET_TYPE: u64 = 2_000_001_729;
+
+/// TLV type for `invreq_payer_offer` in [bLIP 42].
+///
+/// [bLIP 42]: https://github.com/lightning/blips/blob/master/blip-0042.md
+pub(super) const INVREQ_PAYER_OFFER_TYPE: u64 = 2_000_001_731;
+
+/// Maximum encoded size of an [`Offer`] used as `invreq_payer_offer`.
+///
+/// [bLIP 42](https://github.com/lightning/blips/blob/master/blip-0042.md) recommends keeping
+/// payer offers at or below this size so invoice requests that carry them still fit sender
+/// data that recipients store in blinded-path padding and, for async payments, the payment onion.
+///
+/// [`Offer`]: crate::offers::offer::Offer
+pub const PAYER_OFFER_MAX_BYTES: usize = 300;
+
 /// A 32-byte contact secret as defined by [bLIP 42].
 ///
 /// Do not log it: a leaked secret lets others impersonate this contact's payment identity.

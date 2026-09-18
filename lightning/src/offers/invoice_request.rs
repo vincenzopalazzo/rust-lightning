@@ -71,6 +71,9 @@ use crate::io;
 use crate::ln::channelmanager::PaymentId;
 use crate::ln::inbound_payment::{ExpandedKey, IV_LEN};
 use crate::ln::msgs::DecodeError;
+use crate::offers::contacts::{
+	ContactSecret, INVREQ_CONTACT_SECRET_TYPE, INVREQ_PAYER_OFFER_TYPE, PAYER_OFFER_MAX_BYTES,
+};
 use crate::offers::invoice::{DerivedSigningPubkey, ExplicitSigningPubkey, SigningPubkeyStrategy};
 use crate::offers::merkle::{
 	self, SignError, SignFn, SignatureTlvStream, SignatureTlvStreamRef, TaggedHash, TlvStream,
@@ -186,7 +189,7 @@ macro_rules! invoice_request_builder_methods { (
 		InvoiceRequestContentsWithoutPayerSigningPubkey {
 			payer: PayerContents(metadata), offer, chain: None, amount_msats: None,
 			features: InvoiceRequestFeatures::empty(), quantity: None, payer_note: None,
-			offer_from_hrn: None,
+			offer_from_hrn: None, invreq_contact_secret: None, invreq_payer_offer: None,
 			#[cfg(test)]
 			experimental_bar: None,
 		}
@@ -255,6 +258,32 @@ macro_rules! invoice_request_builder_methods { (
 		$return_value
 	}
 
+	/// Includes the primary [`ContactSecret`] from `contact_secrets` as `invreq_contact_secret`.
+	///
+	/// Building fails with [`Bolt12SemanticError::InvalidPayerContact`] unless [`Self::payer_offer`]
+	/// is also set, so the secret has a return path.
+	///
+	/// Successive calls to this method will override the previous setting.
+	///
+	/// [`ContactSecret`]: crate::offers::contacts::ContactSecret
+	pub fn contact_secrets($($self_mut)* $self: $self_type, contact_secrets: crate::offers::contacts::ContactSecrets) -> $return_type {
+		$self.invoice_request.invreq_contact_secret = Some(*contact_secrets.primary_secret());
+		$return_value
+	}
+
+	/// Includes `offer` as `invreq_payer_offer`, a return path for the recipient.
+	///
+	/// The encoded offer must not exceed [`PAYER_OFFER_MAX_BYTES`], otherwise building fails with
+	/// [`Bolt12SemanticError::InvalidPayerOffer`].
+	///
+	/// Successive calls to this method will override the previous setting.
+	///
+	/// [`PAYER_OFFER_MAX_BYTES`]: crate::offers::contacts::PAYER_OFFER_MAX_BYTES
+	pub fn payer_offer($($self_mut)* $self: $self_type, offer: &Offer) -> $return_type {
+		$self.invoice_request.invreq_payer_offer = Some(offer.clone());
+		$return_value
+	}
+
 	fn build_with_checks($($self_mut)* $self: $self_type) -> Result<
 		(UnsignedInvoiceRequest, Option<Keypair>, Option<&'b Secp256k1<$secp_context>>),
 		Bolt12SemanticError
@@ -282,6 +311,18 @@ macro_rules! invoice_request_builder_methods { (
 		$self.invoice_request.offer.check_amount_msats_for_quantity(
 			$self.invoice_request.amount_msats, $self.invoice_request.quantity
 		)?;
+
+		if $self.invoice_request.invreq_contact_secret.is_some()
+			&& $self.invoice_request.invreq_payer_offer.is_none()
+		{
+			return Err(Bolt12SemanticError::InvalidPayerContact);
+		}
+
+		if let Some(payer_offer) = &$self.invoice_request.invreq_payer_offer {
+			if payer_offer.as_ref().len() > PAYER_OFFER_MAX_BYTES {
+				return Err(Bolt12SemanticError::InvalidPayerOffer);
+			}
+		}
 
 		Ok($self.build_without_checks())
 	}
@@ -500,7 +541,8 @@ impl UnsignedInvoiceRequest {
 
 		invoice_request_tlv_stream.write(&mut bytes).unwrap();
 
-		const EXPERIMENTAL_TLV_ALLOCATION_SIZE: usize = 0;
+		// invreq_contact_secret (~40 bytes) plus invreq_payer_offer (up to PAYER_OFFER_MAX_BYTES).
+		const EXPERIMENTAL_TLV_ALLOCATION_SIZE: usize = 360;
 		let mut experimental_bytes = Vec::with_capacity(EXPERIMENTAL_TLV_ALLOCATION_SIZE);
 
 		let experimental_tlv_stream =
@@ -686,6 +728,8 @@ pub(super) struct InvoiceRequestContentsWithoutPayerSigningPubkey {
 	quantity: Option<u64>,
 	payer_note: Option<String>,
 	offer_from_hrn: Option<HumanReadableName>,
+	invreq_contact_secret: Option<ContactSecret>,
+	invreq_payer_offer: Option<Offer>,
 	#[cfg(test)]
 	experimental_bar: Option<u64>,
 }
@@ -746,6 +790,16 @@ macro_rules! invoice_request_accessors { ($self: ident, $contents: expr) => {
 	/// builder to indicate the original [`HumanReadableName`] which was resolved.
 	pub fn offer_from_hrn(&$self) -> &Option<HumanReadableName> {
 		$contents.offer_from_hrn()
+	}
+
+	/// The bLIP 42 contact secret included in this request, if any.
+	pub fn contact_secret(&$self) -> Option<ContactSecret> {
+		$contents.contact_secret()
+	}
+
+	/// The payer's own offer included as a return path, if any.
+	pub fn payer_offer(&$self) -> Option<&Offer> {
+		$contents.payer_offer()
 	}
 } }
 
@@ -1179,6 +1233,14 @@ impl InvoiceRequestContents {
 		&self.inner.offer_from_hrn
 	}
 
+	pub(super) fn contact_secret(&self) -> Option<ContactSecret> {
+		self.inner.invreq_contact_secret
+	}
+
+	pub(super) fn payer_offer(&self) -> Option<&Offer> {
+		self.inner.invreq_payer_offer.as_ref()
+	}
+
 	pub(super) fn as_tlv_stream(&self) -> PartialInvoiceRequestTlvStreamRef<'_> {
 		let (payer, offer, mut invoice_request, experimental_offer, experimental_invoice_request) =
 			self.inner.as_tlv_stream();
@@ -1225,6 +1287,8 @@ impl InvoiceRequestContentsWithoutPayerSigningPubkey {
 		};
 
 		let experimental_invoice_request = ExperimentalInvoiceRequestTlvStreamRef {
+			invreq_contact_secret: self.invreq_contact_secret.as_ref(),
+			invreq_payer_offer: self.invreq_payer_offer.as_ref().map(|offer| &offer.bytes),
 			#[cfg(test)]
 			experimental_bar: self.experimental_bar,
 		};
@@ -1291,9 +1355,11 @@ pub(super) const EXPERIMENTAL_INVOICE_REQUEST_TYPES: core::ops::Range<u64> =
 #[cfg(not(test))]
 tlv_stream!(
 	ExperimentalInvoiceRequestTlvStream,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES,
 	{
+		(INVREQ_CONTACT_SECRET_TYPE, invreq_contact_secret: ContactSecret),
+		(INVREQ_PAYER_OFFER_TYPE, invreq_payer_offer: (Vec<u8>, WithoutLength)),
 		// When adding experimental TLVs, update EXPERIMENTAL_TLV_ALLOCATION_SIZE accordingly in
 		// UnsignedInvoiceRequest::new to avoid unnecessary allocations.
 	}
@@ -1301,8 +1367,10 @@ tlv_stream!(
 
 #[cfg(test)]
 tlv_stream!(
-	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStream, ExperimentalInvoiceRequestTlvStreamRef<'a>,
 	EXPERIMENTAL_INVOICE_REQUEST_TYPES, {
+		(INVREQ_CONTACT_SECRET_TYPE, invreq_contact_secret: ContactSecret),
+		(INVREQ_PAYER_OFFER_TYPE, invreq_payer_offer: (Vec<u8>, WithoutLength)),
 		(2_999_999_999, experimental_bar: (u64, HighZeroBytesDroppedBigSize)),
 	}
 );
@@ -1322,7 +1390,7 @@ type FullInvoiceRequestTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl CursorReadable for FullInvoiceRequestTlvStream {
@@ -1358,7 +1426,7 @@ type PartialInvoiceRequestTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	ExperimentalOfferTlvStreamRef,
-	ExperimentalInvoiceRequestTlvStreamRef,
+	ExperimentalInvoiceRequestTlvStreamRef<'a>,
 );
 
 impl TryFrom<Vec<u8>> for UnsignedInvoiceRequest {
@@ -1437,6 +1505,8 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			},
 			experimental_offer_tlv_stream,
 			ExperimentalInvoiceRequestTlvStream {
+				invreq_contact_secret,
+				invreq_payer_offer,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1470,6 +1540,11 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 			return Err(Bolt12SemanticError::UnexpectedPaths);
 		}
 
+		let invreq_payer_offer = invreq_payer_offer
+			.map(Offer::try_from)
+			.transpose()
+			.map_err(|_| Bolt12SemanticError::InvalidPayerOffer)?;
+
 		Ok(InvoiceRequestContents {
 			inner: InvoiceRequestContentsWithoutPayerSigningPubkey {
 				payer,
@@ -1480,6 +1555,8 @@ impl TryFrom<PartialInvoiceRequestTlvStream> for InvoiceRequestContents {
 				quantity,
 				payer_note,
 				offer_from_hrn,
+				invreq_contact_secret,
+				invreq_payer_offer,
 				#[cfg(test)]
 				experimental_bar,
 			},
@@ -1563,6 +1640,7 @@ mod tests {
 	use crate::ln::channelmanager::PaymentId;
 	use crate::ln::inbound_payment::ExpandedKey;
 	use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
+	use crate::offers::contacts::{ContactSecret, ContactSecrets, PAYER_OFFER_MAX_BYTES};
 	use crate::offers::invoice::{Bolt12Invoice, SIGNATURE_TAG as INVOICE_SIGNATURE_TAG};
 	use crate::offers::invoice_request::string_truncate_safe;
 	use crate::offers::merkle::{self, SignatureTlvStreamRef, TaggedHash, TlvStream};
@@ -1669,7 +1747,11 @@ mod tests {
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice_request.signature()) },
 				ExperimentalOfferTlvStreamRef { experimental_foo: None },
-				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
+				ExperimentalInvoiceRequestTlvStreamRef {
+					invreq_contact_secret: None,
+					invreq_payer_offer: None,
+					experimental_bar: None,
+				},
 			),
 		);
 
@@ -3147,6 +3229,124 @@ mod tests {
 				assert_eq!(deserialized_fields, fields);
 			},
 			Err(_) => panic!("unexpected error"),
+		}
+	}
+
+	#[test]
+	fn builds_invoice_request_with_contact_fields() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		let payer_offer = OfferBuilder::new(payer_pubkey()).amount_msats(1).build().unwrap();
+		assert!(payer_offer.as_ref().len() <= PAYER_OFFER_MAX_BYTES);
+		let contact_secrets = ContactSecrets::new(ContactSecret::new([3; 32]));
+
+		let invoice_request = OfferBuilder::new(recipient_pubkey())
+			.amount_msats(1000)
+			.build()
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.contact_secrets(contact_secrets.clone())
+			.payer_offer(&payer_offer)
+			.build_and_sign()
+			.unwrap();
+		assert_eq!(invoice_request.contact_secret(), Some(*contact_secrets.primary_secret()));
+		assert_eq!(invoice_request.payer_offer(), Some(&payer_offer));
+
+		let mut buffer = Vec::new();
+		invoice_request.write(&mut buffer).unwrap();
+
+		let parsed = InvoiceRequest::try_from(buffer).unwrap();
+		assert_eq!(parsed.contact_secret(), Some(*contact_secrets.primary_secret()));
+		assert_eq!(parsed.payer_offer(), Some(&payer_offer));
+	}
+
+	#[test]
+	fn fails_building_invoice_request_with_contact_secret_without_payer_offer() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let contact_secrets = ContactSecrets::new(ContactSecret::new([3; 32]));
+
+		match OfferBuilder::new(recipient_pubkey())
+			.amount_msats(1000)
+			.build()
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.contact_secrets(contact_secrets)
+			.build_and_sign()
+		{
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, Bolt12SemanticError::InvalidPayerContact),
+		}
+	}
+
+	#[test]
+	fn fails_building_invoice_request_with_oversized_payer_offer() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		let oversized_offer = OfferBuilder::new(payer_pubkey())
+			.amount_msats(1)
+			.description("a".repeat(PAYER_OFFER_MAX_BYTES))
+			.build()
+			.unwrap();
+		assert!(oversized_offer.as_ref().len() > PAYER_OFFER_MAX_BYTES);
+
+		match OfferBuilder::new(recipient_pubkey())
+			.amount_msats(1000)
+			.build()
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.payer_offer(&oversized_offer)
+			.build_and_sign()
+		{
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(e, Bolt12SemanticError::InvalidPayerOffer),
+		}
+	}
+
+	#[test]
+	fn fails_parsing_invoice_request_with_malformed_payer_offer() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		let invoice_request = OfferBuilder::new(recipient_pubkey())
+			.amount_msats(1000)
+			.build()
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+
+		let mut tlv_stream = invoice_request.as_tlv_stream();
+		let malformed_offer_bytes = vec![42; 32];
+		tlv_stream.5.invreq_payer_offer = Some(&malformed_offer_bytes);
+
+		let mut buffer = Vec::new();
+		tlv_stream.write(&mut buffer).unwrap();
+
+		match InvoiceRequest::try_from(buffer) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => assert_eq!(
+				e,
+				Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidPayerOffer)
+			),
 		}
 	}
 
