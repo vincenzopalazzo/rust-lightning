@@ -545,6 +545,16 @@ pub(crate) const DUMMY_HOPS_PATH_LENGTH: usize = 4;
 // We add dummy hops until the path reaches this length (including the recipient).
 pub(crate) const QR_CODED_DUMMY_HOPS_PATH_LENGTH: usize = 2;
 
+fn shuffle_with_entropy<T, ES: EntropySource>(items: &mut [T], entropy_source: &ES) {
+	let mut i = items.len();
+	while i > 1 {
+		i -= 1;
+		let bytes = entropy_source.get_secure_random_bytes();
+		let rand = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")) as usize;
+		items.swap(i, rand % (i + 1));
+	}
+}
+
 impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource>
 	DefaultMessageRouter<G, L, ES>
 {
@@ -619,23 +629,21 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource>
 				.filter_map(|peer| {
 					network_graph
 						.node(&NodeId::from_pubkey(&peer.node_id))
-						.map(|info| (peer, info.is_tor_only(), info.channels.len()))
+						.map(|info| (peer, info.is_tor_only()))
 						// Allow messages directly with the only peer
-						.or_else(|| has_one_peer.then(|| (peer, false, 0)))
+						.or_else(|| has_one_peer.then(|| (peer, false)))
 				})
 				.collect::<Vec<_>>();
 
-			// Prefer using non-Tor nodes with the most channels as the introduction node.
-			peer_info.sort_unstable_by(
-				|(_, a_tor_only, a_channels), (_, b_tor_only, b_channels)| {
-					a_tor_only.cmp(b_tor_only).then(a_channels.cmp(b_channels).reverse())
-				},
-			);
+			// Prefer non-Tor introduction nodes, then shuffle.
+			peer_info
+				.sort_unstable_by(|(_, a_tor_only), (_, b_tor_only)| a_tor_only.cmp(b_tor_only));
+			shuffle_with_entropy(&mut peer_info, entropy_source);
 
 			// Try to create paths from peer info, fall back to direct path if needed
 			peer_info
 				.into_iter()
-				.map(|(peer, _, _)| build_path(&[peer]))
+				.map(|(peer, _)| build_path(&[peer]))
 				.take(MAX_PATHS)
 				.collect::<Vec<_>>()
 		} else {
@@ -2556,4 +2564,44 @@ fn construct_onion_message_packet<T: OnionMessageContents>(
 		prng_seed,
 		hop_data_len,
 	)
+}
+
+#[cfg(test)]
+mod shuffle_with_entropy_tests {
+	use super::shuffle_with_entropy;
+	use crate::sign::EntropySource;
+	use crate::sync::Mutex;
+
+	struct SeqEntropy(Mutex<u8>);
+	impl EntropySource for SeqEntropy {
+		fn get_secure_random_bytes(&self) -> [u8; 32] {
+			let mut g = self.0.lock().unwrap();
+			*g = g.wrapping_add(1);
+			let mut out = [0u8; 32];
+			out[0] = *g;
+			out
+		}
+	}
+
+	#[test]
+	fn shuffle_permutes_without_dropping() {
+		let entropy = SeqEntropy(Mutex::new(0));
+		let mut items: Vec<u8> = (0..8).collect();
+		shuffle_with_entropy(&mut items, &entropy);
+		let mut sorted = items.clone();
+		sorted.sort();
+		assert_eq!(sorted, (0..8).collect::<Vec<_>>());
+		assert_ne!(items, (0..8).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn shuffle_empty_and_singleton_are_noops() {
+		let entropy = SeqEntropy(Mutex::new(0));
+		let mut empty: Vec<u8> = Vec::new();
+		shuffle_with_entropy(&mut empty, &entropy);
+		assert!(empty.is_empty());
+		let mut one = vec![7u8];
+		shuffle_with_entropy(&mut one, &entropy);
+		assert_eq!(one, vec![7]);
+	}
 }

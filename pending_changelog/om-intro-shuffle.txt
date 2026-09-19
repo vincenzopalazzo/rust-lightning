@@ -1,0 +1,6 @@
+# API Updates
+
+ * [`DefaultMessageRouter`] now shuffles introduction-node candidates with
+   [`EntropySource`] for unannounced recipients, instead of always ranking by
+   gossip channel count. Compact BOLT 12 offers still keep a single path
+   (`take(1)`), but it is no longer always the highest-degree peer.
