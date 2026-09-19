@@ -2412,12 +2412,7 @@ impl<
 				// Handled above
 			},
 			Message::Error(msg) => {
-				log_debug!(
-					logger,
-					"Got Err message from {}: {}",
-					their_node_id,
-					log_msg!(msg.data)
-				);
+				log_info!(logger, "Got Err message from {}: {}", their_node_id, log_msg!(msg.data));
 				self.message_handler.chan_handler.handle_error(their_node_id, &msg);
 				if msg.channel_id.is_zero() {
 					return Err(PeerHandleError {}.into());
