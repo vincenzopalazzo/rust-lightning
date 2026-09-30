@@ -375,6 +375,7 @@ fn archive_monitor_with_pending_closure_event() {
 			node_signer: nodes[1].keys_manager,
 			signer_provider: nodes[1].keys_manager,
 			fee_estimator: nodes[1].fee_estimator,
+			currency_conversion: crate::sync::Arc::new(crate::util::test_utils::TestCurrencyConversion {}),
 			router: nodes[1].router,
 			message_router: nodes[1].message_router,
 			chain_monitor: nodes[1].chain_monitor,

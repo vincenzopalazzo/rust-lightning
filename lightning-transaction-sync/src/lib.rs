@@ -44,6 +44,7 @@
 //! 	Arc::clone(&chain_monitor),
 //! 	Arc::clone(&some_broadcaster),
 //! 	Arc::clone(&some_router),
+//! 	Arc::new(lightning::offers::currency::NullCurrencyConversion),
 //! 	Arc::clone(&some_logger),
 //! 	Arc::clone(&some_entropy_source),
 //! 	Arc::clone(&some_node_signer),

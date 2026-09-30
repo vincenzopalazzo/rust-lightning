@@ -2289,6 +2289,7 @@ impl<
 /// #     tx_broadcaster: &dyn lightning::chain::chaininterface::BroadcasterInterface,
 /// #     router: &lightning::routing::router::DefaultRouter<&NetworkGraph<&'a L>, &'a L, &ES, &S, SP, SL>,
 /// #     message_router: &lightning::onion_message::messenger::DefaultMessageRouter<&NetworkGraph<&'a L>, &'a L, &ES>,
+/// #     currency_conversion: std::sync::Arc<dyn lightning::offers::currency::CurrencyConversion + Send + Sync>,
 /// #     logger: &L,
 /// #     entropy_source: &ES,
 /// #     node_signer: &dyn lightning::sign::NodeSigner,
@@ -2304,7 +2305,7 @@ impl<
 /// };
 /// let config = UserConfig::default();
 /// let channel_manager = ChannelManager::new(
-///     fee_estimator, chain_monitor, tx_broadcaster, router, message_router,
+///     fee_estimator, chain_monitor, tx_broadcaster, router, message_router, currency_conversion.clone(),
 ///     logger, entropy_source, node_signer, signer_provider, config.clone(), params, current_timestamp,
 /// );
 ///
@@ -2312,10 +2313,10 @@ impl<
 /// let mut channel_monitors = read_channel_monitors();
 /// let args = ChannelManagerReadArgs::new(
 ///     entropy_source, node_signer, signer_provider, fee_estimator, chain_monitor, tx_broadcaster,
-///     router, message_router, logger, config, channel_monitors.iter().collect(),
+///     router, message_router, currency_conversion, logger, config, channel_monitors.iter().collect(),
 /// );
 /// let (best_block, channel_manager) =
-///     <(BlockLocator, ChannelManager<_, _, _, _, _, _, _, _, _, _>)>::read(&mut reader, args)?;
+///     <(BlockLocator, ChannelManager<_, _, _, _, _, _, _, _, _>)>::read(&mut reader, args)?;
 ///
 /// // Update the ChannelManager and ChannelMonitors with the latest chain data
 /// // ...
@@ -2975,6 +2976,17 @@ pub struct ChannelManager<
 	pub(super) flow: OffersMessageFlow<MR, L>,
 	#[cfg(not(test))]
 	flow: OffersMessageFlow<MR, L>,
+
+	/// Standing currency-conversion table for inbound and asynchronous BOLT 12
+	/// flows (answering invoice requests, verifying received invoices).
+	///
+	/// Calls that initiate a flow take their own converter
+	/// ([`Self::create_offer_builder_with_conversion`],
+	/// [`Self::pay_for_offer_with_conversion`]). When the invoice request or
+	/// invoice comes back asynchronously there is no call context, so those
+	/// paths use this table. Nodes that never price fiat pass
+	/// [`NullCurrencyConversion`].
+	currency_conversion: Arc<dyn CurrencyConversion + Send + Sync>,
 
 	#[cfg(any(test, feature = "_test_utils"))]
 	pub(super) best_block: RwLock<BlockLocator>,
@@ -3950,7 +3962,8 @@ impl<
 	/// [`params.best_block.block_hash`]: chain::BlockLocator::block_hash
 	#[rustfmt::skip]
 	pub fn new(
-		fee_est: F, chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR, logger: L,
+		fee_est: F, chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR,
+		currency_conversion: Arc<dyn CurrencyConversion + Send + Sync>, logger: L,
 		entropy_source: ES, node_signer: NS, signer_provider: SP, config: UserConfig,
 		params: ChainParameters, current_timestamp: u32,
 	) -> Self
@@ -3979,6 +3992,7 @@ impl<
 			tx_broadcaster,
 			router,
 			flow,
+			currency_conversion,
 
 			best_block: RwLock::new(params.best_block),
 
@@ -6148,7 +6162,7 @@ impl<
 	pub fn send_payment_for_bolt12_invoice(
 		&self, invoice: &Bolt12Invoice, context: Option<&OffersContext>,
 	) -> Result<(), Bolt12PaymentError> {
-		match self.flow.verify_bolt12_invoice(invoice, &NullCurrencyConversion, context) {
+		match self.flow.verify_bolt12_invoice(invoice, &self.currency_conversion, context) {
 			Ok(payment_id) => self.send_payment_for_verified_bolt12_invoice(invoice, payment_id),
 			Err(Bolt12SemanticError::UnexpectedAmount) => {
 				Err(Bolt12PaymentError::UnexpectedInvoice)
@@ -6302,7 +6316,7 @@ impl<
 			let outbound_pmts_res = self.pending_outbound_payments.static_invoice_received(
 				invoice,
 				payment_id,
-				&NullCurrencyConversion,
+				&self.currency_conversion,
 				features,
 				best_block_height,
 				self.duration_since_epoch(),
@@ -9387,7 +9401,7 @@ impl<
 								};
 
 								match verified_invreq
-									.payable_amount_msats(&NullCurrencyConversion)
+									.payable_amount_msats(&self.currency_conversion)
 								{
 									Ok(invreq_amt_msat) => {
 										if payment_data.total_msat < invreq_amt_msat {
@@ -18249,7 +18263,7 @@ impl<
 						let result = self.flow.create_invoice_builder_from_invoice_request_with_keys(
 							&self.router,
 							&request,
-							&NullCurrencyConversion,
+							&self.currency_conversion,
 							self.list_usable_channels(),
 							get_payment_info,
 							payment_metadata,
@@ -18275,7 +18289,7 @@ impl<
 						let result = self.flow.create_invoice_builder_from_invoice_request_without_keys(
 							&self.router,
 							&request,
-							&NullCurrencyConversion,
+							&self.currency_conversion,
 							self.list_usable_channels(),
 							get_payment_info,
 							payment_metadata,
@@ -18317,7 +18331,7 @@ impl<
 				})
 			},
 			OffersMessage::Invoice(invoice) => {
-				let payment_id = match self.flow.verify_bolt12_invoice(&invoice, &NullCurrencyConversion, context.as_ref()) {
+				let payment_id = match self.flow.verify_bolt12_invoice(&invoice, &self.currency_conversion, context.as_ref()) {
 					Ok(payment_id) => payment_id,
 					Err(_) => return None,
 				};
@@ -18419,7 +18433,7 @@ impl<
 			self.get_peers_for_blinded_path(),
 			self.list_usable_channels(),
 			&self.entropy_source,
-			&NullCurrencyConversion,
+			&self.currency_conversion,
 			&self.router,
 		) {
 			Some((msg, ctx)) => (msg, ctx),
@@ -19927,6 +19941,11 @@ pub struct ChannelManagerReadArgs<
 	///
 	/// [`BlindedMessagePath`]: crate::blinded_path::message::BlindedMessagePath
 	pub message_router: MR,
+	/// The standing [`CurrencyConversion`] table used for inbound and
+	/// asynchronous BOLT 12 flows. Not persisted; pass it again on restart.
+	///
+	/// [`CurrencyConversion`]: crate::offers::currency::CurrencyConversion
+	pub currency_conversion: Arc<dyn CurrencyConversion + Send + Sync>,
 	/// The Logger for use in the ChannelManager and which may be used to log information during
 	/// deserialization.
 	pub logger: L,
@@ -19975,7 +19994,8 @@ impl<
 	/// populate a HashMap directly from C.
 	pub fn new(
 		entropy_source: ES, node_signer: NS, signer_provider: SP, fee_estimator: F,
-		chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR, logger: L,
+		chain_monitor: M, tx_broadcaster: T, router: R, message_router: MR,
+		currency_conversion: Arc<dyn CurrencyConversion + Send + Sync>, logger: L,
 		config: UserConfig, mut channel_monitors: Vec<&'a ChannelMonitor<SP::EcdsaSigner>>,
 	) -> Self {
 		Self {
@@ -19987,6 +20007,7 @@ impl<
 			tx_broadcaster,
 			router,
 			message_router,
+			currency_conversion,
 			logger,
 			config,
 			channel_monitors: hash_map_from_iter(
@@ -21351,6 +21372,7 @@ impl<
 			tx_broadcaster: args.tx_broadcaster,
 			router: args.router,
 			flow,
+			currency_conversion: args.currency_conversion,
 
 			best_block: RwLock::new(best_block),
 
@@ -23084,7 +23106,7 @@ pub mod bench {
 		let seed_a = [1u8; 32];
 		let keys_manager_a = KeysManager::new(&seed_a, 42, 42, true, &logger_a);
 		let chain_monitor_a = ChainMonitor::new(None::<&test_utils::TestChainSource>, &tx_broadcaster, &logger_a, &fee_estimator, &persister_a, &keys_manager_a, keys_manager_a.get_peer_storage_key(), false);
-		let node_a = ChannelManager::new(&fee_estimator, &chain_monitor_a, &tx_broadcaster, &router, &message_router, &logger_a, &keys_manager_a, &keys_manager_a, &keys_manager_a, config.clone(), ChainParameters {
+		let node_a = ChannelManager::new(&fee_estimator, &chain_monitor_a, &tx_broadcaster, &router, &message_router, Arc::new(test_utils::TestCurrencyConversion {}), &logger_a, &keys_manager_a, &keys_manager_a, &keys_manager_a, config.clone(), ChainParameters {
 			network,
 			best_block: BlockLocator::from_network(network),
 		}, genesis_block.header.time);
@@ -23094,7 +23116,7 @@ pub mod bench {
 		let seed_b = [2u8; 32];
 		let keys_manager_b = KeysManager::new(&seed_b, 42, 42, true, &logger_b);
 		let chain_monitor_b = ChainMonitor::new(None::<&test_utils::TestChainSource>, &tx_broadcaster, &logger_a, &fee_estimator, &persister_b, &keys_manager_b, keys_manager_b.get_peer_storage_key(), false);
-		let node_b = ChannelManager::new(&fee_estimator, &chain_monitor_b, &tx_broadcaster, &router, &message_router, &logger_b, &keys_manager_b, &keys_manager_b, &keys_manager_b, config.clone(), ChainParameters {
+		let node_b = ChannelManager::new(&fee_estimator, &chain_monitor_b, &tx_broadcaster, &router, &message_router, Arc::new(test_utils::TestCurrencyConversion {}), &logger_b, &keys_manager_b, &keys_manager_b, &keys_manager_b, config.clone(), ChainParameters {
 			network,
 			best_block: BlockLocator::from_network(network),
 		}, genesis_block.header.time);
