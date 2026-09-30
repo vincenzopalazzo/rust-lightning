@@ -15133,6 +15133,24 @@ impl<
 {
 	#[cfg(not(c_bindings))]
 	create_offer_builder!(self, OfferBuilder<'_, DerivedMetadata, secp256k1::All, NullCurrencyConversion>);
+
+	/// Same as [`Self::create_offer_builder`], but validates a currency-denominated
+	/// amount with `conversion` instead of rejecting every ISO 4217 amount.
+	///
+	/// The converter is borrowed by the returned builder and is not stored on the
+	/// [`ChannelManager`]. A node that publishes offers and a node that pays them
+	/// should pass different bounds: the rate it is willing to be paid is not the
+	/// rate it is willing to pay.
+	#[cfg(not(c_bindings))]
+	pub fn create_offer_builder_with_conversion<'a, CC: CurrencyConversion>(
+		&'a self, conversion: &'a CC,
+	) -> Result<OfferBuilder<'a, DerivedMetadata, secp256k1::All, CC>, Bolt12SemanticError> {
+		let builder = self.flow.create_offer_builder(
+			&self.entropy_source, conversion, self.get_peers_for_blinded_path(),
+		)?;
+		Ok(builder.into())
+	}
+
 	#[cfg(not(c_bindings))]
 	create_refund_builder!(self, RefundBuilder<'_, secp256k1::All>);
 
