@@ -3521,7 +3521,7 @@ mod tests {
 		let nonce = Nonce([7; 16]);
 		let payment_id = PaymentId([3; 32]);
 
-		let invoice = OfferBuilder::new(recipient_pubkey())
+		let invoice = OfferBuilder::new(recipient_pubkey(), &NullCurrencyConversion)
 			.amount_msats(1000)
 			.build()
 			.unwrap()
@@ -3529,7 +3529,7 @@ mod tests {
 			.unwrap()
 			.build_and_sign()
 			.unwrap()
-			.respond_with_no_std(payment_paths(), payment_hash(), now())
+			.respond_with_no_std(&NullCurrencyConversion, payment_paths(), payment_hash(), now())
 			.unwrap()
 			.build()
 			.unwrap()

@@ -53,6 +53,7 @@ where
 /// use lightning::chain::chaininterface::BroadcasterInterface;
 /// use lightning::chain::chaininterface::FeeEstimator;
 /// use lightning::ln::channelmanager::{ChannelManager, ChannelManagerReadArgs};
+/// use lightning::offers::currency::NullCurrencyConversion;
 /// use lightning::onion_message::messenger::MessageRouter;
 /// use lightning::routing::router::Router;
 /// use lightning::sign;
@@ -99,6 +100,7 @@ where
 /// 	// Read the channel manager paired with the best block when it was persisted.
 /// 	let serialized_manager = "...";
 /// 	let (manager_best_block, mut manager) = {
+/// 		let currency_conversion = std::sync::Arc::new(NullCurrencyConversion);
 /// 		let read_args = ChannelManagerReadArgs::new(
 /// 			entropy_source,
 /// 			node_signer,
@@ -108,6 +110,7 @@ where
 /// 			tx_broadcaster,
 /// 			router,
 /// 			message_router,
+/// 			currency_conversion,
 /// 			logger,
 /// 			config,
 /// 			vec![&mut monitor],

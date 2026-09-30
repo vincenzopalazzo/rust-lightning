@@ -1949,6 +1949,7 @@ mod tests {
 		IgnoringMessageHandler, MessageHandler, PeerManager, SocketDescriptor,
 	};
 	use lightning::ln::types::ChannelId;
+	use lightning::offers::currency::NullCurrencyConversion;
 	use lightning::onion_message::messenger::{DefaultMessageRouter, OnionMessenger};
 	use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
 	use lightning::routing::router::{CandidateRouteHop, DefaultRouter, Path, RouteHop};
@@ -2494,6 +2495,7 @@ mod tests {
 				Arc::clone(&tx_broadcaster),
 				Arc::clone(&router),
 				Arc::clone(&msg_router),
+				Arc::new(NullCurrencyConversion),
 				Arc::clone(&logger),
 				Arc::clone(&keys_manager),
 				Arc::clone(&keys_manager),

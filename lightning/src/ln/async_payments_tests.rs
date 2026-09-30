@@ -328,7 +328,7 @@ fn create_static_invoice<T: secp256k1::Signing + secp256k1::Verification>(
 	let (offer_builder, offer_nonce) = recipient
 		.node
 		.flow
-		.create_async_receive_offer_builder(entropy_source, blinded_paths_to_always_online_node)
+		.create_async_receive_offer_builder(entropy_source, &crate::util::test_utils::TestCurrencyConversion {}, blinded_paths_to_always_online_node)
 		.unwrap();
 	let offer = offer_builder.build().unwrap();
 	let static_invoice =
@@ -702,7 +702,7 @@ fn static_invoice_unknown_required_features() {
 	let (offer_builder, nonce) = nodes[2]
 		.node
 		.flow
-		.create_async_receive_offer_builder(entropy_source, blinded_paths_to_always_online_node)
+		.create_async_receive_offer_builder(entropy_source, &crate::util::test_utils::TestCurrencyConversion {}, blinded_paths_to_always_online_node)
 		.unwrap();
 	let offer = offer_builder.build().unwrap();
 	let static_invoice_unknown_req_features =
@@ -1772,7 +1772,7 @@ fn invalid_async_receive_with_retry<F1, F2>(
 	let (offer_builder, offer_nonce) = nodes[2]
 		.node
 		.flow
-		.create_async_receive_offer_builder(entropy_source, blinded_paths_to_always_online_node)
+		.create_async_receive_offer_builder(entropy_source, &crate::util::test_utils::TestCurrencyConversion {}, blinded_paths_to_always_online_node)
 		.unwrap();
 	let offer = offer_builder.build().unwrap();
 	let amt_msat = 5000;
