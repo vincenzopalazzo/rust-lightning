@@ -95,6 +95,9 @@ use crate::ln::outbound_payment::{
 };
 use crate::ln::types::ChannelId;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
+#[cfg(not(c_bindings))]
+use crate::offers::currency::CurrencyConversion;
+use crate::offers::currency::NullCurrencyConversion;
 use crate::offers::flow::{HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow};
 use crate::offers::invoice::{Bolt12Invoice, UnsignedBolt12Invoice};
 use crate::offers::invoice_error::InvoiceError;
@@ -2179,8 +2182,8 @@ impl<
 /// };
 /// let config = UserConfig::default();
 /// let channel_manager = ChannelManager::new(
-///     fee_estimator, chain_monitor, tx_broadcaster, router, message_router, logger,
-///     entropy_source, node_signer, signer_provider, config.clone(), params, current_timestamp,
+///     fee_estimator, chain_monitor, tx_broadcaster, router, message_router,
+///     logger, entropy_source, node_signer, signer_provider, config.clone(), params, current_timestamp,
 /// );
 ///
 /// // Restart from deserialized data
@@ -2190,7 +2193,7 @@ impl<
 ///     router, message_router, logger, config, channel_monitors.iter().collect(),
 /// );
 /// let (best_block, channel_manager) =
-///     <(BlockLocator, ChannelManager<_, _, _, _, _, _, _, _, _>)>::read(&mut reader, args)?;
+///     <(BlockLocator, ChannelManager<_, _, _, _, _, _, _, _, _, _>)>::read(&mut reader, args)?;
 ///
 /// // Update the ChannelManager and ChannelMonitors with the latest chain data
 /// // ...
@@ -2547,7 +2550,7 @@ impl<
 ///     .create_offer_builder()?
 /// # ;
 /// # // Needed for compiling for c_bindings
-/// # let builder: lightning::offers::offer::OfferBuilder<_, _> = offer.into();
+/// # let builder: lightning::offers::offer::OfferBuilder<_, _, _> = offer.into();
 /// # let offer = builder
 ///     .description("coffee".to_string())
 ///     .amount_msats(10_000_000)
@@ -3795,7 +3798,8 @@ impl<
 		let flow = OffersMessageFlow::new(
 			ChainHash::using_genesis_block(params.network), params.best_block,
 			our_network_pubkey, current_timestamp, expanded_inbound_key,
-			node_signer.get_receive_auth_key(), secp_ctx.clone(), message_router, logger.clone(),
+			node_signer.get_receive_auth_key(), secp_ctx.clone(), message_router,
+			logger.clone(),
 		);
 
 		ChannelManager {
@@ -5921,6 +5925,13 @@ impl<
 	///   offer, or
 	/// - the refund corresponding to the invoice has already expired.
 	///
+	/// If the invoice corresponds to a currency-denominated offer and the invoice request did not
+	/// specify an explicit amount, the invoice amount is checked against the maximum amount payable
+	/// using the configured currency conversion. [`Bolt12PaymentError::UnverifiableAmount`] is
+	/// returned if the invoice amount could not be verified against the converted offer amount, and
+	/// [`Bolt12PaymentError::ExcessiveAmount`] is returned if the invoice quotes more than the
+	/// maximum amount we are willing to pay for the offer.
+	///
 	/// To retry the payment, request another invoice using a new `payment_id`.
 	///
 	/// Attempting to pay the same invoice twice while the first payment is still pending will
@@ -5933,9 +5944,16 @@ impl<
 	pub fn send_payment_for_bolt12_invoice(
 		&self, invoice: &Bolt12Invoice, context: Option<&OffersContext>,
 	) -> Result<(), Bolt12PaymentError> {
-		match self.flow.verify_bolt12_invoice(invoice, context) {
+		match self.flow.verify_bolt12_invoice(invoice, &NullCurrencyConversion, context) {
 			Ok(payment_id) => self.send_payment_for_verified_bolt12_invoice(invoice, payment_id),
-			Err(()) => Err(Bolt12PaymentError::UnexpectedInvoice),
+			Err(Bolt12SemanticError::UnexpectedAmount) => {
+				Err(Bolt12PaymentError::UnexpectedInvoice)
+			},
+			Err(Bolt12SemanticError::UnsupportedCurrency)
+			| Err(Bolt12SemanticError::MissingAmount)
+			| Err(Bolt12SemanticError::InvalidAmount) => Err(Bolt12PaymentError::UnverifiableAmount),
+			Err(Bolt12SemanticError::ExcessiveAmount) => Err(Bolt12PaymentError::ExcessiveAmount),
+			_ => Err(Bolt12PaymentError::UnexpectedInvoice),
 		}
 	}
 
@@ -6022,6 +6040,7 @@ impl<
 			let outbound_pmts_res = self.pending_outbound_payments.static_invoice_received(
 				invoice,
 				payment_id,
+				&NullCurrencyConversion,
 				features,
 				best_block_height,
 				self.duration_since_epoch(),
@@ -8850,7 +8869,7 @@ impl<
 									},
 								};
 
-								let verify_opt = invoice_request_opt.and_then(|invreq| {
+								let verified_invreq = match invoice_request_opt.and_then(|invreq| {
 									invreq
 										.verify_using_recipient_data(
 											offer_nonce,
@@ -8858,22 +8877,28 @@ impl<
 											&self.secp_ctx,
 										)
 										.ok()
-								});
-								let verified_invreq = match verify_opt {
-									Some(verified_invreq) => {
-										if let Some(invreq_amt_msat) =
-											verified_invreq.amount_msats()
-										{
-											if payment_data.total_msat < invreq_amt_msat {
-												fail_htlc!(payment_hash);
-											}
-										}
-										verified_invreq
-									},
+								}) {
+									Some(verified_invreq) => verified_invreq,
 									None => {
 										fail_htlc!(payment_hash);
 									},
 								};
+
+								match verified_invreq
+									.payable_amount_msats(&NullCurrencyConversion)
+								{
+									Ok(invreq_amt_msat) => {
+										if payment_data.total_msat < invreq_amt_msat {
+											fail_htlc!(payment_hash);
+										}
+									},
+									// If we cannot check the offer amount, reject the payment instead of risking
+									// accepting an underpayment.
+									Err(_) => {
+										fail_htlc!(payment_hash);
+									},
+								}
+
 								let payment_purpose_context =
 									PaymentContext::Bolt12Offer(Bolt12OfferContext {
 										offer_id: verified_invreq.offer_id(),
@@ -14916,12 +14941,9 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 	///
 	/// Errors if the parameterized [`MessageRouter`] is unable to create a blinded path for the offer.
 	///
-	/// [`BlindedMessagePath`]: crate::blinded_path::message::BlindedMessagePath
-	/// [`Offer`]: crate::offers::offer::Offer
-	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
 	pub fn create_offer_builder(&$self) -> Result<$builder, Bolt12SemanticError> {
 		let builder = $self.flow.create_offer_builder(
-			&$self.entropy_source, $self.get_peers_for_blinded_path()
+			&$self.entropy_source, &NullCurrencyConversion, $self.get_peers_for_blinded_path()
 		)?;
 
 		Ok(builder.into())
@@ -14943,7 +14965,7 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 		router: ME,
 	) -> Result<$builder, Bolt12SemanticError> {
 		let builder = $self.flow.create_offer_builder_using_router(
-			router, &$self.entropy_source, $self.get_peers_for_blinded_path()
+			router, &$self.entropy_source, &NullCurrencyConversion, $self.get_peers_for_blinded_path()
 		)?;
 
 		Ok(builder.into())
@@ -14984,7 +15006,7 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 		}
 
 		let builder = $self.flow.create_phantom_offer_builder(
-			&$self.entropy_source, peers, path_count_limit
+			&$self.entropy_source, &NullCurrencyConversion, peers, path_count_limit
 		)?;
 
 		Ok(builder.into())
@@ -15110,12 +15132,12 @@ impl<
 	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
 {
 	#[cfg(not(c_bindings))]
-	create_offer_builder!(self, OfferBuilder<'_, DerivedMetadata, secp256k1::All>);
+	create_offer_builder!(self, OfferBuilder<'_, DerivedMetadata, secp256k1::All, NullCurrencyConversion>);
 	#[cfg(not(c_bindings))]
 	create_refund_builder!(self, RefundBuilder<'_, secp256k1::All>);
 
 	#[cfg(c_bindings)]
-	create_offer_builder!(self, OfferWithDerivedMetadataBuilder);
+	create_offer_builder!(self, OfferWithDerivedMetadataBuilder<'_, NullCurrencyConversion>);
 	#[cfg(c_bindings)]
 	create_refund_builder!(self, RefundMaybeWithDerivedMetadataBuilder);
 
@@ -15159,6 +15181,12 @@ impl<
 	///
 	/// `amount_msats` allows you to overpay what is required to satisfy the offer, or may be
 	/// required if the offer does not require a specific amount.
+	///
+	/// If the offer specifies an amount in a fiat currency, `amount_msats` is not locally
+	/// checked against the offer amount when building the [`InvoiceRequest`]. Instead, the
+	/// payee verifies whether the requested amount is sufficient when deciding whether to
+	/// issue a [`Bolt12Invoice`]. If `amount_msats` is omitted, the payee may determine the
+	/// final invoice amount.
 	///
 	/// If the [`Offer`] was built from a human readable name resolved using BIP 353, you *must*
 	/// instead call [`Self::pay_for_offer_from_hrn`].
@@ -15204,6 +15232,22 @@ impl<
 		&self, offer: &Offer, amount_msats: Option<u64>, payment_id: PaymentId,
 		optional_params: OptionalOfferPaymentParams,
 	) -> Result<(), Bolt12SemanticError> {
+		self.pay_for_offer_with_conversion(
+			offer, amount_msats, payment_id, optional_params, &NullCurrencyConversion,
+		)
+	}
+
+	/// Same as [`Self::pay_for_offer`], but resolves a currency-denominated offer with
+	/// `conversion` before the [`InvoiceRequest`] is sent.
+	///
+	/// An explicit `amount_msats` outside the converted range is rejected locally.
+	/// Omitting `amount_msats` sends no amount and lets the payee price the invoice;
+	/// the returned invoice is checked against the same converter. The converter is
+	/// not stored: pass the bound for this payment, not a node-wide rate.
+	pub fn pay_for_offer_with_conversion<CC: CurrencyConversion>(
+		&self, offer: &Offer, amount_msats: Option<u64>, payment_id: PaymentId,
+		optional_params: OptionalOfferPaymentParams, conversion: &CC,
+	) -> Result<(), Bolt12SemanticError> {
 		let create_pending_payment_fn = |retryable_invoice_request: RetryableInvoiceRequest| {
 			self.pending_outbound_payments
 				.add_new_awaiting_invoice(
@@ -15223,6 +15267,7 @@ impl<
 			optional_params.payer_note,
 			payment_id,
 			None,
+			conversion,
 			create_pending_payment_fn,
 		)
 	}
@@ -15252,6 +15297,7 @@ impl<
 			optional_params.payer_note,
 			payment_id,
 			Some(offer.hrn),
+			&NullCurrencyConversion,
 			create_pending_payment_fn,
 		)
 	}
@@ -15294,16 +15340,34 @@ impl<
 			optional_params.payer_note,
 			payment_id,
 			None,
+			&NullCurrencyConversion,
 			create_pending_payment_fn,
 		)
 	}
 
 	#[rustfmt::skip]
-	fn pay_for_offer_intern<CPP: FnOnce(RetryableInvoiceRequest) -> Result<(), Bolt12SemanticError>>(
+	fn pay_for_offer_intern<CC: CurrencyConversion, CPP: FnOnce(RetryableInvoiceRequest) -> Result<(), Bolt12SemanticError>>(
 		&self, offer: &Offer, quantity: Option<u64>, amount_msats: Option<u64>,
 		payer_note: Option<String>, payment_id: PaymentId,
-		human_readable_name: Option<HumanReadableName>, create_pending_payment: CPP,
+		human_readable_name: Option<HumanReadableName>, conversion: &CC,
+		create_pending_payment: CPP,
 	) -> Result<(), Bolt12SemanticError> {
+		if let Some(amount) = offer.amount() {
+			let (minimum_unit, maximum_unit) = amount.to_msats_range(conversion)?;
+			let quantity_for_range = quantity.unwrap_or(1);
+			let minimum_msats = minimum_unit
+				.checked_mul(quantity_for_range)
+				.filter(|msats| *msats <= msgs::MAX_VALUE_MSAT)
+				.ok_or(Bolt12SemanticError::InvalidAmount)?;
+			let maximum_msats = maximum_unit
+				.saturating_mul(quantity_for_range)
+				.min(msgs::MAX_VALUE_MSAT);
+			if let Some(amount_msats) = amount_msats {
+				if amount_msats < minimum_msats || amount_msats > maximum_msats {
+					return Err(Bolt12SemanticError::InvalidAmount);
+				}
+			}
+		}
 		let entropy = &self.entropy_source;
 		let nonce = Nonce::from_entropy_source(entropy);
 
@@ -17587,6 +17651,9 @@ impl<
 					},
 					Err(Bolt12PaymentError::UnexpectedInvoice)
 						| Err(Bolt12PaymentError::DuplicateInvoice)
+						| Err(Bolt12PaymentError::UnverifiableAmount)
+						| Err(Bolt12PaymentError::InsufficientAmount)
+						| Err(Bolt12PaymentError::ExcessiveAmount)
 						| Ok(()) => return None,
 				};
 
@@ -17642,6 +17709,7 @@ impl<
 						let result = self.flow.create_invoice_builder_from_invoice_request_with_keys(
 							&self.router,
 							&request,
+							&NullCurrencyConversion,
 							self.list_usable_channels(),
 							get_payment_info,
 							payment_metadata,
@@ -17667,6 +17735,7 @@ impl<
 						let result = self.flow.create_invoice_builder_from_invoice_request_without_keys(
 							&self.router,
 							&request,
+							&NullCurrencyConversion,
 							self.list_usable_channels(),
 							get_payment_info,
 							payment_metadata,
@@ -17708,9 +17777,9 @@ impl<
 				})
 			},
 			OffersMessage::Invoice(invoice) => {
-				let payment_id = match self.flow.verify_bolt12_invoice(&invoice, context.as_ref()) {
+				let payment_id = match self.flow.verify_bolt12_invoice(&invoice, &NullCurrencyConversion, context.as_ref()) {
 					Ok(payment_id) => payment_id,
-					Err(()) => return None,
+					Err(_) => return None,
 				};
 
 				let logger = WithContext::for_payment(
@@ -17809,6 +17878,7 @@ impl<
 			self.get_peers_for_blinded_path(),
 			self.list_usable_channels(),
 			&self.entropy_source,
+			&NullCurrencyConversion,
 			&self.router,
 		) {
 			Some((msg, ctx)) => (msg, ctx),
@@ -19469,8 +19539,10 @@ impl<
 	fn read<Reader: io::Read>(
 		reader: &mut Reader, args: ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L>,
 	) -> Result<Self, DecodeError> {
-		let (best_block, chan_manager) =
-			<(BlockLocator, ChannelManager<M, T, ES, NS, SP, F, R, MR, L>)>::read(reader, args)?;
+		let (best_block, chan_manager) = <(
+			BlockLocator,
+			ChannelManager<M, T, ES, NS, SP, F, R, MR, L>,
+		)>::read(reader, args)?;
 		Ok((best_block, Arc::new(chan_manager)))
 	}
 }
@@ -22421,7 +22493,7 @@ pub mod bench {
 		let entropy = test_utils::TestKeysInterface::new(&[0u8; 32], network);
 		let router = test_utils::TestRouter::new(Arc::new(NetworkGraph::new(network, &logger_a)), &logger_a, &scorer);
 		let message_router = test_utils::TestMessageRouter::new_default(Arc::new(NetworkGraph::new(network, &logger_a)), &entropy);
-
+		
 		let mut config: UserConfig = Default::default();
 		config.channel_config.max_dust_htlc_exposure = MaxDustHTLCExposure::FeeRateMultiplier(5_000_000 / 253);
 		config.channel_handshake_config.minimum_depth = 1;
