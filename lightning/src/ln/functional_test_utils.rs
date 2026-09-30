@@ -936,6 +936,7 @@ impl<'a, 'b, 'c> Drop for Node<'a, 'b, 'c> {
 						node_signer: self.keys_manager,
 						signer_provider: self.keys_manager,
 						fee_estimator: &test_utils::TestFeeEstimator::new(253),
+						currency_conversion: Arc::new(test_utils::TestCurrencyConversion {}),
 						router: &test_utils::TestRouter::new(
 							Arc::clone(&network_graph),
 							&self.logger,
@@ -1382,6 +1383,7 @@ pub fn _reload_node<'a, 'b, 'c>(
 				node_signer: node.keys_manager,
 				signer_provider: node.keys_manager,
 				fee_estimator: node.fee_estimator,
+				currency_conversion: Arc::new(test_utils::TestCurrencyConversion {}),
 				router: node.router,
 				message_router: node.message_router,
 				chain_monitor: node.chain_monitor,
@@ -4838,6 +4840,7 @@ pub fn create_node_chanmgrs<'a, 'b>(
 			cfgs[i].tx_broadcaster,
 			&cfgs[i].router,
 			&cfgs[i].message_router,
+			Arc::new(test_utils::TestCurrencyConversion {}),
 			cfgs[i].logger,
 			cfgs[i].keys_manager,
 			cfgs[i].keys_manager,
