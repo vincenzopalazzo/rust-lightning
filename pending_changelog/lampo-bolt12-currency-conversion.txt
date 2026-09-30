@@ -1,0 +1,15 @@
+# API Updates
+
+* BOLT 12 offers may use an ISO 4217 amount. `ChannelManager` does not store
+  a converter: pass one to `create_offer_builder_with_conversion` and
+  `pay_for_offer_with_conversion`. `pay_for_offer` and `create_offer_builder`
+  keep their previous signatures and reject currency amounts via
+  `NullCurrencyConversion`.
+
+* `pay_for_offer_with_conversion` rejects an explicit amount outside the
+  converted range before sending an `InvoiceRequest`. The range is
+  `Amount::to_msats_range`, multiplied by the quantity.
+
+* A node that publishes offers and a node that pays them should pass
+  different bounds. The rate it is willing to be paid is not the rate it is
+  willing to pay, and neither is persisted with the channel manager.

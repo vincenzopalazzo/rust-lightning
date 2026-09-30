@@ -26,9 +26,11 @@ use crate::ln::channelmanager::{
 use crate::ln::msgs::{DecodeError, TrampolineOnionPacket};
 use crate::ln::onion_utils;
 use crate::ln::onion_utils::{DecodedOnionFailure, HTLCFailReason};
+use crate::offers::currency::CurrencyConversion;
 use crate::offers::invoice::{Bolt12Invoice, DerivedSigningPubkey, InvoiceBuilder};
 use crate::offers::invoice_request::InvoiceRequest;
 use crate::offers::nonce::Nonce;
+use crate::offers::parse::Bolt12SemanticError;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::routing::router::{
 	BlindedTail, InFlightHtlcs, Path, PaymentParameters, Route, RouteParameters,
@@ -686,6 +688,28 @@ pub enum Bolt12PaymentError {
 	UnexpectedInvoice,
 	/// Payment for an invoice with the corresponding [`PaymentId`] was already initiated.
 	DuplicateInvoice,
+	/// The invoice was valid for the corresponding [`PaymentId`], but its amount
+	/// could not be verified.
+	///
+	/// This occurs for currency-denominated offers without an explicitly requested
+	/// amount when the offer amount could not be converted to msats because the
+	/// currency was unsupported or the converted amount exceeded supported bounds.
+	UnverifiableAmount,
+	/// The invoice was valid for the corresponding [`PaymentId`], but its amount
+	/// was lower than the minimum acceptable amount derived from the underlying
+	/// offer.
+	///
+	/// This occurs for currency-denominated offers with an explicitly requested
+	/// amount when the requested invoice amount was lower than the minimum amount
+	/// the payee was willing to accept after currency conversion.
+	InsufficientAmount,
+	/// The invoice was valid for the corresponding [`PaymentId`], but its amount
+	/// exceeded the maximum acceptable amount derived from the underlying offer.
+	///
+	/// This occurs for currency-denominated offers without an explicitly requested
+	/// amount when the invoice amount was higher than the payer was willing to pay
+	/// after currency conversion.
+	ExcessiveAmount,
 	/// The invoice was valid for the corresponding [`PaymentId`], but required unknown features.
 	UnknownRequiredFeatures,
 	/// Incorrect amount was provided to [`ChannelManager::pay_for_bolt12_invoice`].
@@ -1384,9 +1408,10 @@ impl OutboundPayments {
 		Ok(())
 	}
 
-	pub(super) fn static_invoice_received<ES: EntropySource>(
-		&self, invoice: &StaticInvoice, payment_id: PaymentId, features: Bolt12InvoiceFeatures,
-		best_block_height: u32, duration_since_epoch: Duration, entropy_source: ES,
+	pub(super) fn static_invoice_received<ES: EntropySource, CC: CurrencyConversion>(
+		&self, invoice: &StaticInvoice, payment_id: PaymentId, converter: &CC,
+		features: Bolt12InvoiceFeatures, best_block_height: u32, duration_since_epoch: Duration,
+		entropy_source: ES,
 		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>,
 	) -> Result<(), Bolt12PaymentError> {
 		macro_rules! abandon_with_entry {
@@ -1433,9 +1458,18 @@ impl OutboundPayments {
 					}
 
 					let amount_msat = match InvoiceBuilder::<DerivedSigningPubkey>::amount_msats(
-						invreq,
+						invreq, converter,
 					) {
 						Ok(amt) => amt,
+						Err(Bolt12SemanticError::UnsupportedCurrency)
+						| Err(Bolt12SemanticError::InvalidAmount) => {
+							abandon_with_entry!(entry, PaymentFailureReason::UnexpectedError);
+							return Err(Bolt12PaymentError::UnverifiableAmount);
+						},
+						Err(Bolt12SemanticError::InsufficientAmount) => {
+							abandon_with_entry!(entry, PaymentFailureReason::UnexpectedError);
+							return Err(Bolt12PaymentError::InsufficientAmount);
+						},
 						Err(_) => {
 							// We check this during invoice request parsing, when constructing the invreq's
 							// contents from its TLV stream.
@@ -3023,6 +3057,7 @@ mod tests {
 		Bolt12PaymentError, OutboundPayments, PendingOutboundPayment, RecipientCustomTlvs, Retry,
 		RetryableSendFailure, StaleExpiration,
 	};
+	use crate::offers::currency::NullCurrencyConversion;
 	#[cfg(feature = "std")]
 	use crate::offers::invoice::DEFAULT_RELATIVE_EXPIRY;
 	use crate::offers::nonce::Nonce;
@@ -3416,12 +3451,12 @@ mod tests {
 		assert!(outbound_payments.has_pending_payments());
 
 		let created_at = now() - DEFAULT_RELATIVE_EXPIRY;
-		let invoice = OfferBuilder::new(recipient_pubkey())
+		let invoice = OfferBuilder::new(recipient_pubkey(), &NullCurrencyConversion)
 			.amount_msats(1000)
 			.build().unwrap()
 			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id).unwrap()
 			.build_and_sign().unwrap()
-			.respond_with_no_std(payment_paths(), payment_hash(), created_at).unwrap()
+			.respond_with_no_std(&NullCurrencyConversion, payment_paths(), payment_hash(), created_at).unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
 
@@ -3465,12 +3500,12 @@ mod tests {
 		let payment_id = PaymentId([0; 32]);
 		let expiration = StaleExpiration::AbsoluteTimeout(Duration::from_secs(100));
 
-		let invoice = OfferBuilder::new(recipient_pubkey())
+		let invoice = OfferBuilder::new(recipient_pubkey(), &NullCurrencyConversion)
 			.amount_msats(1000)
 			.build().unwrap()
 			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id).unwrap()
 			.build_and_sign().unwrap()
-			.respond_with_no_std(payment_paths(), payment_hash(), now()).unwrap()
+			.respond_with_no_std(&NullCurrencyConversion, payment_paths(), payment_hash(), now()).unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
 
@@ -3530,12 +3565,12 @@ mod tests {
 		let payment_id = PaymentId([0; 32]);
 		let expiration = StaleExpiration::AbsoluteTimeout(Duration::from_secs(100));
 
-		let invoice = OfferBuilder::new(recipient_pubkey())
+		let invoice = OfferBuilder::new(recipient_pubkey(), &NullCurrencyConversion)
 			.amount_msats(1000)
 			.build().unwrap()
 			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id).unwrap()
 			.build_and_sign().unwrap()
-			.respond_with_no_std(payment_paths(), payment_hash(), now()).unwrap()
+			.respond_with_no_std(&NullCurrencyConversion, payment_paths(), payment_hash(), now()).unwrap()
 			.build().unwrap()
 			.sign(recipient_sign).unwrap();
 
@@ -3665,6 +3700,23 @@ mod tests {
 			},
 			_ => panic!("expected a Retryable payment"),
 		}
+	}
+
+	#[rustfmt::skip]
+	fn dummy_invoice_request() -> InvoiceRequest {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		OfferBuilder::new(recipient_pubkey(), &NullCurrencyConversion)
+			.amount_msats(1000)
+			.build().unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap()
 	}
 
 	#[test]
