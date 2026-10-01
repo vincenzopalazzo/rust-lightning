@@ -15135,7 +15135,7 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 			.and_then(|chan| chan.get_inbound_payment_scid());
 
 		let (builder, nonce) = $self.flow.create_compact_offer_builder(
-			&$self.entropy_source, intro_node_id, intro_short_channel_id,
+			&$self.entropy_source, &NullCurrencyConversion, intro_node_id, intro_short_channel_id,
 		)?;
 
 		Ok((builder.into(), nonce))
