@@ -619,10 +619,11 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	/// This is not exported to bindings users as builder patterns don't map outside of move semantics.
 	///
 	/// [`PAYER_OFFER_MAX_BYTES`]: crate::offers::contacts::PAYER_OFFER_MAX_BYTES
-	pub fn create_compact_offer_builder<ES: EntropySource>(
-		&self, entropy_source: ES, intro_node_id: PublicKey, intro_short_channel_id: Option<u64>,
-	) -> Result<(OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Nonce), Bolt12SemanticError> {
-		self.create_offer_builder_intern(&entropy_source, |_, context, _| {
+	pub fn create_compact_offer_builder<'a, ES: EntropySource, CC: CurrencyConversion>(
+		&'a self, entropy_source: ES, converter: &'a CC, intro_node_id: PublicKey,
+		intro_short_channel_id: Option<u64>,
+	) -> Result<(OfferBuilder<'a, DerivedMetadata, secp256k1::All, CC>, Nonce), Bolt12SemanticError> {
+		self.create_offer_builder_intern(&entropy_source, converter, |_, context, _| {
 			let peers = vec![MessageForwardNode {
 				node_id: intro_node_id,
 				short_channel_id: intro_short_channel_id,
