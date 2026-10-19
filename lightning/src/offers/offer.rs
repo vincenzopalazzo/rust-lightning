@@ -267,6 +267,21 @@ macro_rules! offer_explicit_metadata_builder_methods {
 			}
 		}
 
+		/// Creates a builder whose [`Offer::issuer_signing_pubkey`] is the public key of `contact_id`.
+		///
+		/// This calls [`Self::new`]. The secret key is [`ContactId::signing_secret`]; pass that to
+		/// [`compute_contact_secret`] together with the offer being paid. The same [`ContactId`]
+		/// always yields the same pubkey.
+		///
+		/// [`ContactId::signing_secret`]: crate::offers::contacts::ContactId::signing_secret
+		/// [`compute_contact_secret`]: crate::offers::contacts::compute_contact_secret
+		pub fn from_contact_id(
+			contact_id: &crate::offers::contacts::ContactId, converter: &'a CC,
+			secp_ctx: &Secp256k1<secp256k1::SignOnly>,
+		) -> Self {
+			Self::new(contact_id.signing_pubkey(secp_ctx), converter)
+		}
+
 		/// Sets the [`Offer::metadata`] to the given bytes.
 		///
 		/// Successive calls to this method will override the previous setting.
