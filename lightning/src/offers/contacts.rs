@@ -14,9 +14,11 @@
 //! See [bLIP 42](https://github.com/lightning/blips/blob/master/blip-0042.md) for more details.
 //!
 //! The typical lifecycle of a contact relationship is:
-//! 1. The payer adds the recipient to their contacts list using the recipient's long-lived
-//!    offer, deterministically deriving [`ContactSecrets`] from both parties' offers via
-//!    `ChannelManager::compute_contact_secret`.
+//! 1. The payer adds the recipient with a [`ContactId`]. Use [`ContactId::from_bip353`] when
+//!    the recipient has a BIP 353 name, or [`ContactId::from_entropy_source`] otherwise.
+//!    [`OfferBuilder::from_contact_id`] builds the offer we reveal, and [`compute_contact_secret`]
+//!    ECDHs [`ContactId::signing_secret`] with their offer. A long-lived offer pair can still
+//!    use `ChannelManager::compute_contact_secret`.
 //! 2. When paying that contact's offer, the payer opts into revealing their identity by setting
 //!    `OptionalOfferPaymentParams::contact_secrets` together with a return path: either
 //!    `OptionalOfferPaymentParams::payer_offer` or `OptionalOfferPaymentParams::payer_bip_353`.
@@ -33,18 +35,22 @@
 //!
 //! [`InvoiceRequestFields::contact_secret`]: crate::offers::invoice_request::InvoiceRequestFields::contact_secret
 //! [`InvoiceRequestFields::payer_offer`]: crate::offers::invoice_request::InvoiceRequestFields::payer_offer
+//! [`OfferBuilder::from_contact_id`]: crate::offers::offer::OfferBuilder::from_contact_id
+//! [`compute_contact_secret`]: crate::offers::contacts::compute_contact_secret
+//! [`ContactId::signing_secret`]: ContactId::signing_secret
 
 use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
 use crate::offers::offer::Offer;
 use crate::offers::parse::Bolt12SemanticError;
 use crate::onion_message::dns_resolution::HumanReadableName;
+use crate::sign::EntropySource;
 use crate::util::ser::{Readable, Writeable, Writer};
 use bitcoin::hashes::cmp::fixed_time_eq;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::secp256k1::ecdh::shared_secret_point;
 use bitcoin::secp256k1::schnorr;
-use bitcoin::secp256k1::{PublicKey, SecretKey};
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey, Signing};
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -125,6 +131,102 @@ impl Readable for ContactSecret {
 impl Writeable for ContactSecret {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		w.write_all(&self.contents)
+	}
+}
+
+/// Stable handle for one contact. The offer we show that contact is signed by the key derived
+/// from this id, so rebuilding the offer does not change the bLIP 42 contact secret.
+///
+/// [`Self::from_bip353`] hashes the [`HumanReadableName`] into the signing key, so the same name
+/// yields the same key on every node. [`Self::from_entropy_source`] is a fresh id; persist it.
+/// Two different ids produce two different pubkeys.
+///
+/// [`OfferBuilder::from_contact_id`] places [`Self::signing_pubkey`] on the offer.
+/// [`compute_contact_secret`] ECDHs [`Self::signing_secret`] with their offer.
+///
+/// [`OfferBuilder::from_contact_id`]: crate::offers::offer::OfferBuilder::from_contact_id
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ContactId {
+	/// Random id. The bytes are not a pubkey and must be persisted.
+	Entropy([u8; 32]),
+	/// Id of a BIP 353 recipient. The name is public; do not log [`Self::signing_secret`].
+	Bip353(HumanReadableName),
+}
+
+impl ContactId {
+	/// Creates a fresh id from `entropy_source`.
+	///
+	/// Persist the id. It cannot be derived again.
+	pub fn from_entropy_source<ES: EntropySource>(entropy_source: ES) -> Self {
+		ContactId::Entropy(entropy_source.get_secure_random_bytes())
+	}
+
+	/// Id for the recipient at `name`.
+	///
+	/// The same [`HumanReadableName`] always produces the same signing key.
+	pub fn from_bip353(name: HumanReadableName) -> Self {
+		ContactId::Bip353(name)
+	}
+
+	/// Secret key whose public half [`OfferBuilder::from_contact_id`] puts on the offer.
+	///
+	/// Pass it to [`compute_contact_secret`]. The same id always yields the same key. Do not log it.
+	///
+	/// [`OfferBuilder::from_contact_id`]: crate::offers::offer::OfferBuilder::from_contact_id
+	pub fn signing_secret(&self) -> SecretKey {
+		let mut engine = sha256::Hash::engine();
+		engine.input(b"ldk_contact_signing_key");
+		match self {
+			ContactId::Entropy(bytes) => engine.input(bytes),
+			ContactId::Bip353(name) => {
+				engine.input(&[name.user().len() as u8]);
+				engine.input(name.user().as_bytes());
+				engine.input(&[name.domain().len() as u8]);
+				engine.input(name.domain().as_bytes());
+			},
+		}
+		// A SHA256 output is a valid secp256k1 scalar.
+		SecretKey::from_slice(&sha256::Hash::from_engine(engine).to_byte_array())
+			.expect("You broke SHA-256!")
+	}
+
+	/// Public half of [`Self::signing_secret`].
+	pub fn signing_pubkey<C: Signing>(&self, secp_ctx: &Secp256k1<C>) -> PublicKey {
+		PublicKey::from_secret_key(secp_ctx, &self.signing_secret())
+	}
+}
+
+impl core::fmt::Debug for ContactId {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		match self {
+			ContactId::Entropy(_) => f.write_str("ContactId::Entropy"),
+			ContactId::Bip353(name) => f.debug_tuple("ContactId::Bip353").field(name).finish(),
+		}
+	}
+}
+
+impl Readable for ContactId {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		match <u8 as Readable>::read(r)? {
+			0 => Ok(ContactId::Entropy(Readable::read(r)?)),
+			1 => Ok(ContactId::Bip353(Readable::read(r)?)),
+			_ => Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for ContactId {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		match self {
+			ContactId::Entropy(bytes) => {
+				0u8.write(w)?;
+				bytes.write(w)
+			},
+			ContactId::Bip353(name) => {
+				1u8.write(w)?;
+				name.write(w)
+			},
+		}
 	}
 }
 

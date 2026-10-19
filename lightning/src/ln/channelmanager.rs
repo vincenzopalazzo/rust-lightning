@@ -900,12 +900,15 @@ pub struct OptionalOfferPaymentParams {
 	///
 	/// # Example
 	/// ```rust,ignore
-	/// // Include a compact offer with a single blinded path through a trusted peer.
-	/// let (builder, nonce) = channel_manager.create_compact_offer_builder(trusted_peer_pubkey)?;
-	/// let payer_offer = builder.build()?;
+	/// let secp_ctx = Secp256k1::signing_only();
+	/// let id = ContactId::from_bip353(HumanReadableName::from_encoded("alice@example.com")?);
+	/// let secrets = compute_contact_secret(&id.signing_secret(), &offer)?;
+	/// let payer_offer = OfferBuilder::from_contact_id(&id, &NullCurrencyConversion, &secp_ctx)
+	///     .path(our_blinded_path)?
+	///     .build()?;
 	///
 	/// let params = OptionalOfferPaymentParams {
-	///     contact_secrets: Some(channel_manager.compute_contact_secret(&payer_offer, nonce, &offer)?),
+	///     contact_secrets: Some(secrets),
 	///     payer_offer: Some(payer_offer),
 	///     ..Default::default()
 	/// };
