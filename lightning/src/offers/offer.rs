@@ -84,7 +84,7 @@ use crate::io;
 use crate::ln::channelmanager::PaymentId;
 use crate::ln::inbound_payment::{ExpandedKey, IV_LEN};
 use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
-use crate::offers::currency::CurrencyConversion;
+use crate::offers::currency::{CurrencyConversion, NullCurrencyConversion};
 use crate::offers::merkle::{TaggedHash, TlvRecord, TlvStream};
 use crate::offers::nonce::Nonce;
 use crate::offers::parse::{Bech32Encode, Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
@@ -265,21 +265,6 @@ macro_rules! offer_explicit_metadata_builder_methods {
 				metadata_strategy: core::marker::PhantomData,
 				secp_ctx: None,
 			}
-		}
-
-		/// Creates a builder whose [`Offer::issuer_signing_pubkey`] is the public key of `contact_id`.
-		///
-		/// This calls [`Self::new`]. The secret key is [`ContactId::signing_secret`]; pass that to
-		/// [`compute_contact_secret`] together with the offer being paid. The same [`ContactId`]
-		/// always yields the same pubkey.
-		///
-		/// [`ContactId::signing_secret`]: crate::offers::contacts::ContactId::signing_secret
-		/// [`compute_contact_secret`]: crate::offers::contacts::compute_contact_secret
-		pub fn from_contact_id(
-			contact_id: &crate::offers::contacts::ContactId, converter: &'a CC,
-			secp_ctx: &Secp256k1<secp256k1::SignOnly>,
-		) -> Self {
-			Self::new(contact_id.signing_pubkey(secp_ctx), converter)
 		}
 
 		/// Sets the [`Offer::metadata`] to the given bytes.
@@ -567,6 +552,25 @@ impl<'a, M: MetadataStrategy, T: secp256k1::Signing, CC: CurrencyConversion>
 
 impl<'a, CC: CurrencyConversion> OfferBuilder<'a, ExplicitMetadata, secp256k1::SignOnly, CC> {
 	offer_explicit_metadata_builder_methods!(self, Self, Self, self, mut);
+}
+
+const NULL_CONTACT_CONVERSION: NullCurrencyConversion = NullCurrencyConversion;
+
+impl OfferBuilder<'static, ExplicitMetadata, secp256k1::SignOnly, NullCurrencyConversion> {
+	/// Creates a builder whose [`Offer::issuer_signing_pubkey`] is the public key of `contact_id`.
+	///
+	/// A contact payer offer carries no amount, so no currency converter is required. The secret
+	/// key is [`ContactId::signing_secret`]; pass that to [`compute_contact_secret`] together with
+	/// the offer being paid. The same [`ContactId`] always yields the same pubkey.
+	///
+	/// [`ContactId::signing_secret`]: crate::offers::contacts::ContactId::signing_secret
+	/// [`compute_contact_secret`]: crate::offers::contacts::compute_contact_secret
+	pub fn from_contact_id(
+		contact_id: &crate::offers::contacts::ContactId,
+		secp_ctx: &Secp256k1<secp256k1::SignOnly>,
+	) -> Self {
+		Self::new(contact_id.signing_pubkey(secp_ctx), &NULL_CONTACT_CONVERSION)
+	}
 }
 
 impl<'a, T: secp256k1::Signing, CC: CurrencyConversion> OfferBuilder<'a, DerivedMetadata, T, CC> {
