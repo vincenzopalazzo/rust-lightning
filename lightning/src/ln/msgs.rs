@@ -310,6 +310,9 @@ pub struct OpenChannelV2 {
 	pub require_confirmed_inputs: Option<()>,
 	/// Optionally, disables the channel reserve of the receiver
 	pub disable_channel_reserve: Option<()>,
+	/// Raw liquidity-ad `request_funding` (TLV 1339). Set when the opener
+	/// contributes nothing and asks the peer to fund the channel.
+	pub request_funding: Option<Vec<u8>>,
 }
 
 /// Contains fields that are both common to [`accept_channel`] and [`accept_channel2`] messages.
@@ -388,6 +391,10 @@ pub struct AcceptChannelV2 {
 	pub require_confirmed_inputs: Option<()>,
 	/// Optionally, disables the channel reserve of the receiver
 	pub disable_channel_reserve: Option<()>,
+	/// Raw `will_fund` (TLV 1339) answering a purchase on `open_channel2`.
+	pub will_fund: Option<Vec<u8>>,
+	/// Fee credit the seller applied, in millisatoshis (even TLV 41042).
+	pub fee_credit_used_msat: Option<u64>,
 }
 
 /// A [`funding_created`] message to be sent to or received from a peer.
@@ -3000,6 +3007,8 @@ impl Writeable for AcceptChannelV2 {
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
 			(103, self.disable_channel_reserve, option),
+			(1339, self.will_fund.as_ref().map(|bytes| WithoutLength(bytes)), option),
+			(41042, self.fee_credit_used_msat, (option, encoding: (u64, Tu64))),
 		});
 		Ok(())
 	}
@@ -3027,11 +3036,15 @@ impl LengthReadable for AcceptChannelV2 {
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
 		let mut disable_channel_reserve: Option<()> = None;
+		let mut will_fund: Option<Vec<u8>> = None;
+		let mut fee_credit_used_msat: Option<u64> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
 			(103, disable_channel_reserve, option),
+			(1339, will_fund, (option, encoding: (Vec<u8>, WithoutLength))),
+			(41042, fee_credit_used_msat, (option, encoding: (u64, Tu64))),
 		});
 
 		Ok(AcceptChannelV2 {
@@ -3056,6 +3069,8 @@ impl LengthReadable for AcceptChannelV2 {
 			second_per_commitment_point,
 			require_confirmed_inputs,
 			disable_channel_reserve,
+			will_fund,
+			fee_credit_used_msat,
 		})
 	}
 }
@@ -3467,6 +3482,7 @@ impl Writeable for OpenChannelV2 {
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
 			(103, self.disable_channel_reserve, option),
+			(1339, self.request_funding.as_ref().map(|bytes| WithoutLength(bytes)), option),
 		});
 		Ok(())
 	}
@@ -3498,11 +3514,13 @@ impl LengthReadable for OpenChannelV2 {
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
 		let mut disable_channel_reserve: Option<()> = None;
+		let mut request_funding: Option<Vec<u8>> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
 			(103, disable_channel_reserve, option),
+			(1339, request_funding, (option, encoding: (Vec<u8>, WithoutLength))),
 		});
 		Ok(OpenChannelV2 {
 			common_fields: CommonOpenChannelFields {
@@ -3530,6 +3548,7 @@ impl LengthReadable for OpenChannelV2 {
 			second_per_commitment_point,
 			require_confirmed_inputs,
 			disable_channel_reserve,
+			request_funding,
 		})
 	}
 }
@@ -4871,10 +4890,9 @@ mod tests {
 		legacy[len_at] = 32;
 		legacy.pop();
 		let mut bytes = &legacy[..];
-		let decoded = <msgs::ChannelReestablish as LengthReadable>::read_from_fixed_length_buffer(
-			&mut bytes,
-		)
-		.unwrap();
+		let decoded =
+			<msgs::ChannelReestablish as LengthReadable>::read_from_fixed_length_buffer(&mut bytes)
+				.unwrap();
 		let next = decoded.next_funding.unwrap();
 		assert_eq!(next.retransmit_flags, 0);
 		assert_eq!(next.txid, cr.next_funding.as_ref().unwrap().txid);
@@ -5437,6 +5455,7 @@ mod tests {
 			second_per_commitment_point: pubkey_7,
 			require_confirmed_inputs: require_confirmed_inputs.then_some(()),
 			disable_channel_reserve: disable_channel_reserve.then_some(()),
+			request_funding: None,
 		};
 		let encoded_value = open_channelv2.encode();
 		let mut target_value = Vec::new();
@@ -5705,6 +5724,8 @@ mod tests {
 			second_per_commitment_point: pubkey_7,
 			require_confirmed_inputs: require_confirmed_inputs.then_some(()),
 			disable_channel_reserve: disable_channel_reserve.then_some(()),
+			will_fund: None,
+			fee_credit_used_msat: None,
 		};
 		let encoded_value = accept_channelv2.encode();
 		let mut target_value =

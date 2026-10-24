@@ -4195,6 +4195,87 @@ impl<
 		Ok(temporary_channel_id)
 	}
 
+	/// Opens a dual-funded channel the peer pays for.
+	///
+	/// `their_funding_satoshis` is the liquidity we ask them to add. The
+	/// `open_channel2` contribution is zero, `request_funding` carries the
+	/// purchase, and the peer's `accept_channel2` contribution replaces the
+	/// placeholder value.
+	pub fn create_liquidity_funded_channel(
+		&self, their_network_key: PublicKey, their_funding_satoshis: u64, user_channel_id: u128,
+		override_config: Option<UserConfig>, funding_feerate_sat_per_kw: u32,
+		request_funding: Vec<u8>,
+	) -> Result<ChannelId, APIError> {
+		if request_funding.is_empty() {
+			return Err(APIError::APIMisuseError {
+				err: "a liquidity open needs a request_funding".to_owned(),
+			});
+		}
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		debug_assert!(&self.total_consistency_lock.try_write().is_err());
+
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(&their_network_key).ok_or_else(|| {
+			APIError::APIMisuseError { err: format!("Not connected to node: {their_network_key}") }
+		})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		if !peer_state.is_connected {
+			return Err(APIError::APIMisuseError {
+				err: format!("Not connected to node: {their_network_key}"),
+			});
+		}
+		let their_features = peer_state.latest_features.clone();
+		if !their_features.supports_dual_fund() {
+			return Err(APIError::APIMisuseError {
+				err: format!("peer {their_network_key} does not support dual funding"),
+			});
+		}
+		let outbound_scid_alias = self.create_and_insert_outbound_scid_alias();
+		let config = self.config.read().unwrap();
+		let config = if let Some(config) = &override_config { config } else { &*config };
+		let mut channel = match PendingV2Channel::new_outbound(
+			&self.fee_estimator,
+			&self.entropy_source,
+			&self.signer_provider,
+			their_network_key,
+			&their_features,
+			their_funding_satoshis,
+			Vec::new(),
+			user_channel_id,
+			config,
+			self.best_block.read().unwrap().height,
+			outbound_scid_alias,
+			ConfirmationTarget::NonAnchorChannelFee,
+			&self.logger,
+			None,
+		) {
+			Ok(channel) => channel,
+			Err(err) => {
+				self.outbound_scid_aliases.lock().unwrap().remove(&outbound_scid_alias);
+				return Err(err);
+			},
+		};
+		channel.funding_negotiation_context.funding_feerate_sat_per_1000_weight =
+			funding_feerate_sat_per_kw;
+		channel.request_counterparty_funding(request_funding);
+		let msg = channel.get_open_channel_v2(self.chain_hash);
+		let temporary_channel_id = channel.context.channel_id();
+		match peer_state.channel_by_id.entry(temporary_channel_id) {
+			hash_map::Entry::Occupied(_) => {
+				return Err(APIError::APIMisuseError {
+					err: "temporary channel id collision".to_owned(),
+				});
+			},
+			hash_map::Entry::Vacant(entry) => {
+				entry.insert(Channel::from(channel));
+			},
+		}
+		peer_state
+			.pending_msg_events
+			.push(MessageSendEvent::SendOpenChannelV2 { node_id: their_network_key, msg });
+		Ok(temporary_channel_id)
+	}
+
 	fn list_funded_channels_with_filter<
 		Fn: FnMut(&(&InitFeatures, &ChannelId, &Channel<SP>)) -> bool,
 	>(

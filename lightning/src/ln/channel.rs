@@ -2685,6 +2685,18 @@ impl FundingScope {
 		self.channel_transaction_parameters.channel_value_satoshis
 	}
 
+	/// The peer is funding this channel. Our balance is `value_to_self_msat`
+	/// and we do not keep a reserve.
+	fn apply_counterparty_funding(
+		&mut self, channel_value_satoshis: u64, value_to_self_msat: u64,
+		counterparty_reserve_satoshis: u64,
+	) {
+		self.channel_transaction_parameters.channel_value_satoshis = channel_value_satoshis;
+		self.value_to_self_msat = value_to_self_msat;
+		self.holder_selected_channel_reserve_satoshis = 0;
+		self.counterparty_selected_channel_reserve_satoshis = Some(counterparty_reserve_satoshis);
+	}
+
 	pub(crate) fn get_value_to_self_msat(&self) -> u64 {
 		self.value_to_self_msat
 	}
@@ -3282,6 +3294,7 @@ impl FundingNegotiation {
 			shared_funding_input: Some(prev_funding_input),
 			our_funding_inputs,
 			our_funding_outputs,
+			liquidity_request: None,
 		};
 
 		let (interactive_tx_constructor, first_message) = funding_negotiation_context
@@ -7293,6 +7306,8 @@ pub(super) struct FundingNegotiationContext {
 	/// The funding outputs we will be contributing to the channel.
 	#[allow(dead_code)] // TODO(dual_funding): Remove once contribution to V2 channels is enabled.
 	pub our_funding_outputs: Vec<TxOut>,
+	/// Liquidity-ad `request_funding` for an open we do not fund ourselves.
+	pub liquidity_request: Option<Vec<u8>>,
 }
 
 impl FundingNegotiationContext {
@@ -15445,6 +15460,7 @@ where
 						shared_funding_input: Some(prev_funding_input),
 						our_funding_inputs,
 						our_funding_outputs,
+						liquidity_request: None,
 					};
 
 					if self.pending_splice.is_some() {
@@ -16349,6 +16365,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			shared_funding_input: None,
 			our_funding_inputs: funding_inputs,
 			our_funding_outputs: Vec::new(),
+			liquidity_request: None,
 		};
 		let chan = Self {
 			funding,
@@ -16358,6 +16375,15 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			interactive_tx_constructor: None,
 		};
 		Ok(chan)
+	}
+
+	/// We contribute nothing. The peer funds the channel in answer to `request_funding`.
+	pub fn request_counterparty_funding(&mut self, request_funding: Vec<u8>) {
+		self.funding_negotiation_context.our_funding_contribution = SignedAmount::ZERO;
+		self.funding_negotiation_context.our_funding_inputs.clear();
+		self.funding_negotiation_context.liquidity_request = Some(request_funding);
+		self.funding.holder_selected_channel_reserve_satoshis = 0;
+		self.funding.value_to_self_msat = 0;
 	}
 
 	/// If we receive an error message, it may only be a rejection of the channel type we tried,
@@ -16399,12 +16425,20 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				&self.context.secp_ctx)
 				.expect("TODO: async signing is not yet supported for commitment points in v2 channel establishment");
 		let keys = self.funding.get_holder_pubkeys();
+		let mut channel_flags = if self.context.config.announce_for_forwarding { 1 } else { 0 };
+		if self.funding_negotiation_context.liquidity_request.is_some() {
+			// Phoenix asks the LSP to pay commitment fees when we contribute nothing.
+			channel_flags |= 2;
+		}
 
 		msgs::OpenChannelV2 {
 			common_fields: msgs::CommonOpenChannelFields {
 				chain_hash,
 				temporary_channel_id: self.context.temporary_channel_id.unwrap(),
-				funding_satoshis: self.funding.get_value_satoshis(),
+				funding_satoshis: self
+					.funding_negotiation_context
+					.our_funding_contribution
+					.to_sat() as u64,
 				dust_limit_satoshis: self.context.holder_dust_limit_satoshis,
 				max_htlc_value_in_flight_msat: self.context.holder_max_htlc_value_in_flight_msat,
 				htlc_minimum_msat: self.context.holder_htlc_minimum_msat,
@@ -16417,7 +16451,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				delayed_payment_basepoint: keys.delayed_payment_basepoint.to_public_key(),
 				htlc_basepoint: keys.htlc_basepoint.to_public_key(),
 				first_per_commitment_point,
-				channel_flags: if self.context.config.announce_for_forwarding {1} else {0},
+				channel_flags,
 				shutdown_scriptpubkey: Some(match &self.context.shutdown_scriptpubkey {
 					Some(script) => script.clone().into_inner(),
 					None => Builder::new().into_script(),
@@ -16431,6 +16465,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			locktime: self.funding_negotiation_context.funding_tx_locktime.to_consensus_u32(),
 			require_confirmed_inputs: None,
 			disable_channel_reserve: (self.funding.holder_selected_channel_reserve_satoshis == 0).then_some(()),
+			request_funding: self.funding_negotiation_context.liquidity_request.clone(),
 		}
 	}
 
@@ -16505,6 +16540,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			shared_funding_input: None,
 			our_funding_inputs: our_funding_inputs.clone(),
 			our_funding_outputs: Vec::new(),
+			liquidity_request: None,
 		};
 		let shared_funding_output = TxOut {
 			value: Amount::from_sat(funding.get_value_satoshis()),
@@ -16546,11 +16582,35 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 		&mut self, msg: &msgs::AcceptChannelV2, default_limits: &ChannelHandshakeLimits,
 		their_features: &InitFeatures, entropy_source: &ES, holder_node_id: PublicKey,
 	) -> Result<(ChannelId, Option<InteractiveTxMessageSend>), ChannelError> {
-		if msg.funding_satoshis != 0 {
+		let our_funding = self.funding_negotiation_context.our_funding_contribution.to_sat() as u64;
+		let their_funding = msg.funding_satoshis;
+		let buying_liquidity = self.funding_negotiation_context.liquidity_request.is_some();
+		if their_funding != 0 && !buying_liquidity {
 			return Err(ChannelError::close(format!(
 				"accept_channel2 contributed {} sat; a remote contribution is not implemented",
-				msg.funding_satoshis
+				their_funding
 			)));
+		}
+		if buying_liquidity && their_funding == 0 {
+			return Err(ChannelError::close(
+				"the LSP accepted the purchase but contributed no satoshis".to_owned(),
+			));
+		}
+		let channel_value = our_funding.saturating_add(their_funding);
+		if buying_liquidity {
+			let their_reserve = get_v2_channel_reserve_satoshis(
+				channel_value,
+				msg.common_fields.dust_limit_satoshis,
+				msg.disable_channel_reserve.is_some(),
+			)
+			.map_err(|()| {
+				ChannelError::close("channel value is below the dust limit".to_owned())
+			})?;
+			self.funding.apply_counterparty_funding(
+				channel_value,
+				our_funding.saturating_mul(1000),
+				their_reserve,
+			);
 		}
 		let channel_value = self.funding.get_value_satoshis();
 		let their_reserve = get_v2_channel_reserve_satoshis(
@@ -16590,7 +16650,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				funding_tx_locktime: self.funding_negotiation_context.funding_tx_locktime,
 				inputs_to_contribute: inputs,
 				shared_funding_input: None,
-				shared_funding_output: SharedOwnedOutput::new(shared_funding_output, channel_value),
+				shared_funding_output: SharedOwnedOutput::new(shared_funding_output, our_funding),
 				outputs_to_contribute: self.funding_negotiation_context.our_funding_outputs.clone(),
 			});
 		self.interactive_tx_constructor = Some(constructor);
@@ -16662,6 +16722,8 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			require_confirmed_inputs: None,
 			disable_channel_reserve: (self.funding.holder_selected_channel_reserve_satoshis == 0)
 				.then_some(()),
+			will_fund: None,
+			fee_credit_used_msat: None,
 		}
 	}
 
