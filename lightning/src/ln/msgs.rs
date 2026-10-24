@@ -5457,6 +5457,14 @@ mod tests {
 			disable_channel_reserve: disable_channel_reserve.then_some(()),
 			request_funding: None,
 		};
+		let mut with_request = open_channelv2.clone();
+		with_request.request_funding = Some(vec![0x11, 0x22, 0x33]);
+		let encoded_request = with_request.encode();
+		assert!(
+			encoded_request.windows(6).any(|w| w == [0xfd, 0x05, 0x3b, 0x03, 0x11, 0x22]),
+			"open_channel2 TLV 1339 was {:02x?}",
+			&encoded_request[encoded_request.len().saturating_sub(24)..]
+		);
 		let encoded_value = open_channelv2.encode();
 		let mut target_value = Vec::new();
 		target_value.append(
