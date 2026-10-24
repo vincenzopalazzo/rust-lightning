@@ -4093,7 +4093,8 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 
 	#[rustfmt::skip]
 	fn check_counterparty_commitment_signature<L: Logger>(
-		&self, sig: &Signature, holder_commitment_point: &HolderCommitmentPoint, logger: &L
+		&self, sig: &Signature, holder_commitment_point: &HolderCommitmentPoint,
+		skip_ecdsa: bool, logger: &L,
 	) -> Result<CommitmentTransaction, ChannelError> {
 		let funding_script = self.funding().get_funding_redeemscript();
 
@@ -4109,7 +4110,14 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 			self.received_msg(), log_bytes!(sig.serialize_compact()[..]), log_bytes!(self.funding().counterparty_funding_pubkey().serialize()),
 			encode::serialize_hex(&initial_commitment_bitcoin_tx.transaction), log_bytes!(sighash[..]),
 			encode::serialize_hex(&funding_script), &self.context().channel_id());
-		secp_check!(self.context().secp_ctx.verify_ecdsa(&sighash, sig, self.funding().counterparty_funding_pubkey()), format!("Invalid {} signature from peer", self.received_msg()));
+		if skip_ecdsa {
+			log_info!(
+				logger,
+				"phoenix partial present; not checking the ecdsa commitment signature"
+			);
+		} else {
+			secp_check!(self.context().secp_ctx.verify_ecdsa(&sighash, sig, self.funding().counterparty_funding_pubkey()), format!("Invalid {} signature from peer", self.received_msg()));
+		}
 
 		Ok(initial_commitment_tx)
 	}
@@ -4117,9 +4125,9 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 	#[rustfmt::skip]
 	fn initial_commitment_signed<L: Logger>(
 		&mut self, channel_id: ChannelId, counterparty_signature: Signature, holder_commitment_point: &mut HolderCommitmentPoint,
-		best_block: BlockLocator, signer_provider: &SP, logger: &L,
+		best_block: BlockLocator, signer_provider: &SP, skip_ecdsa: bool, logger: &L,
 	) -> Result<(ChannelMonitor<SP::EcdsaSigner>, CommitmentTransaction), ChannelError> {
-		let initial_commitment_tx = match self.check_counterparty_commitment_signature(&counterparty_signature, holder_commitment_point, logger) {
+		let initial_commitment_tx = match self.check_counterparty_commitment_signature(&counterparty_signature, holder_commitment_point, skip_ecdsa, logger) {
 			Ok(res) => res,
 			Err(ChannelError::Close(e)) => {
 				// TODO(dual_funding): Update for V2 established channels.
@@ -9001,6 +9009,7 @@ where
 			holder_commitment_point,
 			best_block,
 			signer_provider,
+			msg.partial_signature.is_some(),
 			logger,
 		)?;
 		self.holder_commitment_point = *holder_commitment_point;
@@ -16047,6 +16056,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			&mut holder_commitment_point,
 			best_block,
 			signer_provider,
+			false,
 			logger,
 		) {
 			Ok(channel_monitor) => channel_monitor,
@@ -16375,6 +16385,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 				&mut holder_commitment_point,
 				best_block,
 				signer_provider,
+				false,
 				logger,
 			) {
 			Ok(channel_monitor) => channel_monitor,
