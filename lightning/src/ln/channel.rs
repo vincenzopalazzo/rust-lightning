@@ -90,7 +90,9 @@ use crate::util::config::{
 use crate::util::errors::APIError;
 use crate::util::logger::{Logger, Record, WithContext};
 use crate::util::scid_utils::{block_from_scid, scid_from_parts};
-use crate::util::ser::{Iterable, Readable, ReadableArgs, RequiredWrapper, Writeable, Writer};
+use crate::util::ser::{
+	Iterable, Readable, ReadableArgs, RequiredWrapper, WithoutLength, Writeable, Writer,
+};
 use crate::util::wallet_utils::{ConfirmedUtxo, Input};
 use crate::{impl_readable_for_vec, impl_writeable_for_vec};
 
@@ -3000,6 +3002,12 @@ struct PendingFunding {
 	/// The feerate used in the last successfully negotiated funding transaction.
 	/// Used for validating the minimum feerate increase rule on RBF attempts.
 	last_funding_feerate_sat_per_1000_weight: Option<u32>,
+
+	/// Raw `will_fund` from the latest `splice_ack` or `tx_ack_rbf` (TLV 1339).
+	liquidity_will_fund: Option<Vec<u8>>,
+
+	/// Fee credit the seller applied on that ack, in msat. `None` when omitted.
+	liquidity_fee_credit_msat: Option<u64>,
 }
 
 /// A funding candidate that has been negotiated, together with our contribution, if any, to the
@@ -3116,6 +3124,8 @@ impl Writeable for PendingFundingWriteable<'_> {
 			(11, negotiated_candidates, option),
 			(13, negotiation_contribution, option),
 			(14, rbf_gate, option),
+			(15, self.pending_funding.liquidity_will_fund, (option, encoding: (Vec<u8>, WithoutLength))),
+			(17, self.pending_funding.liquidity_fee_credit_msat, option),
 		});
 		Ok(())
 	}
@@ -3131,6 +3141,8 @@ impl Readable for PendingFunding {
 		let mut negotiated_candidates: Option<Vec<NegotiatedCandidate>> = None;
 		let mut negotiation_contribution: Option<FundingContribution> = None;
 		let mut rbf_gate: Option<()> = None;
+		let mut liquidity_will_fund: Option<Vec<u8>> = None;
+		let mut liquidity_fee_credit_msat: Option<u64> = None;
 
 		read_tlv_fields!(reader, {
 			(1, funding_negotiation, upgradable_option),
@@ -3141,6 +3153,8 @@ impl Readable for PendingFunding {
 			(11, negotiated_candidates, optional_vec),
 			(13, negotiation_contribution, option),
 			(14, rbf_gate, option),
+			(15, liquidity_will_fund, (option, encoding: (Vec<u8>, WithoutLength))),
+			(17, liquidity_fee_credit_msat, option),
 		});
 
 		// TLV 11 (the candidate list, each funding bundled with its contribution) is authoritative
@@ -3174,6 +3188,8 @@ impl Readable for PendingFunding {
 			sent_funding_txid,
 			received_funding_txid,
 			last_funding_feerate_sat_per_1000_weight,
+			liquidity_will_fund,
+			liquidity_fee_credit_msat,
 		})
 	}
 }
@@ -3271,6 +3287,17 @@ impl FundingNegotiation {
 }
 
 impl PendingFunding {
+	fn note_liquidity_ack(
+		&mut self, will_fund: &Option<Vec<u8>>, fee_credit_used_msat: Option<u64>,
+	) {
+		if let Some(will_fund) = will_fund {
+			self.liquidity_will_fund = Some(will_fund.clone());
+		}
+		if let Some(fee_credit_used_msat) = fee_credit_used_msat {
+			self.liquidity_fee_credit_msat = Some(fee_credit_used_msat);
+		}
+	}
+
 	fn has_confirmed_candidate(&self) -> bool {
 		self.negotiated_candidates
 			.iter()
@@ -4321,32 +4348,33 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		debug_assert!(our_funding_satoshis == 0 || msg_push_msat == 0);
 		let value_to_self_msat = our_funding_satoshis * 1000 + msg_push_msat;
 
-		let counterparty_shutdown_scriptpubkey =
-			if their_features.supports_upfront_shutdown_script() {
-				match &open_channel_fields.shutdown_scriptpubkey {
-					&Some(ref script) => {
-						// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
-						if script.len() == 0 {
-							None
-						} else {
-							if !script::is_bolt2_compliant(&script, their_features) {
-								return Err(ChannelError::close(format!(
+		let counterparty_shutdown_scriptpubkey = if their_features
+			.supports_upfront_shutdown_script()
+		{
+			match &open_channel_fields.shutdown_scriptpubkey {
+				&Some(ref script) => {
+					// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
+					if script.len() == 0 {
+						None
+					} else {
+						if !script::is_bolt2_compliant(&script, their_features) {
+							return Err(ChannelError::close(format!(
 								"Peer is signaling upfront_shutdown but has provided an unacceptable scriptpubkey format: {script}"
 							)));
-							}
-							Some(script.clone())
 						}
-					},
-					// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
-					&None => {
-						return Err(ChannelError::close(String::from(
+						Some(script.clone())
+					}
+				},
+				// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
+				&None => {
+					return Err(ChannelError::close(String::from(
 						"Peer is signaling upfront_shutdown but we don't get any script. Use 0-length script to opt-out"
 					)));
-					},
-				}
-			} else {
-				None
-			};
+				},
+			}
+		} else {
+			None
+		};
 
 		let shutdown_scriptpubkey =
 			if config.channel_handshake_config.commit_upfront_shutdown_pubkey {
@@ -5277,32 +5305,33 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			)));
 		}
 
-		let counterparty_shutdown_scriptpubkey =
-			if their_features.supports_upfront_shutdown_script() {
-				match &common_fields.shutdown_scriptpubkey {
-					&Some(ref script) => {
-						// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
-						if script.len() == 0 {
-							None
-						} else {
-							if !script::is_bolt2_compliant(&script, their_features) {
-								return Err(ChannelError::close(format!(
+		let counterparty_shutdown_scriptpubkey = if their_features
+			.supports_upfront_shutdown_script()
+		{
+			match &common_fields.shutdown_scriptpubkey {
+				&Some(ref script) => {
+					// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
+					if script.len() == 0 {
+						None
+					} else {
+						if !script::is_bolt2_compliant(&script, their_features) {
+							return Err(ChannelError::close(format!(
 								"Peer is signaling upfront_shutdown but has provided an unacceptable scriptpubkey format: {script}"
 							)));
-							}
-							Some(script.clone())
 						}
-					},
-					// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
-					&None => {
-						return Err(ChannelError::close(String::from(
+						Some(script.clone())
+					}
+				},
+				// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
+				&None => {
+					return Err(ChannelError::close(String::from(
 						"Peer is signaling upfront_shutdown but we don't get any script. Use 0-length script to opt-out"
 					)));
-					},
-				}
-			} else {
-				None
-			};
+				},
+			}
+		} else {
+			None
+		};
 
 		self.counterparty_dust_limit_satoshis = common_fields.dust_limit_satoshis;
 		self.counterparty_max_htlc_value_in_flight_msat = cmp::min(
@@ -7512,6 +7541,13 @@ where
 {
 	pub fn context(&self) -> &ChannelContext<SP> {
 		&self.context
+	}
+
+	/// The seller's `will_fund` and fee credit from the latest splice ack, if one arrived.
+	pub(super) fn splice_liquidity_ack(&self) -> Option<(Vec<u8>, u64)> {
+		let pending = self.pending_splice.as_ref()?;
+		let will_fund = pending.liquidity_will_fund.clone()?;
+		Some((will_fund, pending.liquidity_fee_credit_msat.unwrap_or(0)))
 	}
 
 	pub fn force_shutdown(&mut self, closure_reason: ClosureReason) -> ShutdownResult {
@@ -13656,6 +13692,7 @@ where
 		let funding_feerate_per_kw = context.funding_feerate_sat_per_1000_weight;
 		let funding_contribution_satoshis = context.our_funding_contribution.to_sat();
 		let locktime = context.funding_tx_locktime.to_consensus_u32();
+		let request_funding = contribution.request_funding().map(|bytes| bytes.to_vec());
 
 		let funding_negotiation =
 			FundingNegotiation::AwaitingAck { context, new_holder_funding_key: funding_pubkey };
@@ -13666,6 +13703,8 @@ where
 			sent_funding_txid: None,
 			received_funding_txid: None,
 			last_funding_feerate_sat_per_1000_weight: None,
+			liquidity_will_fund: None,
+			liquidity_fee_credit_msat: None,
 		});
 
 		msgs::SpliceInit {
@@ -13675,6 +13714,7 @@ where
 			locktime,
 			funding_pubkey,
 			require_confirmed_inputs: None,
+			request_funding,
 		}
 	}
 
@@ -13700,6 +13740,7 @@ where
 		let funding_feerate_per_kw = context.funding_feerate_sat_per_1000_weight;
 		let funding_contribution_satoshis = context.our_funding_contribution.to_sat();
 		let locktime = context.funding_tx_locktime.to_consensus_u32();
+		let request_funding = contribution.request_funding().map(|bytes| bytes.to_vec());
 
 		pending_splice.funding_negotiation =
 			Some(FundingNegotiation::AwaitingAck { context, new_holder_funding_key });
@@ -13710,6 +13751,7 @@ where
 			locktime,
 			feerate_sat_per_1000_weight: funding_feerate_per_kw,
 			funding_output_contribution: Some(funding_contribution_satoshis),
+			request_funding,
 		}
 	}
 
@@ -14047,6 +14089,9 @@ where
 			received_funding_txid: None,
 			sent_funding_txid: None,
 			last_funding_feerate_sat_per_1000_weight: None,
+			// The peer's purchase request is odd and ignored: we are not a seller.
+			liquidity_will_fund: None,
+			liquidity_fee_credit_msat: None,
 		});
 
 		Ok(msgs::SpliceAck {
@@ -14054,6 +14099,8 @@ where
 			funding_contribution_satoshis: our_funding_contribution.to_sat(),
 			funding_pubkey: new_funding_pubkey,
 			require_confirmed_inputs: None,
+			will_fund: None,
+			fee_credit_used_msat: None,
 		})
 	}
 
@@ -14261,6 +14308,8 @@ where
 			} else {
 				None
 			},
+			will_fund: None,
+			fee_credit_used_msat: None,
 		})
 	}
 
@@ -14318,6 +14367,7 @@ where
 			.pending_splice
 			.as_mut()
 			.expect("pending_splice existence validated in validate_tx_ack_rbf");
+		pending_splice.note_liquidity_ack(&msg.will_fund, msg.fee_credit_used_msat);
 		let funding_negotiation_context = pending_splice
 			.take_awaiting_ack_context("tx_ack_rbf")
 			.expect("awaiting ack state validated in validate_tx_ack_rbf");
@@ -14354,6 +14404,7 @@ where
 			.pending_splice
 			.as_mut()
 			.expect("pending_splice existence validated in validate_splice_ack");
+		pending_splice.note_liquidity_ack(&msg.will_fund, msg.fee_credit_used_msat);
 		let funding_negotiation_context = pending_splice
 			.take_awaiting_ack_context("splice_ack")
 			.expect("awaiting ack state validated in validate_splice_ack");

@@ -68,12 +68,14 @@ fn test_funding_peer_disconnect() {
 	assert!(events_2.is_empty());
 
 	nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-		features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-	}, true).unwrap();
+		features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, true).unwrap();
 	let as_reestablish = get_chan_reestablish_msgs!(nodes[0], nodes[1]).pop().unwrap();
 	nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-		features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-	}, false).unwrap();
+		features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, false).unwrap();
 	let bs_reestablish = get_chan_reestablish_msgs!(nodes[1], nodes[0]).pop().unwrap();
 
 	// nodes[0] hasn't yet received a channel_ready, so it only sends that on reconnect.
@@ -210,12 +212,14 @@ fn test_no_txn_manager_serialize_deserialize() {
 	reload_node!(nodes[0], nodes[0].node.encode(), &[&chan_0_monitor_serialized], persister, new_chain_monitor, nodes_0_deserialized);
 
 	nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-		features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-	}, true).unwrap();
+		features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
 	nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-		features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-	}, false).unwrap();
+		features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, false).unwrap();
 	let reestablish_2 = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
 
 	nodes[1].node.handle_channel_reestablish(nodes[0].node.get_our_node_id(), &reestablish_1[0]);
@@ -306,12 +310,14 @@ fn test_manager_serialize_deserialize_events() {
 	assert_eq!(nodes[0].node.list_channels().len(), 1);
 
 	nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-		features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-	}, true).unwrap();
+		features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
 	nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-		features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-	}, false).unwrap();
+		features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, false).unwrap();
 	let reestablish_2 = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
 
 	nodes[1].node.handle_channel_reestablish(nodes[0].node.get_our_node_id(), &reestablish_1[0]);
@@ -488,12 +494,14 @@ fn test_manager_serialize_deserialize_inconsistent_monitor() {
 	claim_payment(&nodes[2], &[&nodes[0], &nodes[1]], our_payment_preimage);
 
 	nodes[3].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-		features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-	}, true).unwrap();
+		features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, true).unwrap();
 	let reestablish = get_chan_reestablish_msgs!(nodes[3], nodes[0]).pop().unwrap();
 	nodes[0].node.peer_connected(nodes[3].node.get_our_node_id(), &msgs::Init {
-		features: nodes[3].node.init_features(), networks: None, remote_network_address: None
-	}, false).unwrap();
+		features: nodes[3].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, false).unwrap();
 	nodes[0].node.handle_channel_reestablish(nodes[3].node.get_our_node_id(), &reestablish);
 	let mut found_err = false;
 	for msg_event in nodes[0].node.get_and_clear_pending_msg_events() {
@@ -579,11 +587,13 @@ fn do_test_data_loss_protect(reconnect_panicing: bool, substantially_old: bool, 
 
 	if reconnect_panicing {
 		nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-			features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, false).unwrap();
 
 		let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
 
@@ -680,11 +690,13 @@ fn do_test_data_loss_protect(reconnect_panicing: bool, substantially_old: bool, 
 		// use the channel, or reconnect with success to the channel.
 		assert!(nodes[0].node.list_usable_channels().is_empty());
 		nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-			features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, false).unwrap();
 		let retry_reestablish = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
 
 		nodes[0].node.handle_channel_reestablish(nodes[1].node.get_our_node_id(), &retry_reestablish[0]);
@@ -884,12 +896,14 @@ fn do_test_partial_claim_before_restart(persist_both_monitors: bool, double_rest
 		// If one of the two channels is still live, reveal the payment preimage over it.
 
 		nodes[3].node.peer_connected(nodes[2].node.get_our_node_id(), &msgs::Init {
-			features: nodes[2].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: nodes[2].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		let reestablish_1 = get_chan_reestablish_msgs!(nodes[3], nodes[2]);
 		nodes[2].node.peer_connected(nodes[3].node.get_our_node_id(), &msgs::Init {
-			features: nodes[3].node.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
+			features: nodes[3].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, false).unwrap();
 		let reestablish_2 = get_chan_reestablish_msgs!(nodes[2], nodes[3]);
 
 		nodes[2].node.handle_channel_reestablish(nodes[3].node.get_our_node_id(), &reestablish_1[0]);
@@ -1089,10 +1103,12 @@ fn test_mpp_claim_htlc_fulfills_unblocked_on_reload() {
 	let node_1_id = nodes[1].node.get_our_node_id();
 	nodes[0].node.peer_connected(node_1_id, &msgs::Init {
 		features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
-	}, true).unwrap();
+
+		will_fund_rates: None,}, true).unwrap();
 	nodes[1].node.peer_connected(node_0_id, &msgs::Init {
 		features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
-	}, false).unwrap();
+
+		will_fund_rates: None,}, false).unwrap();
 
 	let reestablish_0 = nodes[0].node.get_and_clear_pending_msg_events();
 	let reestablish_1 = nodes[1].node.get_and_clear_pending_msg_events();
@@ -1955,13 +1971,15 @@ fn test_htlc_localremoved_persistence() {
 	reload_node!(nodes[1], nodes[1].node.encode(), &[&monitor_encoded], persister, chain_monitor, deserialized_chanmgr);
 
 	nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-		features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-	}, true).unwrap();
+		features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
 	assert_eq!(reestablish_1.len(), 1);
 	nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-		features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-	}, false).unwrap();
+		features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+		will_fund_rates: None,}, false).unwrap();
 	let reestablish_2 = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
 	assert_eq!(reestablish_2.len(), 1);
 	nodes[0].node.handle_channel_reestablish(nodes[1].node.get_our_node_id(), &reestablish_2[0]);
@@ -2047,7 +2065,8 @@ fn test_peer_storage() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
-	};
+
+		will_fund_rates: None,};
 
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	nodes[1].node.peer_connected(node_a_id, &init_msg, true).unwrap();

@@ -588,6 +588,8 @@ fn test_signer_unblocked_clears_monitor_pending_raa_after_reestablish() {
 		features: nodes[2].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[1].node.peer_connected(node_c_id, &init_msg, true).unwrap();
 	let bs_reestablish = get_chan_reestablish_msgs!(nodes[1], nodes[2]);
@@ -596,6 +598,8 @@ fn test_signer_unblocked_clears_monitor_pending_raa_after_reestablish() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[2].node.peer_connected(node_b_id, &init_msg, false).unwrap();
 	let cs_reestablish = get_chan_reestablish_msgs!(nodes[2], nodes[1]);
@@ -768,6 +772,8 @@ fn do_test_async_raa_peer_disconnect(
 		features: dst.node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	src.node.peer_connected(dst_node_id, init_msg, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(src, dst);
@@ -776,6 +782,8 @@ fn do_test_async_raa_peer_disconnect(
 		features: src.node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	dst.node.peer_connected(src_node_id, init_msg, false).unwrap();
 	let reestablish_2 = get_chan_reestablish_msgs!(dst, src);
@@ -918,6 +926,8 @@ fn do_test_async_commitment_signature_peer_disconnect(
 		features: dst.node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	src.node.peer_connected(dst_node_id, init_msg, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(src, dst);
@@ -926,6 +936,8 @@ fn do_test_async_commitment_signature_peer_disconnect(
 		features: src.node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	dst.node.peer_connected(src_node_id, init_msg, false).unwrap();
 	let reestablish_2 = get_chan_reestablish_msgs!(dst, src);
@@ -1062,6 +1074,8 @@ fn do_test_async_commitment_signature_ordering(monitor_update_failure: bool) {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[0].node.peer_connected(node_b_id, init_msg, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
@@ -1070,6 +1084,8 @@ fn do_test_async_commitment_signature_ordering(monitor_update_failure: bool) {
 		features: nodes[0].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[1].node.peer_connected(node_a_id, init_msg, false).unwrap();
 	let reestablish_2 = get_chan_reestablish_msgs!(nodes[1], nodes[0]);

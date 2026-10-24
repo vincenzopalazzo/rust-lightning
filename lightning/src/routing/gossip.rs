@@ -3890,6 +3890,8 @@ pub(crate) mod tests {
 				features: InitFeatures::empty(),
 				networks: None,
 				remote_network_address: None,
+
+				will_fund_rates: None,
 			};
 			gossip_sync.peer_connected(node_id_1, &init_msg, true).unwrap();
 			let events = gossip_sync.get_and_clear_pending_msg_events();
@@ -3900,7 +3902,12 @@ pub(crate) mod tests {
 		{
 			let mut features = InitFeatures::empty();
 			features.set_gossip_queries_optional();
-			let init_msg = Init { features, networks: None, remote_network_address: None };
+			let init_msg = Init {
+				features,
+				networks: None,
+				remote_network_address: None,
+				will_fund_rates: None,
+			};
 			gossip_sync.peer_connected(node_id_1, &init_msg, true).unwrap();
 			let events = gossip_sync.get_and_clear_pending_msg_events();
 			assert_eq!(events.len(), 1);

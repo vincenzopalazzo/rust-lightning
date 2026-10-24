@@ -1276,7 +1276,8 @@ mod tests {
 			// We set it to the override here because addresses from the stream are private addresses,
 			// so they are filtered out and not reported to the peer
 			remote_network_address: b_addr_override,
-		};
+
+			will_fund_rates: None,};
 		a_logger.assert_log(
 			"lightning::ln::peer_handler",
 			format!("Enqueueing message Init({:?})", a_init_msg),

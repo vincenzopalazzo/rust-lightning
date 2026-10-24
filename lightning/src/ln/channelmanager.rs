@@ -4176,6 +4176,21 @@ impl<
 		res
 	}
 
+	/// Liquidity-ad acceptance recorded from the latest `splice_ack` or `tx_ack_rbf`.
+	///
+	/// `None` until the seller has answered a [`msgs::SpliceInit::request_funding`] on this
+	/// channel. The raw `will_fund` bytes are not interpreted here.
+	pub fn splice_liquidity_ack(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId,
+	) -> Option<msgs::SpliceLiquidityAck> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)?;
+		let peer_state_lock = peer_state_mutex.lock().unwrap();
+		let channel = peer_state_lock.channel_by_id.get(channel_id)?;
+		let (will_fund, fee_credit_used_msat) = channel.as_funded()?.splice_liquidity_ack()?;
+		Some(msgs::SpliceLiquidityAck { will_fund, fee_credit_used_msat })
+	}
+
 	/// Gets the list of usable channels, in random order. Useful as an argument to
 	/// [`Router::find_route`] to ensure non-announced channels are used.
 	///
@@ -10054,7 +10069,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: &HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -10092,7 +10108,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -15146,7 +15163,10 @@ impl<
 	> ChannelManager<M, T, ES, NS, SP, F, R, MR, L>
 {
 	#[cfg(not(c_bindings))]
-	create_offer_builder!(self, OfferBuilder<'_, DerivedMetadata, secp256k1::All, NullCurrencyConversion>);
+	create_offer_builder!(
+		self,
+		OfferBuilder<'_, DerivedMetadata, secp256k1::All, NullCurrencyConversion>
+	);
 
 	/// Same as [`Self::create_offer_builder`], but validates a currency-denominated
 	/// amount with `conversion` instead of rejecting every ISO 4217 amount.
@@ -15160,7 +15180,9 @@ impl<
 		&'a self, conversion: &'a CC,
 	) -> Result<OfferBuilder<'a, DerivedMetadata, secp256k1::All, CC>, Bolt12SemanticError> {
 		let builder = self.flow.create_offer_builder(
-			&self.entropy_source, conversion, self.get_peers_for_blinded_path(),
+			&self.entropy_source,
+			conversion,
+			self.get_peers_for_blinded_path(),
 		)?;
 		Ok(builder.into())
 	}
@@ -15265,7 +15287,11 @@ impl<
 		optional_params: OptionalOfferPaymentParams,
 	) -> Result<(), Bolt12SemanticError> {
 		self.pay_for_offer_with_conversion(
-			offer, amount_msats, payment_id, optional_params, &NullCurrencyConversion,
+			offer,
+			amount_msats,
+			payment_id,
+			optional_params,
+			&NullCurrencyConversion,
 		)
 	}
 
@@ -19578,10 +19604,8 @@ impl<
 	fn read<Reader: io::Read>(
 		reader: &mut Reader, args: ChannelManagerReadArgs<'a, M, T, ES, NS, SP, F, R, MR, L>,
 	) -> Result<Self, DecodeError> {
-		let (best_block, chan_manager) = <(
-			BlockLocator,
-			ChannelManager<M, T, ES, NS, SP, F, R, MR, L>,
-		)>::read(reader, args)?;
+		let (best_block, chan_manager) =
+			<(BlockLocator, ChannelManager<M, T, ES, NS, SP, F, R, MR, L>)>::read(reader, args)?;
 		Ok((best_block, Arc::new(chan_manager)))
 	}
 }
@@ -21868,11 +21892,13 @@ mod tests {
 
 		// Now we reconnect to a peer
 		nodes[0].node.peer_connected(nodes[2].node.get_our_node_id(), &msgs::Init {
-			features: nodes[2].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: nodes[2].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		nodes[2].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, false).unwrap();
 
 		// Confirm that get_and_clear_pending_msg_events correctly captures pending broadcast messages
 		let node_0_events = nodes[0].node.get_and_clear_pending_msg_events();
@@ -22136,14 +22162,16 @@ mod tests {
 				&SecretKey::from_slice(&nodes[1].keys_manager.get_secure_random_bytes()).unwrap());
 			peer_pks.push(random_pk);
 			nodes[1].node.peer_connected(random_pk, &msgs::Init {
-				features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-			}, true).unwrap();
+				features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+				will_fund_rates: None,}, true).unwrap();
 		}
 		let last_random_pk = PublicKey::from_secret_key(&nodes[0].node.secp_ctx,
 			&SecretKey::from_slice(&nodes[1].keys_manager.get_secure_random_bytes()).unwrap());
 		nodes[1].node.peer_connected(last_random_pk, &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap_err();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap_err();
 
 		// Also importantly, because nodes[0] isn't "protected", we will refuse a reconnection from
 		// them if we have too many un-channel'd peers.
@@ -22154,16 +22182,19 @@ mod tests {
 			if let Event::ChannelClosed { .. } = ev { } else { panic!(); }
 		}
 		nodes[1].node.peer_connected(last_random_pk, &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap_err();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap_err();
 
 		// but of course if the connection is outbound its allowed...
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, false).unwrap();
 		nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
 
 		// Now nodes[0] is disconnected but still has a pending, un-funded channel lying around.
@@ -22198,8 +22229,9 @@ mod tests {
 		// "protected" and can connect again.
 		mine_transaction(&nodes[1], funding_tx.as_ref().unwrap());
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		get_event_msg!(nodes[1], MessageSendEvent::SendChannelReestablish, nodes[0].node.get_our_node_id());
 
 		// Further, because the first channel was funded, we can open another channel with
@@ -22414,11 +22446,13 @@ mod tests {
 		// such that Bob sends a `ChannelReestablish` to Alice since the channel is still open from
 		// their side.
 		nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-			features: nodes[1].node.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: nodes[1].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, false).unwrap();
 		assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
 		let channel_reestablish = get_event_msg!(
 			nodes[1], MessageSendEvent::SendChannelReestablish, nodes[0].node.get_our_node_id()
@@ -22533,7 +22567,7 @@ pub mod bench {
 		let entropy = test_utils::TestKeysInterface::new(&[0u8; 32], network);
 		let router = test_utils::TestRouter::new(Arc::new(NetworkGraph::new(network, &logger_a)), &logger_a, &scorer);
 		let message_router = test_utils::TestMessageRouter::new_default(Arc::new(NetworkGraph::new(network, &logger_a)), &entropy);
-		
+
 		let mut config: UserConfig = Default::default();
 		config.channel_config.max_dust_htlc_exposure = MaxDustHTLCExposure::FeeRateMultiplier(5_000_000 / 253);
 		config.channel_handshake_config.minimum_depth = 1;
@@ -22558,11 +22592,13 @@ pub mod bench {
 		let node_b_holder = ANodeHolder { node: &node_b };
 
 		node_a.peer_connected(node_b.get_our_node_id(), &Init {
-			features: node_b.init_features(), networks: None, remote_network_address: None
-		}, true).unwrap();
+			features: node_b.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, true).unwrap();
 		node_b.peer_connected(node_a.get_our_node_id(), &Init {
-			features: node_a.init_features(), networks: None, remote_network_address: None
-		}, false).unwrap();
+			features: node_a.init_features(), networks: None, remote_network_address: None,
+
+			will_fund_rates: None,}, false).unwrap();
 		node_a.create_channel(node_b.get_our_node_id(), 8_000_000, 100_000_000, 42, None, None).unwrap();
 		node_b.handle_open_channel(node_a.get_our_node_id(), &get_event_msg!(node_a_holder, MessageSendEvent::SendOpenChannel, node_b.get_our_node_id()));
 		let events = node_b.get_and_clear_pending_events();

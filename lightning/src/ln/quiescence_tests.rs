@@ -648,6 +648,8 @@ fn do_test_quiescence_during_disconnection(with_pending_claim: bool, propose_dis
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	nodes[1].node.peer_connected(node_a_id, &init_msg, true).unwrap();

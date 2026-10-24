@@ -25,6 +25,7 @@ use crate::ln::types::ChannelId;
 use crate::ln::LN_MAX_MSG_LEN;
 use crate::prelude::*;
 use crate::util::native_async::MaybeSend;
+use crate::util::ser::WithoutLength;
 use crate::util::wallet_utils::{
 	CoinSelection, CoinSelectionSource, CoinSelectionSourceSync, ConfirmedUtxo, Input,
 };
@@ -751,6 +752,12 @@ pub struct FundingContribution {
 	/// any, and so are excluded from the funding reported as discarded when this contribution
 	/// fails.
 	pending_components: Option<PendingFundingComponents>,
+
+	/// Raw liquidity-ad `request_funding` (TLV 1339) to put on `splice_init` / `tx_init_rbf`.
+	///
+	/// Set with [`FundingContribution::with_request_funding`]. Empty when this splice is not
+	/// buying inbound liquidity.
+	request_funding: Option<Vec<u8>>,
 }
 
 // `pending_components` describes which reservations the contribution owns rather than the
@@ -769,6 +776,7 @@ impl PartialEq for FundingContribution {
 			is_splice,
 			input_mode,
 			pending_components: _,
+			request_funding,
 		} = self;
 		*estimated_fee == other.estimated_fee
 			&& *inputs == other.inputs
@@ -778,6 +786,7 @@ impl PartialEq for FundingContribution {
 			&& *max_feerate == other.max_feerate
 			&& *is_splice == other.is_splice
 			&& *input_mode == other.input_mode
+			&& *request_funding == other.request_funding
 	}
 }
 
@@ -795,6 +804,7 @@ impl core::hash::Hash for FundingContribution {
 			is_splice,
 			input_mode,
 			pending_components: _,
+			request_funding,
 		} = self;
 		estimated_fee.hash(state);
 		inputs.hash(state);
@@ -804,6 +814,7 @@ impl core::hash::Hash for FundingContribution {
 		max_feerate.hash(state);
 		is_splice.hash(state);
 		input_mode.hash(state);
+		request_funding.hash(state);
 	}
 }
 
@@ -817,6 +828,7 @@ impl_writeable_tlv_based!(FundingContribution, {
 	(13, is_splice, required),
 	(15, input_mode, option),
 	(17, pending_components, option),
+	(19, request_funding, (option, encoding: (Vec<u8>, WithoutLength))),
 });
 
 /// Removes from `inputs` and `outputs` any that overlap with `existing_inputs`/`existing_outputs`.
@@ -843,6 +855,21 @@ fn filter_unique_contributions<'a, O: Borrow<TxOut>>(
 impl FundingContribution {
 	pub(super) fn is_splice(&self) -> bool {
 		self.is_splice
+	}
+
+	/// Attaches a liquidity-ad purchase to this contribution.
+	///
+	/// `request` is the raw TLV 1339 value (`request_funding`) written on `splice_init` and
+	/// `tx_init_rbf`. An empty request is ignored. The bytes are not inspected here; the caller
+	/// owns the rate-card encoding.
+	pub fn with_request_funding(mut self, request: Vec<u8>) -> Self {
+		self.request_funding = (!request.is_empty()).then_some(request);
+		self
+	}
+
+	/// The liquidity-ad purchase attached with [`FundingContribution::with_request_funding`].
+	pub fn request_funding(&self) -> Option<&[u8]> {
+		self.request_funding.as_deref()
 	}
 
 	/// Records which of this contribution's inputs and outputs are committed to another splice
@@ -1556,6 +1583,7 @@ impl<State> FundingBuilderInner<State> {
 				// Without a prior contribution to inherit from, nothing here is committed to
 				// another splice attempt.
 				pending_components: None,
+				request_funding: None,
 			};
 			let net_value = contribution.net_value();
 			if net_value.is_negative() {
@@ -2025,6 +2053,8 @@ impl<W: CoinSelectionSource + MaybeSend> AsyncFundingBuilder<W> {
 			pending_components: inner.prior_contribution.as_ref().and_then(|prior_contribution| {
 				PendingFundingComponents::from_explicit_outputs(prior_contribution).into_option()
 			}),
+
+			request_funding: None,
 		});
 	}
 }
@@ -2137,6 +2167,8 @@ impl<W: CoinSelectionSourceSync> SyncFundingBuilder<W> {
 			pending_components: inner.prior_contribution.as_ref().and_then(|prior_contribution| {
 				PendingFundingComponents::from_explicit_outputs(prior_contribution).into_option()
 			}),
+
+			request_funding: None,
 		});
 	}
 }
@@ -2385,6 +2417,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let delta = Amount::from_sat(change.value.to_sat() - dust_limit.to_sat() + 1);
@@ -2737,6 +2771,8 @@ mod tests {
 			is_splice: false,
 			input_mode: Some(FundingInputMode::ManuallySelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let contribution = FundingTemplate::new(None, None, Some(prior), Amount::MAX_MONEY)
@@ -2795,6 +2831,8 @@ mod tests {
 			is_splice: false,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let builder = FundingTemplate::new(None, None, Some(prior), Amount::MAX_MONEY)
@@ -2847,6 +2885,8 @@ mod tests {
 			is_splice: false,
 			input_mode: Some(FundingInputMode::ManuallySelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let contribution = FundingTemplate::new(None, None, Some(prior), Amount::MAX_MONEY)
@@ -2876,6 +2916,8 @@ mod tests {
 			is_splice: false,
 			input_mode: Some(FundingInputMode::ManuallySelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = FundingTemplate::new(None, None, Some(prior), Amount::ZERO)
@@ -2913,6 +2955,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::ManuallySelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let holder_balance = target_fee
@@ -2952,6 +2996,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::ManuallySelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let holder_balance = target_fee.checked_sub(net_value_without_fee).unwrap();
@@ -3136,6 +3182,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let net_value_before = contribution.net_value();
@@ -3175,6 +3223,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3217,6 +3267,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let net_value_before = contribution.net_value();
@@ -3254,6 +3306,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3281,6 +3335,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let contribution =
@@ -3312,6 +3368,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// Balance of 55,000 sats can't cover outputs (50,000) + target_fee at 50k sat/kwu.
@@ -3343,6 +3401,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// For splice-in with change that stays above dust, the surplus is absorbed by the change
@@ -3378,6 +3438,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let net_at_feerate = contribution
@@ -3416,6 +3478,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let net_before = contribution.net_value();
@@ -3451,6 +3515,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result =
@@ -3481,6 +3547,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3514,6 +3582,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3550,6 +3620,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3594,6 +3666,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3628,6 +3702,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3668,6 +3744,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(target_feerate, Amount::MAX_MONEY);
@@ -3706,6 +3784,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// target == min feerate, so FeeRateTooLow check passes.
@@ -3735,6 +3815,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let result = contribution.for_acceptor_at_feerate(feerate, Amount::MAX_MONEY);
@@ -3761,6 +3843,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// Balance of 40,000 sats is less than outputs (50,000) + target_fee.
@@ -3789,6 +3873,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// Balance of 100,000 sats is more than outputs (50,000) + target_fee.
@@ -3821,6 +3907,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// Balance of 40,000 sats is less than outputs (50,000) + target_fee.
@@ -3852,6 +3940,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let acceptor = contribution
@@ -3891,6 +3981,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// max_feerate (2020) < min_rbf_feerate (2025).
@@ -3926,6 +4018,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let template =
@@ -3958,6 +4052,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let template =
@@ -3985,6 +4081,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let template =
@@ -4016,6 +4114,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let template =
@@ -4081,6 +4181,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let template = FundingTemplate::new(
@@ -4125,6 +4227,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		let template = FundingTemplate::new(
@@ -4201,6 +4305,7 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+			request_funding: None,
 		}
 	}
 
@@ -4363,6 +4468,8 @@ mod tests {
 			is_splice: true,
 			input_mode: Some(FundingInputMode::CoinSelected),
 			pending_components: Default::default(),
+
+			request_funding: None,
 		};
 
 		// With nothing recorded as pending, everything is unique to the contribution.

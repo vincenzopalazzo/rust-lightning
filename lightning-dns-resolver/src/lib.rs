@@ -256,8 +256,12 @@ mod test {
 	}
 
 	fn get_om_init() -> Init {
-		let mut init_msg =
-			Init { features: InitFeatures::empty(), networks: None, remote_network_address: None };
+		let mut init_msg = Init {
+			features: InitFeatures::empty(),
+			networks: None,
+			remote_network_address: None,
+			will_fund_rates: None,
+		};
 		init_msg.features.set_onion_messages_optional();
 		init_msg
 	}

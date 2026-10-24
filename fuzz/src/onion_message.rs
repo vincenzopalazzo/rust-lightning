@@ -76,7 +76,8 @@ pub fn do_test<L: Logger>(data: &[u8], logger: &L) {
 
 		let mut features = InitFeatures::empty();
 		features.set_onion_messages_optional();
-		let init = msgs::Init { features, networks: None, remote_network_address: None };
+		let init = msgs::Init { features, networks: None, remote_network_address: None,
+ will_fund_rates: None,};
 
 		onion_messenger.peer_connected(peer_node_id, &init, false).unwrap();
 		onion_messenger.handle_onion_message(peer_node_id, &msg);

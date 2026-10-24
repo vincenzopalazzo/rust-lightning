@@ -2586,7 +2586,8 @@ mod tests {
 					features: nodes[j].node.init_features(),
 					networks: None,
 					remote_network_address: None,
-				};
+
+					will_fund_rates: None,};
 				nodes[i]
 					.node
 					.peer_connected(nodes[j].node.get_our_node_id(), &init_i, true)
@@ -2595,7 +2596,8 @@ mod tests {
 					features: nodes[i].node.init_features(),
 					networks: None,
 					remote_network_address: None,
-				};
+
+					will_fund_rates: None,};
 				nodes[j]
 					.node
 					.peer_connected(nodes[i].node.get_our_node_id(), &init_j, false)

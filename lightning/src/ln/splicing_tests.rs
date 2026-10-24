@@ -8674,6 +8674,8 @@ fn test_splice_rbf_no_pending_splice() {
 		locktime: 0,
 		feerate_sat_per_1000_weight: 500,
 		funding_output_contribution: Some(50_000),
+
+		request_funding: None,
 	};
 
 	nodes[1].node.handle_tx_init_rbf(node_id_0, &tx_init_rbf);
@@ -9558,6 +9560,8 @@ fn test_splice_rbf_after_splice_locked() {
 		locktime: 0,
 		feerate_sat_per_1000_weight: 500,
 		funding_output_contribution: Some(added_value.to_sat() as i64),
+
+		request_funding: None,
 	};
 
 	nodes[1].node.handle_tx_init_rbf(node_id_0, &tx_init_rbf);
@@ -10331,6 +10335,8 @@ fn test_splice_rbf_zeroconf_rejected() {
 		locktime: 0,
 		feerate_sat_per_1000_weight: 500,
 		funding_output_contribution: Some(50_000),
+
+		request_funding: None,
 	};
 
 	nodes[1].node.handle_tx_init_rbf(node_id_0, &tx_init_rbf);
@@ -10393,6 +10399,8 @@ fn test_overlapping_tx_init_rbf_disconnects() {
 		locktime: 0,
 		feerate_sat_per_1000_weight: 500,
 		funding_output_contribution: Some(added_value.to_sat() as i64),
+
+		request_funding: None,
 	};
 
 	nodes[0].node.handle_tx_init_rbf(node_id_1, &tx_init_rbf);
@@ -13077,6 +13085,8 @@ fn test_splice_init_before_quiescence_sends_warning() {
 		locktime: 0,
 		funding_pubkey,
 		require_confirmed_inputs: None,
+
+		request_funding: None,
 	};
 	nodes[0].node.handle_splice_init(node_id_1, &splice_init);
 
@@ -13122,6 +13132,8 @@ fn test_tx_init_rbf_before_quiescence_sends_warning() {
 		locktime: 0,
 		feerate_sat_per_1000_weight: FEERATE_FLOOR_SATS_PER_KW + 25,
 		funding_output_contribution: Some(added_value.to_sat() as i64),
+
+		request_funding: None,
 	};
 	nodes[0].node.handle_tx_init_rbf(node_id_1, &tx_init_rbf);
 
@@ -13662,7 +13674,8 @@ fn do_test_0reserve_splice_holder_validation(
 		Amount::from_sat(
 			initiator_value_to_self_sat
 				- commit_tx_fee_sat
-				- anchors_sat - estimated_fees_sat
+				- anchors_sat
+				- estimated_fees_sat
 				- dust_limit_satoshis,
 		)
 	} else if counterparty_has_output && !node_0_is_initiator {

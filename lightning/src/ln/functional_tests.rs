@@ -918,7 +918,7 @@ pub fn test_justice_tx_htlc_timeout() {
 		revoked_local_txn[1].input[0].witness.last().unwrap().len(),
 		OFFERED_HTLC_SCRIPT_WEIGHT
 	); // HTLC-Timeout
-   // Revoke the old state
+	// Revoke the old state
 	claim_payment(&nodes[0], &[&nodes[1]], payment_preimage_3);
 
 	{
@@ -3264,6 +3264,8 @@ pub fn test_drop_messages_peer_disconnect_dual_htlc() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
@@ -6236,7 +6238,7 @@ pub fn test_announce_disable_channels() {
 		match e {
 			MessageSendEvent::BroadcastChannelUpdate { ref msg, .. } => {
 				assert_eq!(msg.contents.channel_flags & (1 << 1), 1 << 1); // The "channel disabled" bit should be set
-														   // Check that each channel gets updated exactly once
+															   // Check that each channel gets updated exactly once
 				if chans_disabled
 					.insert(msg.contents.short_channel_id, msg.contents.timestamp)
 					.is_some()
@@ -6252,6 +6254,8 @@ pub fn test_announce_disable_channels() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
@@ -9716,12 +9720,16 @@ pub fn test_disconnects_peer_awaiting_response_ticks() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[0].node.peer_connected(node_b_id, &bob_init, true).unwrap();
 	let alice_init = msgs::Init {
 		features: nodes[0].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[1].node.peer_connected(node_a_id, &alice_init, true).unwrap();
 

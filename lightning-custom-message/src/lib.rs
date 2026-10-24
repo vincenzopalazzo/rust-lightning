@@ -584,7 +584,8 @@ mod tests {
 		];
 		let pk = PublicKey::from_slice(&pk_bytes).unwrap();
 		let init =
-			Init { features: InitFeatures::empty(), networks: None, remote_network_address: None };
+			Init { features: InitFeatures::empty(), networks: None, remote_network_address: None,
+ will_fund_rates: None,};
 
 		let result = composite.peer_connected(pk, &init, true);
 		assert!(result.is_err(), "Composite must propagate the inner Err");

@@ -122,6 +122,11 @@ pub struct Init {
 	/// public IPv4 address (NAT) and use that for a [`NodeAnnouncement`] update message containing
 	/// the new address.
 	pub remote_network_address: Option<SocketAddress>,
+	/// Liquidity-ad rate card (TLV 1339, `will_fund_rates`), as the peer wrote it.
+	///
+	/// ACINQ's Phoenix LSP sends this to a client. The bytes are the raw TLV value;
+	/// this crate does not interpret the rate card.
+	pub will_fund_rates: Option<Vec<u8>>,
 }
 
 /// An [`error`] message to be sent to or received from a peer.
@@ -464,6 +469,19 @@ pub struct SpliceInit {
 	pub funding_pubkey: PublicKey,
 	/// If set, only confirmed inputs added (by the splice acceptor) will be accepted
 	pub require_confirmed_inputs: Option<()>,
+	/// Raw liquidity-ad `request_funding` (TLV 1339). The seller reads this as a
+	/// request to add inbound liquidity. Empty when this splice is not a purchase.
+	pub request_funding: Option<Vec<u8>>,
+}
+
+/// The seller's answer to a liquidity-ad purchase, taken from the latest `splice_ack`
+/// or `tx_ack_rbf`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpliceLiquidityAck {
+	/// Raw `will_fund` TLV value.
+	pub will_fund: Vec<u8>,
+	/// Fee credit the seller applied, in millisatoshis. Zero when TLV 41042 was omitted.
+	pub fee_credit_used_msat: u64,
 }
 
 /// A `splice_ack` message to be received by or sent to the splice initiator.
@@ -480,6 +498,12 @@ pub struct SpliceAck {
 	pub funding_pubkey: PublicKey,
 	/// If set, only confirmed inputs added (by the splice initiator) will be accepted
 	pub require_confirmed_inputs: Option<()>,
+	/// Raw liquidity-ad `will_fund` (TLV 1339): the seller's signed acceptance of
+	/// [`SpliceInit::request_funding`].
+	pub will_fund: Option<Vec<u8>>,
+	/// Fee credit the seller applied to this purchase, in msat (even TLV 41042,
+	/// truncated uint64). `None` when the seller sent no credit.
+	pub fee_credit_used_msat: Option<u64>,
 }
 
 /// A `splice_locked` message to be sent to or received from a peer.
@@ -593,6 +617,9 @@ pub struct TxInitRbf {
 	/// The number of satoshis the sender will contribute to or, if negative, remove from
 	/// (e.g. splice-out) the funding output of the transaction
 	pub funding_output_contribution: Option<i64>,
+	/// Raw liquidity-ad `request_funding` (TLV 1339), carried across an RBF of a
+	/// purchase splice. See [`SpliceInit::request_funding`].
+	pub request_funding: Option<Vec<u8>>,
 }
 
 /// A [`tx_ack_rbf`] message which acknowledges replacement of the transaction after it's been
@@ -606,6 +633,11 @@ pub struct TxAckRbf {
 	/// The number of satoshis the sender will contribute to or, if negative, remove from
 	/// (e.g. splice-out) the funding output of the transaction
 	pub funding_output_contribution: Option<i64>,
+	/// Raw liquidity-ad `will_fund` (TLV 1339) on an RBF acknowledgement.
+	pub will_fund: Option<Vec<u8>>,
+	/// Fee credit applied on this RBF, in msat (even TLV 41042). See
+	/// [`SpliceAck::fee_credit_used_msat`].
+	pub fee_credit_used_msat: Option<u64>,
 }
 
 /// A [`tx_abort`] message which signals the cancellation of an in-progress transaction negotiation.
@@ -3038,6 +3070,7 @@ impl_writeable_msg!(SpliceInit, {
 	funding_pubkey,
 }, {
 	(2, require_confirmed_inputs, option), // `splice_init_tlvs`
+	(1339, request_funding, (option, encoding: (Vec<u8>, WithoutLength))),
 });
 
 impl_writeable_msg!(SpliceAck, {
@@ -3046,6 +3079,8 @@ impl_writeable_msg!(SpliceAck, {
 	funding_pubkey,
 }, {
 	(2, require_confirmed_inputs, option), // `splice_ack_tlvs`
+	(1339, will_fund, (option, encoding: (Vec<u8>, WithoutLength))),
+	(41042, fee_credit_used_msat, (option, encoding: (u64, Tu64))),
 });
 
 impl_writeable_msg!(SpliceLocked, {
@@ -3140,12 +3175,15 @@ impl_writeable_msg!(TxInitRbf, {
 	feerate_sat_per_1000_weight,
 }, {
 	(0, funding_output_contribution, option),
+	(1339, request_funding, (option, encoding: (Vec<u8>, WithoutLength))),
 });
 
 impl_writeable_msg!(TxAckRbf, {
 	channel_id,
 }, {
 	(0, funding_output_contribution, option),
+	(1339, will_fund, (option, encoding: (Vec<u8>, WithoutLength))),
+	(41042, fee_credit_used_msat, (option, encoding: (u64, Tu64))),
 });
 
 impl_writeable_msg!(TxAbort, {
@@ -3268,6 +3306,7 @@ impl Writeable for Init {
 		encode_tlv_stream!(w, {
 			(1, self.networks.as_ref().map(|n| WithoutLength(n)), option),
 			(3, self.remote_network_address, option),
+			(1339, self.will_fund_rates.as_ref().map(|rates| WithoutLength(rates)), option),
 		});
 		Ok(())
 	}
@@ -3279,14 +3318,17 @@ impl LengthReadable for Init {
 		let features: InitFeatures = Readable::read(r)?;
 		let mut remote_network_address: Option<SocketAddress> = None;
 		let mut networks: Option<WithoutLength<Vec<ChainHash>>> = None;
+		let mut will_fund_rates: Option<WithoutLength<Vec<u8>>> = None;
 		decode_tlv_stream!(r, {
 			(1, networks, option),
-			(3, remote_network_address, option)
+			(3, remote_network_address, option),
+			(1339, will_fund_rates, option),
 		});
 		Ok(Init {
 			features: features | global_features,
 			networks: networks.map(|n| n.0),
 			remote_network_address,
+			will_fund_rates: will_fund_rates.map(|rates| rates.0),
 		})
 	}
 }
@@ -3549,21 +3591,99 @@ impl Readable for OnionPacket {
 	}
 }
 
-impl_writeable_msg!(UpdateAddHTLC, {
-	channel_id,
-	htlc_id,
-	amount_msat,
-	payment_hash,
-	cltv_expiry,
-	onion_routing_packet,
-}, {
-	(0, blinding_point, option),
-	(65537, skimmed_fee_msat, option),
-	// TODO: currently we may fail to read the `ChannelManager` if we write a new even TLV in this message
-	// and then downgrade. Once this is fixed, update the type here to match BOLTs PR 989.
-	(75537, hold_htlc, option),
-	(106823, accountable, (option, encoding: (bool, AccountableBool))),
-});
+/// Truncated uint64, the encoding lightning-kmp uses for fee credit (`writeTU64`).
+struct Tu64<T>(T);
+
+impl Writeable for Tu64<&u64> {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		BigSize(*self.0).write(writer)
+	}
+}
+
+impl LengthReadable for Tu64<u64> {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(
+		reader: &mut R,
+	) -> Result<Self, DecodeError> {
+		let BigSize(value) = Readable::read(reader)?;
+		Ok(Tu64(value))
+	}
+}
+
+/// Phoenix `funding_fee` (TLV 41041): 8-byte msat amount, then the funding txid.
+struct FundingFeeTlv {
+	amount_msat: u64,
+}
+
+impl LengthReadable for FundingFeeTlv {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(
+		reader: &mut R,
+	) -> Result<Self, DecodeError> {
+		let amount_msat: u64 = Readable::read(reader)?;
+		let _funding_txid: Txid = Readable::read(reader)?;
+		Ok(Self { amount_msat })
+	}
+}
+
+impl Writeable for UpdateAddHTLC {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.channel_id.write(w)?;
+		self.htlc_id.write(w)?;
+		self.amount_msat.write(w)?;
+		self.payment_hash.write(w)?;
+		self.cltv_expiry.write(w)?;
+		self.onion_routing_packet.write(w)?;
+		encode_tlv_stream!(w, {
+			(0, self.blinding_point, option),
+			(65537, self.skimmed_fee_msat, option),
+			// TODO: currently we may fail to read the `ChannelManager` if we write a new even TLV in this message
+			// and then downgrade. Once this is fixed, update the type here to match BOLTs PR 989.
+			(75537, self.hold_htlc, option),
+			(106823, self.accountable, (option, encoding: (bool, AccountableBool))),
+		});
+		Ok(())
+	}
+}
+
+impl LengthReadable for UpdateAddHTLC {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		let channel_id = Readable::read(r)?;
+		let htlc_id = Readable::read(r)?;
+		let amount_msat = Readable::read(r)?;
+		let payment_hash = Readable::read(r)?;
+		let cltv_expiry = Readable::read(r)?;
+		let onion_routing_packet = Readable::read(r)?;
+		let mut blinding_point = None;
+		let mut funding_fee: Option<FundingFeeTlv> = None;
+		let mut skimmed_fee_msat = None;
+		let mut hold_htlc = None;
+		let mut accountable = None;
+		decode_tlv_stream!(r, {
+			(0, blinding_point, option),
+			(41041, funding_fee, option),
+			(65537, skimmed_fee_msat, option),
+			(75537, hold_htlc, option),
+			(106823, accountable, (option, encoding: (bool, AccountableBool))),
+		});
+		// Phoenix declares the LSP's funding fee here instead of TLV 65537. The
+		// rest of the stack already allows a shortfall of `skimmed_fee_msat`.
+		if let Some(fee) = funding_fee {
+			skimmed_fee_msat =
+				Some(skimmed_fee_msat.unwrap_or(0u64).saturating_add(fee.amount_msat));
+		}
+		Ok(Self {
+			channel_id,
+			htlc_id,
+			amount_msat,
+			payment_hash,
+			cltv_expiry,
+			onion_routing_packet,
+			skimmed_fee_msat,
+			blinding_point,
+			hold_htlc,
+			accountable,
+		})
+	}
+}
 
 impl LengthReadable for OnionMessage {
 	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
@@ -3868,7 +3988,8 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPaylo
 					used_aad,
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 						|| used_aad != TriPolyAADUsed::None
@@ -3890,7 +4011,8 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPaylo
 					used_aad,
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 						|| used_aad == TriPolyAADUsed::None
@@ -4038,7 +4160,8 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundTrampoline
 					used_aad,
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 						|| used_aad != TriPolyAADUsed::None
@@ -5700,6 +5823,8 @@ mod tests {
 			locktime: 0,
 			funding_pubkey: pubkey_1,
 			require_confirmed_inputs: Some(()),
+
+			request_funding: None,
 		};
 		let encoded_value = splice_init.encode();
 		assert_eq!(encoded_value.as_hex().to_string(), "0202020202020202020202020202020202020202020202020202020202020202fffffffffffe1dc0000007d000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0200");
@@ -5723,6 +5848,61 @@ mod tests {
 	}
 
 	#[test]
+	fn phoenix_funding_fee_counts_as_skimmed_fee() {
+		let base = test_update_add_htlc();
+		assert_eq!(base.skimmed_fee_msat, None);
+		let mut encoded = base.encode();
+		// TLV 41041, length 40: u64 msat then funding txid.
+		BigSize(41041).write(&mut encoded).unwrap();
+		BigSize(40).write(&mut encoded).unwrap();
+		2_500_000u64.write(&mut encoded).unwrap();
+		[0xabu8; 32].write(&mut encoded).unwrap();
+
+		let decoded: msgs::UpdateAddHTLC =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.skimmed_fee_msat, Some(2_500_000));
+		assert_eq!(decoded.amount_msat, base.amount_msat);
+	}
+
+	#[test]
+	fn splice_liquidity_ads_round_trip() {
+		let secp_ctx = Secp256k1::new();
+		let (_, pubkey_1) = get_keys_from!(
+			"0101010101010101010101010101010101010101010101010101010101010101",
+			secp_ctx
+		);
+		let request = vec![1, 2, 3, 4];
+		let splice_init = msgs::SpliceInit {
+			channel_id: ChannelId::from_bytes([2; 32]),
+			funding_contribution_satoshis: 0,
+			funding_feerate_per_kw: 2000,
+			locktime: 0,
+			funding_pubkey: pubkey_1,
+			require_confirmed_inputs: None,
+			request_funding: Some(request.clone()),
+		};
+		let encoded = splice_init.encode();
+		let decoded: msgs::SpliceInit =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.request_funding.as_deref(), Some(request.as_slice()));
+
+		let will_fund = vec![9, 8, 7];
+		let splice_ack = msgs::SpliceAck {
+			channel_id: ChannelId::from_bytes([2; 32]),
+			funding_contribution_satoshis: 50_000,
+			funding_pubkey: pubkey_1,
+			require_confirmed_inputs: None,
+			will_fund: Some(will_fund.clone()),
+			fee_credit_used_msat: Some(1_500_000),
+		};
+		let encoded = splice_ack.encode();
+		let decoded: msgs::SpliceAck =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.will_fund.as_deref(), Some(will_fund.as_slice()));
+		assert_eq!(decoded.fee_credit_used_msat, Some(1_500_000));
+	}
+
+	#[test]
 	fn encoding_splice_ack() {
 		let secp_ctx = Secp256k1::new();
 		let (_, pubkey_1) = get_keys_from!(
@@ -5734,6 +5914,9 @@ mod tests {
 			funding_contribution_satoshis: -123456,
 			funding_pubkey: pubkey_1,
 			require_confirmed_inputs: Some(()),
+
+			will_fund: None,
+			fee_credit_used_msat: None,
 		};
 		let encoded_value = splice_ack.encode();
 		assert_eq!(encoded_value.as_hex().to_string(), "0202020202020202020202020202020202020202020202020202020202020202fffffffffffe1dc0031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0200");
@@ -5934,6 +6117,8 @@ mod tests {
 			} else {
 				None
 			},
+
+			request_funding: None,
 		};
 		let encoded_value = tx_init_rbf.encode();
 		let mut target_value =
@@ -5964,6 +6149,9 @@ mod tests {
 			} else {
 				None
 			},
+
+			will_fund: None,
+			fee_credit_used_msat: None,
 		};
 		let encoded_value = tx_ack_rbf.encode();
 		let mut target_value =
@@ -6264,12 +6452,15 @@ mod tests {
 			features: InitFeatures::from_le_bytes(vec![0xFF, 0xFF, 0xFF]),
 			networks: Some(vec![mainnet_hash]),
 			remote_network_address: None,
-		}.encode(), <Vec<u8>>::from_hex("00023fff0003ffffff01206fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap());
+
+			will_fund_rates: None,}.encode(), <Vec<u8>>::from_hex("00023fff0003ffffff01206fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap());
 		assert_eq!(
 			msgs::Init {
 				features: InitFeatures::from_le_bytes(vec![0xFF]),
 				networks: None,
 				remote_network_address: None,
+
+				will_fund_rates: None,
 			}
 			.encode(),
 			<Vec<u8>>::from_hex("0001ff0001ff").unwrap()
@@ -6279,6 +6470,8 @@ mod tests {
 				features: InitFeatures::from_le_bytes(vec![]),
 				networks: Some(vec![mainnet_hash]),
 				remote_network_address: None,
+
+				will_fund_rates: None,
 			}
 			.encode(),
 			<Vec<u8>>::from_hex(
@@ -6290,7 +6483,8 @@ mod tests {
 			features: InitFeatures::from_le_bytes(vec![]),
 			networks: Some(vec![ChainHash::from(&[1; 32]), ChainHash::from(&[2; 32])]),
 			remote_network_address: None,
-		}.encode(), <Vec<u8>>::from_hex("00000000014001010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202").unwrap());
+
+			will_fund_rates: None,}.encode(), <Vec<u8>>::from_hex("00000000014001010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202").unwrap());
 		let init_msg = msgs::Init {
 			features: InitFeatures::from_le_bytes(vec![]),
 			networks: Some(vec![mainnet_hash]),
@@ -6298,6 +6492,8 @@ mod tests {
 				addr: [127, 0, 0, 1],
 				port: 1000,
 			}),
+
+			will_fund_rates: None,
 		};
 		let encoded_value = init_msg.encode();
 		let target_value = <Vec<u8>>::from_hex("0000000001206fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d61900000000000307017f00000103e8").unwrap();

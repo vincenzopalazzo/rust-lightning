@@ -690,6 +690,8 @@ fn do_test_shutdown_rebroadcast(recv_count: u8) {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	let node_0_reestablish = get_chan_reestablish_msgs!(nodes[0], nodes[1]).pop().unwrap();

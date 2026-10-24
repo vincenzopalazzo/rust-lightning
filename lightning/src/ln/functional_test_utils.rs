@@ -4968,11 +4968,15 @@ pub fn connect_nodes<'a, 'b: 'a, 'c: 'b>(node_a: &Node<'a, 'b, 'c>, node_b: &Nod
 		features: node_a.init_features(node_id_b),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 	let init_b = msgs::Init {
 		features: node_b.init_features(node_id_a),
 		networks: None,
 		remote_network_address: None,
+
+		will_fund_rates: None,
 	};
 
 	node_a.node.peer_connected(node_id_b, &init_b, true).unwrap();
@@ -4987,8 +4991,12 @@ pub fn connect_dummy_node<'a, 'b: 'a, 'c: 'b>(node: &Node<'a, 'b, 'c>) {
 	let mut dummy_init_features = InitFeatures::empty();
 	dummy_init_features.set_static_remote_key_required();
 
-	let init_dummy =
-		msgs::Init { features: dummy_init_features, networks: None, remote_network_address: None };
+	let init_dummy = msgs::Init {
+		features: dummy_init_features,
+		networks: None,
+		remote_network_address: None,
+		will_fund_rates: None,
+	};
 
 	node.node.peer_connected(node_id_dummy, &init_dummy, true).unwrap();
 	node.onion_messenger.peer_connected(node_id_dummy, &init_dummy, true).unwrap();

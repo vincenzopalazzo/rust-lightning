@@ -1919,13 +1919,15 @@ impl PeerLink {
 			features: nodes[self.node_b].init_features(),
 			networks: None,
 			remote_network_address: None,
-		};
+
+			will_fund_rates: None,};
 		nodes[self.node_a].peer_connected(node_b_id, &init_b, true).unwrap();
 		let init_a = Init {
 			features: nodes[self.node_a].init_features(),
 			networks: None,
 			remote_network_address: None,
-		};
+
+			will_fund_rates: None,};
 		nodes[self.node_b].peer_connected(node_a_id, &init_a, false).unwrap();
 		self.disconnected = false;
 	}
@@ -2477,10 +2479,12 @@ fn build_node_config(chan_type: ChanType) -> UserConfig {
 
 fn connect_peers(source: &ChanMan<'_>, dest: &ChanMan<'_>) {
 	let init_dest =
-		Init { features: dest.init_features(), networks: None, remote_network_address: None };
+		Init { features: dest.init_features(), networks: None, remote_network_address: None,
+ will_fund_rates: None,};
 	source.peer_connected(dest.get_our_node_id(), &init_dest, true).unwrap();
 	let init_src =
-		Init { features: source.init_features(), networks: None, remote_network_address: None };
+		Init { features: source.init_features(), networks: None, remote_network_address: None,
+ will_fund_rates: None,};
 	dest.peer_connected(source.get_our_node_id(), &init_src, false).unwrap();
 }
 

@@ -1093,7 +1093,8 @@ fn stale_webhooks() {
 		features: lightning_types::features::InitFeatures::empty(),
 		remote_network_address: None,
 		networks: None,
-	};
+
+		will_fund_rates: None,};
 	service_node.liquidity_manager.peer_connected(client_node_id, &init_msg, false).unwrap();
 
 	let _ = client_handler.list_webhooks(service_node_id);
@@ -1389,7 +1390,8 @@ fn test_notifications_and_peer_connected_reset_is_throttled() {
 		features: lightning_types::features::InitFeatures::empty(),
 		remote_network_address: None,
 		networks: None,
-	};
+
+		will_fund_rates: None,};
 	service_node.liquidity_manager.peer_connected(client_node_id, &init_msg, false).unwrap();
 	let _ = service_handler.notify_payment_incoming(client_node_id);
 	let event = service_node.liquidity_manager.next_event().unwrap();

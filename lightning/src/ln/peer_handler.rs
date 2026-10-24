@@ -1884,6 +1884,8 @@ impl<
 								remote_network_address: filter_addresses(
 									peer.their_socket_address.clone(),
 								),
+
+								will_fund_rates: None,
 							};
 							let msg = Message::Init(resp);
 							self.enqueue_message(peer, msg).map_err(|()| PeerHandleError {})?;
@@ -1905,6 +1907,8 @@ impl<
 								remote_network_address: filter_addresses(
 									peer.their_socket_address.clone(),
 								),
+
+								will_fund_rates: None,
 							};
 							let msg = Message::Init(resp);
 							self.enqueue_message(peer, msg).map_err(|()| PeerHandleError {})?;

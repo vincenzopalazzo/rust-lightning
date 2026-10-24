@@ -104,12 +104,14 @@ fn connect_peers<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 'b, 'c
 		features: node_a.init_features(node_id_b),
 		networks: None,
 		remote_network_address: None,
-	};
+
+		will_fund_rates: None,};
 	let init_b = Init {
 		features: node_b.init_features(node_id_a),
 		networks: None,
 		remote_network_address: None,
-	};
+
+		will_fund_rates: None,};
 
 	node_a.node.peer_connected(node_id_b, &init_b, true).unwrap();
 	node_b.node.peer_connected(node_id_a, &init_a, false).unwrap();
