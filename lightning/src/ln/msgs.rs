@@ -3209,10 +3209,32 @@ impl_writeable_msg!(ChannelReestablish, {
 	(5, my_current_funding_locked, option),
 });
 
-impl_writeable!(NextFunding, {
-	txid,
-	retransmit_flags
-});
+impl Writeable for NextFunding {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.txid.write(w)?;
+		self.retransmit_flags.write(w)?;
+		Ok(())
+	}
+
+	#[inline]
+	fn serialized_length(&self) -> usize {
+		33
+	}
+}
+
+impl Readable for NextFunding {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let txid = Readable::read(r)?;
+		// Official splicing appends a retransmit flag (33 bytes). Phoenix's
+		// legacy `splice_prototype` sends only the txid (32 bytes).
+		let retransmit_flags = match <u8 as Readable>::read(r) {
+			Ok(flags) => flags,
+			Err(DecodeError::ShortRead) => 0,
+			Err(err) => return Err(err),
+		};
+		Ok(Self { txid, retransmit_flags })
+	}
+}
 
 impl_writeable!(FundingLocked, {
 	txid,
@@ -4835,6 +4857,21 @@ mod tests {
 				12, 98, 82, 75, 31, 201, 11, 91, 23, 98, 23, 53, 124, 1, // Value
 			]
 		);
+
+		// Phoenix splice_prototype sends TLV 1 as a 32-byte txid.
+		let mut legacy = encoded_value.clone();
+		let len_at = legacy.len() - 34;
+		assert_eq!(legacy[len_at], 33);
+		legacy[len_at] = 32;
+		legacy.pop();
+		let mut bytes = &legacy[..];
+		let decoded = <msgs::ChannelReestablish as LengthReadable>::read_from_fixed_length_buffer(
+			&mut bytes,
+		)
+		.unwrap();
+		let next = decoded.next_funding.unwrap();
+		assert_eq!(next.retransmit_flags, 0);
+		assert_eq!(next.txid, cr.next_funding.as_ref().unwrap().txid);
 	}
 
 	#[test]

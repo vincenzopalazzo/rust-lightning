@@ -2003,8 +2003,8 @@ impl<
 												log_debug!(logger, "Got an invalid value while deserializing message");
 												return Err(PeerHandleError {});
 											},
-											(msgs::DecodeError::ShortRead, _) => {
-												log_debug!(logger, "Deserialization failed due to shortness of message");
+											(msgs::DecodeError::ShortRead, ty) => {
+												log_debug!(logger, "Deserialization failed due to shortness of message type {:?}", ty);
 												return Err(PeerHandleError {});
 											},
 											(msgs::DecodeError::BadLengthDescriptor, _) => {
