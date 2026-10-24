@@ -5,9 +5,17 @@
 //! are sorted, the second distinct key has coefficient 1, and the other is
 //! multiplied by `SHA256(SHA256("KeyAgg coefficient") || SHA256("KeyAgg coefficient") || L || pk)`.
 
+use bitcoin::absolute::LockTime;
+use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::script::ScriptBuf;
-use bitcoin::secp256k1::{self, PublicKey, Scalar, Secp256k1, SecretKey};
+use bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CSV, OP_DROP};
+use bitcoin::script::{Builder, ScriptBuf};
+use bitcoin::secp256k1::schnorr;
+use bitcoin::secp256k1::{self, Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
+use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::taproot::TaprootBuilder;
+use bitcoin::transaction::{Transaction, TxIn, TxOut};
+use bitcoin::{Amount, OutPoint, Sequence, Witness};
 
 use crate::sign::EntropySource;
 
@@ -79,6 +87,171 @@ pub(super) fn aggregate_funding_keys(
 	aggregated.expect("two funding keys").x_only_public_key().0
 }
 
+/// Full aggregate point, before the x-only conversion. The y parity decides
+/// the BIP 327 negation inside the taproot tweak.
+fn aggregate_point(
+	secp: &Secp256k1<secp256k1::All>, local: &PublicKey, remote: &PublicKey,
+) -> PublicKey {
+	let mut keys = [local.serialize(), remote.serialize()];
+	keys.sort();
+	let mut list = Vec::with_capacity(66);
+	list.extend_from_slice(&keys[0]);
+	list.extend_from_slice(&keys[1]);
+	let key_list_hash = tagged_sha256("KeyAgg list", &list);
+	let second = if keys[0] != keys[1] { keys[1] } else { [0u8; 33] };
+	let mut aggregated: Option<PublicKey> = None;
+	for key_bytes in keys {
+		let point = PublicKey::from_slice(&key_bytes).expect("compressed funding key");
+		let scaled = if key_bytes == second {
+			point
+		} else {
+			let mut coeff_input = Vec::with_capacity(65);
+			coeff_input.extend_from_slice(&key_list_hash);
+			coeff_input.extend_from_slice(&key_bytes);
+			let coefficient = scalar_mod_order(tagged_sha256("KeyAgg coefficient", &coeff_input));
+			point.mul_tweak(secp, &coefficient).expect("key aggregation coefficient")
+		};
+		aggregated = Some(match aggregated {
+			None => scaled,
+			Some(so_far) => so_far.combine(&scaled).expect("funding key aggregate"),
+		});
+	}
+	aggregated.expect("two funding keys")
+}
+
+fn key_agg_coeff(local: &PublicKey, remote: &PublicKey) -> Scalar {
+	let ours = local.serialize();
+	let theirs = remote.serialize();
+	let mut keys = [ours, theirs];
+	keys.sort();
+	let second = if keys[0] != keys[1] { keys[1] } else { [0u8; 33] };
+	if ours == second {
+		return Scalar::ONE;
+	}
+	let mut list = Vec::with_capacity(66);
+	list.extend_from_slice(&keys[0]);
+	list.extend_from_slice(&keys[1]);
+	let key_list_hash = tagged_sha256("KeyAgg list", &list);
+	let mut coeff_input = Vec::with_capacity(65);
+	coeff_input.extend_from_slice(&key_list_hash);
+	coeff_input.extend_from_slice(&ours);
+	scalar_mod_order(tagged_sha256("KeyAgg coefficient", &coeff_input))
+}
+
+fn point_from_secret(secp: &Secp256k1<secp256k1::All>, secret: &SecretKey) -> PublicKey {
+	PublicKey::from_secret_key(secp, secret)
+}
+
+fn add_secret(left: SecretKey, right: SecretKey) -> SecretKey {
+	left.add_tweak(&Scalar::from(right)).expect("scalar addition")
+}
+
+fn mul_secret(left: SecretKey, factor: &Scalar) -> SecretKey {
+	left.mul_tweak(factor).expect("scalar multiplication")
+}
+
+/// BIP 327 partial signature of `message` for a key-path taproot spend of the
+/// aggregate. `our_nonce` and `their_nonce` are 66 bytes each.
+pub(super) fn partial_sign(
+	secp: &Secp256k1<secp256k1::All>, our_secret: &SecretKey, remote: &PublicKey,
+	our_k1: &SecretKey, our_k2: &SecretKey, our_nonce: &[u8; 66], their_nonce: &[u8; 66],
+	message: &[u8; 32],
+) -> [u8; 32] {
+	let ours = point_from_secret(secp, our_secret);
+	let untweaked = aggregate_point(secp, &ours, remote);
+	let internal = untweaked.x_only_public_key().0;
+	let tweak = scalar_mod_order(tagged_sha256("TapTweak", &internal.serialize()));
+	let untweaked_even = untweaked.x_only_public_key().1 == Parity::Even;
+	let even_untweaked = if untweaked_even { untweaked } else { untweaked.negate(secp) };
+	let tweak_point =
+		point_from_secret(secp, &SecretKey::from_slice(&tweak.to_be_bytes()).expect("tweak"));
+	let tweaked = even_untweaked.combine(&tweak_point).expect("taproot tweak");
+	let tweaked_x = tweaked.x_only_public_key().0;
+	let tweaked_even = tweaked.x_only_public_key().1 == Parity::Even;
+
+	let our_r1 = PublicKey::from_slice(&our_nonce[..33]).expect("our R1");
+	let our_r2 = PublicKey::from_slice(&our_nonce[33..]).expect("our R2");
+	let their_r1 = PublicKey::from_slice(&their_nonce[..33]).expect("their R1");
+	let their_r2 = PublicKey::from_slice(&their_nonce[33..]).expect("their R2");
+	let r1 = our_r1.combine(&their_r1).expect("aggregate R1");
+	let r2 = our_r2.combine(&their_r2).expect("aggregate R2");
+	let mut aggregate_nonce = [0u8; 66];
+	aggregate_nonce[..33].copy_from_slice(&r1.serialize());
+	aggregate_nonce[33..].copy_from_slice(&r2.serialize());
+	let mut nonce_input = Vec::with_capacity(66 + 32 + 32);
+	nonce_input.extend_from_slice(&aggregate_nonce);
+	nonce_input.extend_from_slice(&tweaked_x.serialize());
+	nonce_input.extend_from_slice(message);
+	let nonce_coeff = scalar_mod_order(tagged_sha256("MuSig/noncecoef", &nonce_input));
+	let r_point = r1.combine(&r2.mul_tweak(secp, &nonce_coeff).expect("b*R2")).expect("R");
+	let r_x = r_point.x_only_public_key().0;
+	let r_even = r_point.x_only_public_key().1 == Parity::Even;
+
+	let mut challenge_input = Vec::with_capacity(96);
+	challenge_input.extend_from_slice(&r_x.serialize());
+	challenge_input.extend_from_slice(&tweaked_x.serialize());
+	challenge_input.extend_from_slice(message);
+	let challenge = scalar_mod_order(tagged_sha256("BIP0340/challenge", &challenge_input));
+
+	let mut secret = our_secret.clone();
+	if !untweaked_even {
+		secret = secret.negate();
+	}
+	if !tweaked_even {
+		secret = secret.negate();
+	}
+	let coefficient = key_agg_coeff(&ours, remote);
+	let mut k1 = our_k1.clone();
+	let mut k2 = our_k2.clone();
+	if !r_even {
+		k1 = k1.negate();
+		k2 = k2.negate();
+	}
+	let partial = add_secret(
+		add_secret(k1, mul_secret(k2, &nonce_coeff)),
+		mul_secret(mul_secret(secret, &coefficient), &challenge),
+	);
+	partial.secret_bytes()
+}
+
+/// Final even nonce point and tweaked output key, shared by the unit test.
+#[cfg(test)]
+fn session_points(
+	secp: &Secp256k1<secp256k1::All>, local: &PublicKey, remote: &PublicKey, our_nonce: &[u8; 66],
+	their_nonce: &[u8; 66], message: &[u8; 32],
+) -> (XOnlyPublicKey, XOnlyPublicKey) {
+	let untweaked = aggregate_point(secp, local, remote);
+	let internal = untweaked.x_only_public_key().0;
+	let tweak = scalar_mod_order(tagged_sha256("TapTweak", &internal.serialize()));
+	let even_untweaked = if untweaked.x_only_public_key().1 == Parity::Even {
+		untweaked
+	} else {
+		untweaked.negate(secp)
+	};
+	let tweak_point =
+		PublicKey::from_secret_key(secp, &SecretKey::from_slice(&tweak.to_be_bytes()).unwrap());
+	let tweaked = even_untweaked.combine(&tweak_point).unwrap();
+	let output = tweaked.x_only_public_key().0;
+	let r1 = PublicKey::from_slice(&our_nonce[..33])
+		.unwrap()
+		.combine(&PublicKey::from_slice(&their_nonce[..33]).unwrap())
+		.unwrap();
+	let r2 = PublicKey::from_slice(&our_nonce[33..])
+		.unwrap()
+		.combine(&PublicKey::from_slice(&their_nonce[33..]).unwrap())
+		.unwrap();
+	let mut aggregate_nonce = [0u8; 66];
+	aggregate_nonce[..33].copy_from_slice(&r1.serialize());
+	aggregate_nonce[33..].copy_from_slice(&r2.serialize());
+	let mut nonce_input = Vec::new();
+	nonce_input.extend_from_slice(&aggregate_nonce);
+	nonce_input.extend_from_slice(&output.serialize());
+	nonce_input.extend_from_slice(message);
+	let nonce_coeff = scalar_mod_order(tagged_sha256("MuSig/noncecoef", &nonce_input));
+	let r_point = r1.combine(&r2.mul_tweak(secp, &nonce_coeff).unwrap()).unwrap();
+	(r_point.x_only_public_key().0, output)
+}
+
 /// P2TR funding script the Phoenix LSP puts on a simple-taproot channel.
 pub(super) fn funding_script(
 	secp: &Secp256k1<secp256k1::All>, local: &PublicKey, remote: &PublicKey,
@@ -86,21 +259,156 @@ pub(super) fn funding_script(
 	ScriptBuf::new_p2tr(secp, aggregate_funding_keys(secp, local, remote), None)
 }
 
+/// Public nonces for `tx_complete`, and the secrets of the first nonce.
+pub(super) struct CommitNonces {
+	pub wire: Vec<u8>,
+	pub k1: SecretKey,
+	pub k2: SecretKey,
+}
+
 /// Two 66-byte MuSig2 nonces (each two compressed points) for `tx_complete` TLV 4.
 pub(super) fn commit_nonces<ES: EntropySource>(
 	secp: &Secp256k1<secp256k1::All>, entropy: &ES,
-) -> Vec<u8> {
-	let mut nonces = Vec::with_capacity(132);
+) -> CommitNonces {
+	let mut secrets = Vec::with_capacity(4);
+	let mut wire = Vec::with_capacity(132);
 	for _ in 0..4 {
 		loop {
 			let bytes = entropy.get_secure_random_bytes();
 			if let Ok(secret) = SecretKey::from_slice(&bytes) {
-				nonces.extend_from_slice(&PublicKey::from_secret_key(secp, &secret).serialize());
+				wire.extend_from_slice(&PublicKey::from_secret_key(secp, &secret).serialize());
+				secrets.push(secret);
 				break;
 			}
 		}
 	}
-	nonces
+	CommitNonces { wire, k1: secrets[0], k2: secrets[1] }
+}
+
+const NUMS: &str = "02dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a279";
+
+fn nums_key() -> XOnlyPublicKey {
+	PublicKey::from_slice(&hex_decode(NUMS)).expect("NUMS point").x_only_public_key().0
+}
+
+fn hex_decode(hex_str: &str) -> Vec<u8> {
+	(0..hex_str.len())
+		.step_by(2)
+		.map(|index| u8::from_str_radix(&hex_str[index..index + 2], 16).expect("hex"))
+		.collect()
+}
+
+fn p2tr_with_leaves(
+	secp: &Secp256k1<secp256k1::All>, internal: XOnlyPublicKey, leaves: &[ScriptBuf],
+) -> ScriptBuf {
+	let mut builder = TaprootBuilder::new();
+	let depth = if leaves.len() == 1 { 0 } else { 1 };
+	for leaf in leaves {
+		builder = builder.add_leaf(depth, leaf.clone()).expect("taproot leaf");
+	}
+	let spend = builder.finalize(secp, internal).expect("taproot tree");
+	ScriptBuf::new_p2tr(secp, internal, spend.merkle_root())
+}
+
+/// Sighash of the counterparty's first Phoenix taproot commitment.
+///
+/// They pay the commitment fee. There are no HTLCs. Returns `None` when a
+/// balance is below dust after the fee.
+pub(super) fn remote_commitment_sighash(
+	secp: &Secp256k1<secp256k1::All>, funding_outpoint: OutPoint, funding_output: &TxOut,
+	our_payment: &PublicKey, their_payment: &PublicKey, their_delayed: &PublicKey,
+	revocation: &PublicKey, to_self_delay: u16, feerate_per_kw: u32, our_balance_sat: u64,
+	their_balance_sat: u64,
+) -> Option<[u8; 32]> {
+	let fee_msat = u64::from(feerate_per_kw).saturating_mul(968).saturating_add(660_000);
+	let fee_sat = fee_msat / 1000;
+	let their_output = their_balance_sat.checked_sub(fee_sat)?;
+	if their_output < 546 || our_balance_sat < 546 {
+		return None;
+	}
+	let nums = nums_key();
+	let their_delayed_x = their_delayed.x_only_public_key().0;
+	let revocation_x = revocation.x_only_public_key().0;
+	let our_payment_x = our_payment.x_only_public_key().0;
+	let to_local = p2tr_with_leaves(
+		secp,
+		nums,
+		&[
+			Builder::new()
+				.push_x_only_key(&their_delayed_x)
+				.push_opcode(OP_CHECKSIGVERIFY)
+				.push_int(i64::from(to_self_delay))
+				.push_opcode(OP_CSV)
+				.into_script(),
+			Builder::new()
+				.push_x_only_key(&their_delayed_x)
+				.push_opcode(OP_DROP)
+				.push_x_only_key(&revocation_x)
+				.push_opcode(OP_CHECKSIG)
+				.into_script(),
+		],
+	);
+	let to_remote = p2tr_with_leaves(
+		secp,
+		nums,
+		&[Builder::new()
+			.push_x_only_key(&our_payment_x)
+			.push_opcode(OP_CHECKSIGVERIFY)
+			.push_int(1)
+			.push_opcode(OP_CSV)
+			.into_script()],
+	);
+	let their_anchor = p2tr_with_leaves(
+		secp,
+		their_delayed_x,
+		&[Builder::new().push_int(16).push_opcode(OP_CSV).into_script()],
+	);
+	let our_anchor = p2tr_with_leaves(
+		secp,
+		our_payment_x,
+		&[Builder::new().push_int(16).push_opcode(OP_CSV).into_script()],
+	);
+	let mut outputs = vec![
+		TxOut { value: Amount::from_sat(their_output), script_pubkey: to_local },
+		TxOut { value: Amount::from_sat(our_balance_sat), script_pubkey: to_remote },
+		TxOut { value: Amount::from_sat(330), script_pubkey: their_anchor },
+		TxOut { value: Amount::from_sat(330), script_pubkey: our_anchor },
+	];
+	outputs.sort_by(|left, right| serialize(left).cmp(&serialize(right)));
+
+	let mut preimage = Vec::with_capacity(66);
+	preimage.extend_from_slice(&our_payment.serialize());
+	preimage.extend_from_slice(&their_payment.serialize());
+	let blind_hash = sha256::Hash::hash(&preimage).to_byte_array();
+	let mut blind = 0u64;
+	for byte in &blind_hash[26..32] {
+		blind = (blind << 8) | u64::from(*byte);
+	}
+	let obscured = (((1u64 << 48) - 1) ^ blind) & ((1u64 << 48) - 1);
+	let sequence = 0x8000_0000 | u32::try_from((obscured >> 24) & 0x00ff_ffff).unwrap();
+	let locktime = 0x2000_0000 | u32::try_from(obscured & 0x00ff_ffff).unwrap();
+	let tx = Transaction {
+		version: bitcoin::transaction::Version::TWO,
+		lock_time: LockTime::from_consensus(locktime),
+		input: vec![TxIn {
+			previous_output: bitcoin::OutPoint {
+				txid: funding_outpoint.txid,
+				vout: funding_outpoint.vout,
+			},
+			script_sig: ScriptBuf::new(),
+			sequence: Sequence(sequence),
+			witness: Witness::default(),
+		}],
+		output: outputs,
+	};
+	let sighash = SighashCache::new(&tx)
+		.taproot_key_spend_signature_hash(
+			0,
+			&Prevouts::All(&[funding_output]),
+			TapSighashType::Default,
+		)
+		.expect("taproot sighash");
+	Some(sighash.to_byte_array())
 }
 
 #[cfg(test)]
@@ -120,5 +428,103 @@ mod tests {
 		assert_eq!(script.as_bytes().len(), 34);
 		assert_eq!(script.as_bytes()[0], 0x51);
 		assert_eq!(script.as_bytes()[1], 0x20);
+	}
+
+	#[test]
+	fn two_partial_signatures_verify_as_schnorr() {
+		let secp = Secp256k1::new();
+		let our_secret = SecretKey::from_slice(&[2u8; 32]).unwrap();
+		let their_secret = SecretKey::from_slice(&[3u8; 32]).unwrap();
+		let our_k1 = SecretKey::from_slice(&[4u8; 32]).unwrap();
+		let our_k2 = SecretKey::from_slice(&[5u8; 32]).unwrap();
+		let their_k1 = SecretKey::from_slice(&[6u8; 32]).unwrap();
+		let their_k2 = SecretKey::from_slice(&[7u8; 32]).unwrap();
+		let our_pub = PublicKey::from_secret_key(&secp, &our_secret);
+		let their_pub = PublicKey::from_secret_key(&secp, &their_secret);
+		let mut our_nonce = [0u8; 66];
+		our_nonce[..33].copy_from_slice(&PublicKey::from_secret_key(&secp, &our_k1).serialize());
+		our_nonce[33..].copy_from_slice(&PublicKey::from_secret_key(&secp, &our_k2).serialize());
+		let mut their_nonce = [0u8; 66];
+		their_nonce[..33]
+			.copy_from_slice(&PublicKey::from_secret_key(&secp, &their_k1).serialize());
+		their_nonce[33..]
+			.copy_from_slice(&PublicKey::from_secret_key(&secp, &their_k2).serialize());
+		let message = [9u8; 32];
+		let ours = partial_sign(
+			&secp,
+			&our_secret,
+			&their_pub,
+			&our_k1,
+			&our_k2,
+			&our_nonce,
+			&their_nonce,
+			&message,
+		);
+		let theirs = partial_sign(
+			&secp,
+			&their_secret,
+			&our_pub,
+			&their_k1,
+			&their_k2,
+			&their_nonce,
+			&our_nonce,
+			&message,
+		);
+		let untweaked = aggregate_point(&secp, &our_pub, &their_pub);
+		let tweak = scalar_mod_order(tagged_sha256(
+			"TapTweak",
+			&untweaked.x_only_public_key().0.serialize(),
+		));
+		let even_untweaked = if untweaked.x_only_public_key().1 == Parity::Even {
+			untweaked
+		} else {
+			untweaked.negate(&secp)
+		};
+		let tweak_point = PublicKey::from_secret_key(
+			&secp,
+			&SecretKey::from_slice(&tweak.to_be_bytes()).unwrap(),
+		);
+		let tweaked = even_untweaked.combine(&tweak_point).unwrap();
+		let tweak_negated = tweaked.x_only_public_key().1 != Parity::Even;
+		let mut tweak_term = mul_secret(SecretKey::from_slice(&tweak.to_be_bytes()).unwrap(), &{
+			let (nonce_x, output) =
+				session_points(&secp, &our_pub, &their_pub, &our_nonce, &their_nonce, &message);
+			let mut challenge_input = Vec::new();
+			challenge_input.extend_from_slice(&nonce_x.serialize());
+			challenge_input.extend_from_slice(&output.serialize());
+			challenge_input.extend_from_slice(&message);
+			scalar_mod_order(tagged_sha256("BIP0340/challenge", &challenge_input))
+		});
+		if tweak_negated {
+			tweak_term = tweak_term.negate();
+		}
+		let sum = ours_plus(&ours_plus(&ours, &theirs), &tweak_term.secret_bytes());
+		let (nonce_x, output) =
+			session_points(&secp, &our_pub, &their_pub, &our_nonce, &their_nonce, &message);
+		let s_point = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&sum).unwrap());
+		let r_even = nonce_x.public_key(Parity::Even);
+		let mut challenge_input = Vec::new();
+		challenge_input.extend_from_slice(&nonce_x.serialize());
+		challenge_input.extend_from_slice(&output.serialize());
+		challenge_input.extend_from_slice(&message);
+		let challenge = scalar_mod_order(tagged_sha256("BIP0340/challenge", &challenge_input));
+		let e_point = output.public_key(Parity::Even).mul_tweak(&secp, &challenge).unwrap();
+		let right = r_even.combine(&e_point).unwrap();
+		assert_eq!(s_point, right, "s*G != R + e*P");
+		let mut sig = [0u8; 64];
+		sig[..32].copy_from_slice(&nonce_x.serialize());
+		sig[32..].copy_from_slice(&sum);
+		let signature = schnorr::Signature::from_slice(&sig).unwrap();
+		output
+			.verify(&secp, &secp256k1::Message::from_digest(message), &signature)
+			.expect("aggregated MuSig2 signature");
+	}
+
+	fn ours_plus(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+		let sum = SecretKey::from_slice(left)
+			.unwrap()
+			.add_tweak(&Scalar::from(SecretKey::from_slice(right).unwrap()))
+			.unwrap();
+		sum.secret_bytes()
 	}
 }

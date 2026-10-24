@@ -383,7 +383,7 @@ impl ConstructedTransaction {
 		self.tx().compute_txid()
 	}
 
-	fn funding_outpoint(&self) -> OutPoint {
+	pub(super) fn funding_outpoint(&self) -> OutPoint {
 		OutPoint { txid: self.compute_txid(), index: self.shared_output_index }
 	}
 

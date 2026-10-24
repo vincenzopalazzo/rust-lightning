@@ -837,6 +837,12 @@ pub trait ChannelSigner {
 	///
 	/// This method is *not* asynchronous. Instead, the value must be cached locally.
 	fn channel_keys_id(&self) -> [u8; 32];
+
+	/// Funding secret used to partially sign a Phoenix taproot commitment.
+	/// The default is `None`. [`InMemorySigner`] returns the key.
+	fn phoenix_funding_secret(&self) -> Option<SecretKey> {
+		None
+	}
 }
 
 /// Represents the secret key material used for encrypting Peer Storage.
@@ -1598,6 +1604,10 @@ impl ChannelSigner for InMemorySigner {
 
 	fn channel_keys_id(&self) -> [u8; 32] {
 		self.channel_keys_id
+	}
+
+	fn phoenix_funding_secret(&self) -> Option<SecretKey> {
+		Some(self.funding_key(None))
 	}
 }
 

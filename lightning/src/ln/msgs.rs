@@ -932,6 +932,8 @@ pub struct CommitmentSigned {
 	pub htlc_signatures: Vec<Signature>,
 	/// The funding transaction, to discriminate among multiple pending funding transactions (e.g. in case of splicing)
 	pub funding_txid: Option<Txid>,
+	/// Phoenix MuSig2 partial signature and nonce (TLV 2): 32-byte sig then 66-byte nonce.
+	pub partial_signature: Option<Vec<u8>>,
 }
 
 /// A [`revoke_and_ack`] message to be sent to or received from a peer.
@@ -3299,6 +3301,7 @@ impl_writeable_msg!(CommitmentSigned, {
 	htlc_signatures
 }, {
 	(1, funding_txid, option),
+	(2, partial_signature, (option, encoding: (Vec<u8>, WithoutLength))),
 });
 
 impl_writeable!(DecodedOnionErrorPacket, {
@@ -6469,6 +6472,7 @@ mod tests {
 				Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
 					.unwrap(),
 			),
+			partial_signature: None,
 		};
 		let encoded_value = commitment_signed.encode();
 		let mut target_value = "0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a".to_string();

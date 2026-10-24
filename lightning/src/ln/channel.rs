@@ -1970,6 +1970,13 @@ where
 	pub fn tx_complete<F: FeeEstimator, L: Logger>(
 		&mut self, msg: &msgs::TxComplete, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<TxCompleteResult, InteractiveTxMsgError> {
+		if let Some(nonces) = msg.commit_nonces.as_ref().filter(|nonces| nonces.len() >= 66) {
+			if let ChannelPhase::UnfundedV2(channel) = &mut self.phase {
+				let mut nonce = [0u8; 66];
+				nonce.copy_from_slice(&nonces[..66]);
+				channel.funding_negotiation_context.their_commit_nonce = Some(nonce);
+			}
+		}
 		let tx_complete_action = self
 			.interactive_tx_constructor_for_message("tx_complete")?
 			.handle_tx_complete(msg)
@@ -2201,10 +2208,76 @@ where
 		Ok(())
 	}
 
+	fn attach_phoenix_partial(
+		context: &ChannelContext<SP>, funding: &FundingScope, funding_outpoint: OutPoint,
+		prevout: &TxOut, nonces: Option<(SecretKey, SecretKey, [u8; 66])>,
+	) -> Option<Vec<u8>> {
+		let (k1, k2, their_nonce) = nonces?;
+		let our_secret = context.holder_signer.phoenix_funding_secret()?;
+		let their_point = context.counterparty_next_commitment_point?;
+		let our_keys = funding.get_holder_pubkeys();
+		let their_keys = funding.get_counterparty_pubkeys();
+		let tx_keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+			&their_point,
+			&their_keys,
+			&our_keys,
+			&context.secp_ctx,
+		);
+		let our_balance = funding.value_to_self_msat / 1000;
+		let their_balance = funding.get_value_satoshis().saturating_sub(our_balance);
+		let mut our_nonce = [0u8; 66];
+		our_nonce[..33]
+			.copy_from_slice(&PublicKey::from_secret_key(&context.secp_ctx, &k1).serialize());
+		our_nonce[33..]
+			.copy_from_slice(&PublicKey::from_secret_key(&context.secp_ctx, &k2).serialize());
+		let sighash = super::phoenix_funding::remote_commitment_sighash(
+			&context.secp_ctx,
+			bitcoin::OutPoint {
+				txid: funding_outpoint.txid,
+				vout: u32::from(funding_outpoint.index),
+			},
+			&prevout,
+			&our_keys.payment_point,
+			&their_keys.payment_point,
+			&tx_keys.broadcaster_delayed_payment_key.0,
+			&tx_keys.revocation_key.0,
+			funding.get_holder_selected_contest_delay(),
+			context.feerate_per_kw,
+			our_balance,
+			their_balance,
+		)?;
+		let signature = super::phoenix_funding::partial_sign(
+			&context.secp_ctx,
+			&our_secret,
+			&their_keys.funding_pubkey,
+			&k1,
+			&k2,
+			&our_nonce,
+			&their_nonce,
+			&sighash,
+		);
+		let mut encoded = Vec::with_capacity(98);
+		encoded.extend_from_slice(&signature);
+		encoded.extend_from_slice(&our_nonce);
+		Some(encoded)
+	}
+
 	pub fn funding_transaction_signed<F: FeeEstimator, L: Logger>(
 		&mut self, funding_txid_signed: Txid, witnesses: Vec<Witness>, best_block_height: u32,
 		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<FundingTxSigned, APIError> {
+		let phoenix_nonces = if let ChannelPhase::UnfundedV2(channel) = &self.phase {
+			match (
+				channel.funding_negotiation_context.our_nonce_k1,
+				channel.funding_negotiation_context.our_nonce_k2,
+				channel.funding_negotiation_context.their_commit_nonce,
+			) {
+				(Some(k1), Some(k2), Some(nonce)) => Some((k1, k2, nonce)),
+				_ => None,
+			}
+		} else {
+			None
+		};
 		let (context, funding, pending_splice) = match &mut self.phase {
 			ChannelPhase::Undefined => unreachable!(),
 			ChannelPhase::UnfundedV2(channel) => (&mut channel.context, &channel.funding, None),
@@ -2301,6 +2374,16 @@ where
 			}
 		}
 
+		let phoenix_funding = {
+			let unsigned = signing_session.unsigned_tx();
+			let outpoint = unsigned.funding_outpoint();
+			unsigned
+				.tx()
+				.output
+				.get(outpoint.index as usize)
+				.cloned()
+				.map(|prevout| (outpoint, prevout))
+		};
 		let logger = WithChannelContext::from(logger, &context, None);
 		if tx_signatures.is_some() {
 			log_info!(
@@ -2314,7 +2397,18 @@ where
 			.and_then(|pending_splice| pending_splice.funding_negotiation.as_ref())
 			.and_then(|funding_negotiation| funding_negotiation.as_funding())
 			.unwrap_or(funding);
-		let commitment_signed = context.get_initial_commitment_signed_v2(funding, &&logger);
+		let mut commitment_signed = context.get_initial_commitment_signed_v2(funding, &&logger);
+		if let Some(message) = commitment_signed.as_mut() {
+			if let Some((outpoint, prevout)) = phoenix_funding {
+				message.partial_signature = Self::attach_phoenix_partial(
+					context,
+					funding,
+					outpoint,
+					&prevout,
+					phoenix_nonces,
+				);
+			}
+		}
 
 		let mut funding_tx_signed = FundingTxSigned {
 			commitment_signed,
@@ -3295,6 +3389,9 @@ impl FundingNegotiation {
 			our_funding_inputs,
 			our_funding_outputs,
 			liquidity_request: None,
+			our_nonce_k1: None,
+			our_nonce_k2: None,
+			their_commit_nonce: None,
 		};
 
 		let (interactive_tx_constructor, first_message) = funding_negotiation_context
@@ -7070,6 +7167,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				htlc_signatures,
 				signature,
 				funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
+				partial_signature: None,
 			})
 		} else {
 			log_debug!(
@@ -7314,6 +7412,11 @@ pub(super) struct FundingNegotiationContext {
 	pub our_funding_outputs: Vec<TxOut>,
 	/// Liquidity-ad `request_funding` for an open we do not fund ourselves.
 	pub liquidity_request: Option<Vec<u8>>,
+	/// Secrets of the MuSig2 nonce we sent for the first commitment.
+	pub our_nonce_k1: Option<SecretKey>,
+	pub our_nonce_k2: Option<SecretKey>,
+	/// The peer's current-commitment nonce from `tx_complete` TLV 4.
+	pub their_commit_nonce: Option<[u8; 66]>,
 }
 
 impl FundingNegotiationContext {
@@ -15058,6 +15161,7 @@ where
 			signature,
 			htlc_signatures,
 			funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
+			partial_signature: None,
 		})
 	}
 
@@ -15468,6 +15572,9 @@ where
 						our_funding_inputs,
 						our_funding_outputs,
 						liquidity_request: None,
+						our_nonce_k1: None,
+						our_nonce_k2: None,
+						their_commit_nonce: None,
 					};
 
 					if self.pending_splice.is_some() {
@@ -16373,6 +16480,9 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			our_funding_inputs: funding_inputs,
 			our_funding_outputs: Vec::new(),
 			liquidity_request: None,
+			our_nonce_k1: None,
+			our_nonce_k2: None,
+			their_commit_nonce: None,
 		};
 		let chan = Self {
 			funding,
@@ -16561,6 +16671,9 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			our_funding_inputs: our_funding_inputs.clone(),
 			our_funding_outputs: Vec::new(),
 			liquidity_request: None,
+			our_nonce_k1: None,
+			our_nonce_k2: None,
+			their_commit_nonce: None,
 		};
 		let shared_funding_output = TxOut {
 			value: Amount::from_sat(funding.get_value_satoshis()),
@@ -16665,8 +16778,13 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 		} else {
 			self.funding.get_funding_redeemscript().to_p2wsh()
 		};
-		let commit_nonces = buying_liquidity
+		let generated_nonces = buying_liquidity
 			.then(|| super::phoenix_funding::commit_nonces(&self.context.secp_ctx, entropy_source));
+		if let Some(nonces) = &generated_nonces {
+			self.funding_negotiation_context.our_nonce_k1 = Some(nonces.k1);
+			self.funding_negotiation_context.our_nonce_k2 = Some(nonces.k2);
+		}
+		let commit_nonces = generated_nonces.map(|nonces| nonces.wire);
 		let shared_funding_output = TxOut { value: Amount::from_sat(channel_value), script_pubkey };
 		let inputs = core::mem::take(&mut self.funding_negotiation_context.our_funding_inputs);
 		let (constructor, first_message) =
