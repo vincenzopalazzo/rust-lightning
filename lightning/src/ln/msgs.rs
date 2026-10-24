@@ -985,6 +985,9 @@ pub struct ChannelReestablish {
 	///   * `channel_reestablish`-sending node: https:///github.com/lightning/bolts/blob/247e83d/02-peer-protocol.md?plain=1#L2466-L2470
 	///   * `channel_reestablish`-receiving node: https:///github.com/lightning/bolts/blob/247e83d/02-peer-protocol.md?plain=1#L2520-L2531
 	pub next_funding: Option<NextFunding>,
+	/// Phoenix `splice_prototype` puts the legacy next-funding txid in even
+	/// TLV 0. It is not the official TLV 1. Kept so the message decodes.
+	pub experimental_next_funding: Option<Txid>,
 	/// The last funding txid sent by the sending node, which may be:
 	/// - the txid of the last `splice_locked` it sent, otherwise
 	/// - the txid of the funding transaction if it sent `channel_ready`, or else
@@ -3205,6 +3208,7 @@ impl_writeable_msg!(ChannelReestablish, {
 	your_last_per_commitment_secret,
 	my_current_per_commitment_point,
 }, {
+	(0, experimental_next_funding, option),
 	(1, next_funding, option),
 	(5, my_current_funding_locked, option),
 });
@@ -4780,6 +4784,7 @@ mod tests {
 			your_last_per_commitment_secret: [9; 32],
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
+			experimental_next_funding: None,
 			my_current_funding_locked: None,
 		};
 
@@ -4835,6 +4840,7 @@ mod tests {
 				),
 				retransmit_flags: 1,
 			}),
+			experimental_next_funding: None,
 			my_current_funding_locked: None,
 		};
 
@@ -4900,6 +4906,7 @@ mod tests {
 			your_last_per_commitment_secret: [9; 32],
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
+			experimental_next_funding: None,
 			my_current_funding_locked: Some(msgs::FundingLocked {
 				txid: Txid::from_raw_hash(
 					bitcoin::hashes::Hash::from_slice(&[
