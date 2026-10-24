@@ -14853,7 +14853,23 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		}
 
 		let channels = self.list_channels();
-		let route_hints = super::invoice_utils::sort_and_filter_channels(channels, amount_msats, &self.logger);
+		// A hint for a private channel that cannot hold the payment makes the
+		// LSP forward to that channel and fail. With no hint, a trampoline LSP
+		// that already has the channel can fund the shortfall on the fly.
+		let none_can_receive = amount_msats.is_some_and(|amt| {
+			!channels.iter().any(|channel| {
+				channel.is_channel_ready
+					&& channel.inbound_capacity_msat >= amt
+					&& channel.get_inbound_payment_scid().is_some()
+					&& channel.counterparty.forwarding_info.is_some()
+			})
+		});
+		let route_hints: Vec<_> = if none_can_receive {
+			Vec::new()
+		} else {
+			super::invoice_utils::sort_and_filter_channels(channels, amount_msats, &self.logger)
+				.collect()
+		};
 		for hint in route_hints {
 			invoice = invoice.private_route(hint);
 		}
