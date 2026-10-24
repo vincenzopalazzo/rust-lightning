@@ -2208,13 +2208,31 @@ where
 		Ok(())
 	}
 
-	fn attach_phoenix_partial(
+	fn attach_phoenix_partial<L: Logger>(
 		context: &ChannelContext<SP>, funding: &FundingScope, funding_outpoint: OutPoint,
-		prevout: &TxOut, nonces: Option<(SecretKey, SecretKey, [u8; 66])>,
+		prevout: &TxOut, nonces: Option<(SecretKey, SecretKey, [u8; 66])>, logger: &L,
 	) -> Option<Vec<u8>> {
-		let (k1, k2, their_nonce) = nonces?;
-		let our_secret = context.holder_signer.phoenix_funding_secret()?;
-		let their_point = context.counterparty_next_commitment_point?;
+		let (k1, k2, their_nonce) = match nonces {
+			Some(nonces) => nonces,
+			None => {
+				log_info!(logger, "phoenix partial skipped: nonce material missing");
+				return None;
+			},
+		};
+		let our_secret = match context.holder_signer.phoenix_funding_secret() {
+			Some(secret) => secret,
+			None => {
+				log_info!(logger, "phoenix partial skipped: signer has no funding secret");
+				return None;
+			},
+		};
+		let their_point = match context.counterparty_next_commitment_point {
+			Some(point) => point,
+			None => {
+				log_info!(logger, "phoenix partial skipped: no counterparty commitment point");
+				return None;
+			},
+		};
 		let our_keys = funding.get_holder_pubkeys();
 		let their_keys = funding.get_counterparty_pubkeys();
 		let tx_keys = chan_utils::TxCreationKeys::from_channel_static_keys(
@@ -2230,7 +2248,7 @@ where
 			.copy_from_slice(&PublicKey::from_secret_key(&context.secp_ctx, &k1).serialize());
 		our_nonce[33..]
 			.copy_from_slice(&PublicKey::from_secret_key(&context.secp_ctx, &k2).serialize());
-		let sighash = super::phoenix_funding::remote_commitment_sighash(
+		let sighash = match super::phoenix_funding::remote_commitment_sighash(
 			&context.secp_ctx,
 			bitcoin::OutPoint {
 				txid: funding_outpoint.txid,
@@ -2245,7 +2263,16 @@ where
 			context.feerate_per_kw,
 			our_balance,
 			their_balance,
-		)?;
+		) {
+			Some(sighash) => sighash,
+			None => {
+				log_info!(
+					logger,
+					"phoenix partial skipped: commitment sighash unavailable (our {our_balance} their {their_balance})"
+				);
+				return None;
+			},
+		};
 		let signature = super::phoenix_funding::partial_sign(
 			&context.secp_ctx,
 			&our_secret,
@@ -2259,6 +2286,7 @@ where
 		let mut encoded = Vec::with_capacity(98);
 		encoded.extend_from_slice(&signature);
 		encoded.extend_from_slice(&our_nonce);
+		log_info!(logger, "phoenix partial signature attached");
 		Some(encoded)
 	}
 
@@ -2406,6 +2434,7 @@ where
 					outpoint,
 					&prevout,
 					phoenix_nonces,
+					&&logger,
 				);
 			}
 		}
