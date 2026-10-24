@@ -933,6 +933,16 @@ impl<D: tb::Bool, H: tb::Bool, T: tb::Bool, C: tb::Bool, M: tb::Bool>
 		}
 		self
 	}
+
+	/// Marks the invoice as a Phoenix experimental trampoline payment.
+	pub fn experimental_trampoline(mut self) -> Self {
+		for field in self.tagged_fields.iter_mut() {
+			if let TaggedField::Features(f) = field {
+				f.set_experimental_trampoline_optional();
+			}
+		}
+		self
+	}
 }
 
 impl<M: tb::Bool> InvoiceBuilder<tb::True, tb::True, tb::True, tb::True, tb::True, M> {

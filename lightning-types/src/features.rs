@@ -995,6 +995,16 @@ pub type NodeFeatures = Features<sealed::NodeContext>;
 pub type ChannelFeatures = Features<sealed::ChannelContext>;
 /// Features used within an invoice.
 pub type Bolt11InvoiceFeatures = Features<sealed::Bolt11InvoiceContext>;
+
+impl Bolt11InvoiceFeatures {
+	/// Phoenix `trampoline_payment_experimental`, optional bit 149.
+	///
+	/// ACINQ's LSP treats an invoice with this bit as a trampoline payment it
+	/// may fund on the fly. Odd, so payers that do not know it ignore it.
+	pub fn set_experimental_trampoline_optional(&mut self) {
+		let _ = self.set_bit(149, false);
+	}
+}
 /// Features used within an `offer`.
 pub type OfferFeatures = Features<sealed::OfferContext>;
 /// Features used within an `invoice_request`.

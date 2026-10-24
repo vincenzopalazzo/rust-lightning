@@ -14838,6 +14838,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			.payment_hash(payment_hash)
 			.payment_secret(payment_secret)
 			.basic_mpp()
+			.experimental_trampoline()
 			.min_final_cltv_expiry_delta(
 				// Add a buffer of 3 to the delta if present, otherwise use LDK's minimum.
 				min_final_cltv_expiry_delta.map(|x| x.saturating_add(3)).unwrap_or(MIN_FINAL_CLTV_EXPIRY_DELTA).into()
