@@ -14857,12 +14857,32 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		// LSP then returns TrampolineFeeInsufficient and does not splice.
 		// A legacy trampoline names this channel, which is the path that
 		// funded a phoenixd peer.
-		let route_hints: Vec<_> = super::invoice_utils::sort_and_filter_channels(
-			self.list_channels(),
-			amount_msats,
-			&self.logger,
-		)
-		.collect();
+		let channels = self.list_channels();
+		let no_channels = channels.is_empty();
+		let mut route_hints: Vec<_> =
+			super::invoice_utils::sort_and_filter_channels(channels, amount_msats, &self.logger)
+				.collect();
+		// Phoenix names a channel alias before any channel exists. The LSP
+		// only treats that hop as on-the-fly funding for a phoenix wallet.
+		if no_channels {
+			let peers = self.per_peer_state.read().unwrap();
+			for node_id in peers.keys() {
+				route_hints.push(crate::routing::router::RouteHint(vec![
+					crate::routing::router::RouteHintHop {
+						src_node_id: *node_id,
+						// block 6_000_000, tx 1, vout 1. Above the testnet3 tip.
+						short_channel_id: 6_597_069_766_656_065_537,
+						fees: crate::routing::gossip::RoutingFees {
+							base_msat: 1_000,
+							proportional_millionths: 100,
+						},
+						cltv_expiry_delta: 144,
+						htlc_minimum_msat: None,
+						htlc_maximum_msat: None,
+					},
+				]));
+			}
+		}
 		for hint in route_hints {
 			invoice = invoice.private_route(hint);
 		}
