@@ -575,6 +575,97 @@ mod tests {
 		assert_ne!(tx.lock_time, LockTime::from_consensus(backwards_lock));
 	}
 
+	/// BIP 327 `sign_verify_vectors` case 0, untweaked. The LSP verifies with
+	/// libsecp256k1's MuSig2, so a mismatch here is a rejected partial even
+	/// when the commitment transaction bytes match.
+	#[test]
+	fn bip327_partial_matches_sign_vector() {
+		let secp = Secp256k1::new();
+		let secret = SecretKey::from_slice(&hex_decode(
+			"7FB9E0E687ADA1EEBF7ECFE2F21E73EBDB51A7D450948DFE8D76D7F2D1007671",
+		))
+		.unwrap();
+		let keys = [
+			hex_decode("03935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9"),
+			hex_decode("02F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9"),
+			hex_decode("02DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA661"),
+		];
+		let ours = PublicKey::from_secret_key(&secp, &secret);
+		assert_eq!(ours.serialize().to_vec(), keys[0]);
+		// The vector keeps the given order. Sorting is a caller choice;
+		// eclair sorts before it calls libsecp, and so does `aggregate_point`.
+		let mut list = Vec::new();
+		for key in &keys {
+			list.extend_from_slice(key);
+		}
+		let key_list_hash = tagged_sha256("KeyAgg list", &list);
+		let second = keys[1].clone();
+		let mut aggregated: Option<PublicKey> = None;
+		let mut coefficient = Scalar::ONE;
+		for key in &keys {
+			let point = PublicKey::from_slice(key).unwrap();
+			let scaled = if key == &second {
+				point
+			} else {
+				let mut coeff_input = Vec::new();
+				coeff_input.extend_from_slice(&key_list_hash);
+				coeff_input.extend_from_slice(key);
+				let factor = scalar_mod_order(tagged_sha256("KeyAgg coefficient", &coeff_input));
+				if key == &keys[0] {
+					coefficient = factor;
+				}
+				point.mul_tweak(&secp, &factor).unwrap()
+			};
+			aggregated = Some(match aggregated {
+				None => scaled,
+				Some(so_far) => so_far.combine(&scaled).unwrap(),
+			});
+		}
+		let aggregate = aggregated.unwrap();
+		let mut signing_secret = secret;
+		if aggregate.x_only_public_key().1 == Parity::Odd {
+			signing_secret = signing_secret.negate();
+		}
+		let output = aggregate.x_only_public_key().0;
+		let agg_nonce = hex_decode("028465FCF0BBDBCF443AABCCE533D42B4B5A10966AC09A49655E8C42DAAB8FCD61037496A3CC86926D452CAFCFD55D25972CA1675D549310DE296BFF42F72EEEA8C9");
+		let message =
+			hex_decode("F95466D086770E689964664219266FE5ED215C92AE20BAB5C9D79ADDDDF3C0CF");
+		let mut nonce_input = Vec::new();
+		nonce_input.extend_from_slice(&agg_nonce);
+		nonce_input.extend_from_slice(&output.serialize());
+		nonce_input.extend_from_slice(&message);
+		let nonce_coeff = scalar_mod_order(tagged_sha256("MuSig/noncecoef", &nonce_input));
+		let r1 = PublicKey::from_slice(&agg_nonce[..33]).unwrap();
+		let r2 = PublicKey::from_slice(&agg_nonce[33..]).unwrap();
+		let r_point = r1.combine(&r2.mul_tweak(&secp, &nonce_coeff).unwrap()).unwrap();
+		let k1 = SecretKey::from_slice(&hex_decode(
+			"508B81A611F100A6B2B6B29656590898AF488BCF2E1F55CF22E5CFB84421FE61",
+		))
+		.unwrap();
+		let k2 = SecretKey::from_slice(&hex_decode(
+			"FA27FD49B1D50085B481285E1CA205D55C82CC1B31FF5CD54A489829355901F7",
+		))
+		.unwrap();
+		let (k1, k2) = if r_point.x_only_public_key().1 == Parity::Odd {
+			(k1.negate(), k2.negate())
+		} else {
+			(k1, k2)
+		};
+		let r_x = r_point.x_only_public_key().0;
+		let mut challenge_input = Vec::new();
+		challenge_input.extend_from_slice(&r_x.serialize());
+		challenge_input.extend_from_slice(&output.serialize());
+		challenge_input.extend_from_slice(&message);
+		let challenge = scalar_mod_order(tagged_sha256("BIP0340/challenge", &challenge_input));
+		let partial = add_secret(
+			add_secret(k1, mul_secret(k2, &nonce_coeff)),
+			mul_secret(mul_secret(signing_secret, &coefficient), &challenge),
+		);
+		let expected =
+			hex_decode("012ABBCB52B3016AC03AD82395A1A415C48B93DEF78718E62A7A90052FE224FB");
+		assert_eq!(partial.secret_bytes().to_vec(), expected);
+	}
+
 	#[test]
 	fn zero_opener_balance_still_has_a_commitment() {
 		let secp = Secp256k1::new();
