@@ -7004,9 +7004,14 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		let mut commitment_point = self.counterparty_next_commitment_point.unwrap();
 
 		// Use the previous commitment number and point when splicing since they shouldn't change.
+		// A new v2 channel can already have decremented the number by the time we sign,
+		// because the peer's commitment_signed arrived first. The point has not rotated
+		// yet, so the first point is still `counterparty_next_commitment_point`.
 		if commitment_number != INITIAL_COMMITMENT_NUMBER {
 			commitment_number += 1;
-			commitment_point = self.counterparty_current_commitment_point.unwrap();
+			if let Some(point) = self.counterparty_current_commitment_point {
+				commitment_point = point;
+			}
 		}
 
 		let commitment_data = self.build_commitment_transaction(
