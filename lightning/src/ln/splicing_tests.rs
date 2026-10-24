@@ -4203,7 +4203,7 @@ fn disconnect_on_unexpected_interactive_tx_message() {
 	let _ = get_event!(initiator, Event::FundingTransactionReadyForSigning);
 	let _ = get_htlc_update_msgs(acceptor, &node_id_initiator);
 
-	let tx_complete = msgs::TxComplete { channel_id };
+	let tx_complete = msgs::TxComplete { channel_id, commit_nonces: None };
 	initiator.node.handle_tx_complete(node_id_acceptor, &tx_complete);
 
 	let _warning = get_warning_msg(initiator, &node_id_acceptor);

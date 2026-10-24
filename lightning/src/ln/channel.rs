@@ -7353,6 +7353,7 @@ impl FundingNegotiationContext {
 				funding.value_to_self_msat / 1000,
 			),
 			outputs_to_contribute: self.our_funding_outputs,
+			commit_nonces: None,
 		};
 		if self.is_initiator {
 			InteractiveTxConstructor::new_for_outbound(constructor_args)
@@ -16578,6 +16579,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				shared_funding_input: None,
 				shared_funding_output: SharedOwnedOutput::new(shared_funding_output, our_funding_contribution_sats),
 				outputs_to_contribute: funding_negotiation_context.our_funding_outputs.clone(),
+				commit_nonces: None,
 			}
 		));
 
@@ -16654,10 +16656,18 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 		);
 		self.context.channel_id = channel_id;
 
-		let shared_funding_output = TxOut {
-			value: Amount::from_sat(channel_value),
-			script_pubkey: self.funding.get_funding_redeemscript().to_p2wsh(),
+		let script_pubkey = if buying_liquidity {
+			super::phoenix_funding::funding_script(
+				&self.context.secp_ctx,
+				&self.funding.get_holder_pubkeys().funding_pubkey,
+				&msg.common_fields.funding_pubkey,
+			)
+		} else {
+			self.funding.get_funding_redeemscript().to_p2wsh()
 		};
+		let commit_nonces = buying_liquidity
+			.then(|| super::phoenix_funding::commit_nonces(&self.context.secp_ctx, entropy_source));
+		let shared_funding_output = TxOut { value: Amount::from_sat(channel_value), script_pubkey };
 		let inputs = core::mem::take(&mut self.funding_negotiation_context.our_funding_inputs);
 		let (constructor, first_message) =
 			InteractiveTxConstructor::new_for_outbound(InteractiveTxConstructorArgs {
@@ -16673,6 +16683,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				shared_funding_input: None,
 				shared_funding_output: SharedOwnedOutput::new(shared_funding_output, our_funding),
 				outputs_to_contribute: self.funding_negotiation_context.our_funding_outputs.clone(),
+				commit_nonces,
 			});
 		self.interactive_tx_constructor = Some(constructor);
 		Ok((channel_id, first_message))

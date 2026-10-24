@@ -1945,6 +1945,8 @@ pub(super) struct InteractiveTxConstructor {
 	outputs_to_contribute: Vec<(SerialId, OutputOwned)>,
 	next_input_index: Option<usize>,
 	next_output_index: Option<usize>,
+	/// MuSig2 nonces attached to our `tx_complete` for a Phoenix taproot open.
+	commit_nonces: Option<Vec<u8>>,
 }
 
 #[allow(clippy::enum_variant_names)] // Clippy doesn't like the repeated `Tx` prefix here
@@ -2013,6 +2015,8 @@ pub(super) struct InteractiveTxConstructorArgs<'a, ES: EntropySource> {
 	pub shared_funding_input: Option<SharedOwnedInput>,
 	pub shared_funding_output: SharedOwnedOutput,
 	pub outputs_to_contribute: Vec<TxOut>,
+	/// Nonces for `tx_complete` TLV 4. `None` on an anchors channel.
+	pub commit_nonces: Option<Vec<u8>>,
 }
 
 impl InteractiveTxConstructor {
@@ -2032,6 +2036,7 @@ impl InteractiveTxConstructor {
 			shared_funding_input,
 			shared_funding_output,
 			outputs_to_contribute,
+			commit_nonces,
 		} = args;
 
 		let state_machine = StateMachine::new(
@@ -2104,6 +2109,7 @@ impl InteractiveTxConstructor {
 			outputs_to_contribute,
 			next_input_index,
 			next_output_index,
+			commit_nonces,
 		}
 	}
 
@@ -2190,7 +2196,7 @@ impl InteractiveTxConstructor {
 			do_state_transition!(self, sent_tx_add_output, &msg)?;
 			Ok(InteractiveTxMessageSend::TxAddOutput(msg))
 		} else {
-			let msg = msgs::TxComplete { channel_id };
+			let msg = msgs::TxComplete { channel_id, commit_nonces: self.commit_nonces.clone() };
 			do_state_transition!(self, sent_tx_complete, &msg)?;
 			Ok(InteractiveTxMessageSend::TxComplete(msg))
 		}
@@ -2435,6 +2441,7 @@ mod tests {
 					session.shared_output_a.1,
 				),
 				outputs_to_contribute: session.outputs_a,
+				commit_nonces: None,
 			});
 		let mut constructor_a = Some(constructor_a);
 		let mut constructor_b =
@@ -2464,6 +2471,7 @@ mod tests {
 					session.shared_output_b.1,
 				),
 				outputs_to_contribute: session.outputs_b,
+				commit_nonces: None,
 			}));
 		let mut message_send_b = None;
 

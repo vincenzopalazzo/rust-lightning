@@ -591,6 +591,9 @@ pub struct TxRemoveOutput {
 pub struct TxComplete {
 	/// The channel ID
 	pub channel_id: ChannelId,
+	/// Phoenix MuSig2 commit nonces (TLV 4): two 66-byte nonces. An even TLV,
+	/// so leaving it unknown disconnects the peer.
+	pub commit_nonces: Option<Vec<u8>>,
 }
 
 /// A [`tx_signatures`] message containing the sender's signatures for a transaction constructed with
@@ -3177,7 +3180,9 @@ impl_writeable_msg!(TxRemoveOutput, {
 
 impl_writeable_msg!(TxComplete, {
 	channel_id,
-}, {});
+}, {
+	(4, commit_nonces, (option, encoding: (Vec<u8>, WithoutLength))),
+});
 
 impl_writeable_msg!(TxSignatures, {
 	channel_id,
@@ -6108,7 +6113,8 @@ mod tests {
 
 	#[test]
 	fn encoding_tx_complete() {
-		let tx_complete = msgs::TxComplete { channel_id: ChannelId::from_bytes([2; 32]) };
+		let tx_complete =
+			msgs::TxComplete { channel_id: ChannelId::from_bytes([2; 32]), commit_nonces: None };
 		let encoded_value = tx_complete.encode();
 		let target_value =
 			<Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202")
