@@ -1152,9 +1152,14 @@ mod test {
 
 		match_invoice_routes(Some(99_000_000), &nodes[0], scid_aliases_99_000_000_msat);
 
-		// Above every channel's inbound capacity the invoice carries no hint,
-		// so a trampoline LSP can fund the shortfall instead of failing the hint.
-		match_invoice_routes(Some(2_000_000_000), &nodes[0], HashSet::new());
+		// Above every channel's inbound capacity the hints are still included.
+		// Phoenixd only tells the LSP which channel to splice when the hint
+		// is present and the invoice does not advertise trampoline.
+		let mut scid_aliases_2_000_000_000_msat = HashSet::new();
+		scid_aliases_2_000_000_000_msat.insert(chan_1_0.0.short_channel_id_alias.unwrap());
+		scid_aliases_2_000_000_000_msat.insert(chan_2_0.0.short_channel_id_alias.unwrap());
+
+		match_invoice_routes(Some(2_000_000_000), &nodes[0], scid_aliases_2_000_000_000_msat);
 
 		// An invoice with no specified amount should include all channels in the route hints.
 		let mut scid_aliases_no_specified_amount = HashSet::new();
