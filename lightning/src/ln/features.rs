@@ -102,6 +102,16 @@ impl_feature_write_without_length!(InvoiceRequestFeatures);
 impl_feature_write_without_length!(OfferFeatures);
 impl_feature_write_without_length!(BlindedHopFeatures);
 
+/// Channel type of a Phoenix on-the-fly open: mandatory zero-reserve (bit 128)
+/// and Phoenix simple taproot (bit 564). The LSP adds `request_funding` for
+/// this type and treats an anchors open as our contribution alone.
+pub(super) fn phoenix_simple_taproot_channel_type() -> ChannelTypeFeatures {
+	let mut flags = vec![0u8; 71];
+	flags[16] |= 1 << 0; // bit 128
+	flags[70] |= 1 << 4; // bit 564
+	ChannelTypeFeatures::from_le_bytes(flags)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -119,5 +129,21 @@ mod tests {
 		let deserialized_features =
 			WithoutLength::<OfferFeatures>::read(&mut &serialized_features[..]).unwrap().0;
 		assert_eq!(features, deserialized_features);
+	}
+
+	#[test]
+	fn phoenix_taproot_channel_type_sets_eclair_bits() {
+		let features = super::phoenix_simple_taproot_channel_type();
+		let le = features.le_flags();
+		assert_eq!(le.len(), 71);
+		assert_eq!(le[16], 0x01);
+		assert_eq!(le[70], 0x10);
+
+		let mut wire = Vec::new();
+		features.write(&mut wire).unwrap();
+		// On the wire the bytes are reversed: bit 0 is the low bit of the last byte.
+		assert_eq!(wire.len(), 71);
+		assert_eq!(wire[0], 0x10);
+		assert_eq!(wire[71 - 1 - 16], 0x01);
 	}
 }

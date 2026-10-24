@@ -16431,10 +16431,18 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				.expect("TODO: async signing is not yet supported for commitment points in v2 channel establishment");
 		let keys = self.funding.get_holder_pubkeys();
 		let mut channel_flags = if self.context.config.announce_for_forwarding { 1 } else { 0 };
-		if self.funding_negotiation_context.liquidity_request.is_some() {
+		let buying_liquidity = self.funding_negotiation_context.liquidity_request.is_some();
+		if buying_liquidity {
 			// Phoenix asks the LSP to pay commitment fees when we contribute nothing.
 			channel_flags |= 2;
 		}
+		// The testnet LSP sells liquidity for Phoenix's taproot channel type.
+		// The same purchase on an anchors type is funded only with our contribution.
+		let channel_type = if buying_liquidity {
+			Some(super::features::phoenix_simple_taproot_channel_type())
+		} else {
+			Some(self.funding.get_channel_type().clone())
+		};
 
 		msgs::OpenChannelV2 {
 			common_fields: msgs::CommonOpenChannelFields {
@@ -16461,7 +16469,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 					Some(script) => script.clone().into_inner(),
 					None => Builder::new().into_script(),
 				}),
-				channel_type: Some(self.funding.get_channel_type().clone()),
+				channel_type,
 			},
 			funding_feerate_sat_per_1000_weight: self
 				.funding_negotiation_context
