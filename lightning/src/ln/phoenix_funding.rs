@@ -320,7 +320,7 @@ pub(super) fn remote_commitment_sighash(
 	our_payment: &PublicKey, their_payment: &PublicKey, their_delayed: &PublicKey,
 	revocation: &PublicKey, to_self_delay: u16, feerate_per_kw: u32, our_balance_sat: u64,
 	their_balance_sat: u64, dust_limit_sat: u64,
-) -> Option<[u8; 32]> {
+) -> Option<([u8; 32], Transaction)> {
 	let fee_msat = u64::from(feerate_per_kw).saturating_mul(968).saturating_add(660_000);
 	let fee_sat = fee_msat / 1000;
 	let their_output = their_balance_sat.checked_sub(fee_sat)?;
@@ -413,7 +413,7 @@ pub(super) fn remote_commitment_sighash(
 			TapSighashType::Default,
 		)
 		.expect("taproot sighash");
-	Some(sighash.to_byte_array())
+	Some((sighash.to_byte_array(), tx))
 }
 
 #[cfg(test)]

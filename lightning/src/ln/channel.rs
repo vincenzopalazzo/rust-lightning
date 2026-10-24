@@ -2250,7 +2250,7 @@ where
 			.copy_from_slice(&PublicKey::from_secret_key(&context.secp_ctx, &k1).serialize());
 		our_nonce[33..]
 			.copy_from_slice(&PublicKey::from_secret_key(&context.secp_ctx, &k2).serialize());
-		let sighash = match super::phoenix_funding::remote_commitment_sighash(
+		let (sighash, commitment_tx) = match super::phoenix_funding::remote_commitment_sighash(
 			&context.secp_ctx,
 			bitcoin::OutPoint {
 				txid: funding_outpoint.txid,
@@ -2267,7 +2267,7 @@ where
 			their_balance,
 			dust_limit,
 		) {
-			Some(sighash) => sighash,
+			Some(signed) => signed,
 			None => {
 				log_info!(
 					logger,
@@ -2289,7 +2289,12 @@ where
 		let mut encoded = Vec::with_capacity(98);
 		encoded.extend_from_slice(&signature);
 		encoded.extend_from_slice(&our_nonce);
-		log_info!(logger, "phoenix partial signature attached");
+		let tx_hex = bitcoin::consensus::encode::serialize_hex(&commitment_tx);
+		log_info!(
+			logger,
+			"phoenix partial signature attached feerate {} our {our_balance} their {their_balance} tx {tx_hex}",
+			context.feerate_per_kw,
+		);
 		Some(encoded)
 	}
 
