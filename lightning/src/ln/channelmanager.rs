@@ -4176,6 +4176,17 @@ impl<
 		res
 	}
 
+	/// `request_funding` from a `splice_init` this channel received, if the peer sent one.
+	pub fn inbound_liquidity_request(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId,
+	) -> Option<Vec<u8>> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)?;
+		let peer_state_lock = peer_state_mutex.lock().unwrap();
+		let channel = peer_state_lock.channel_by_id.get(channel_id)?;
+		channel.as_funded()?.inbound_liquidity_request()
+	}
+
 	/// Liquidity-ad acceptance recorded from the latest `splice_ack` or `tx_ack_rbf`.
 	///
 	/// `None` until the seller has answered a [`msgs::SpliceInit::request_funding`] on this

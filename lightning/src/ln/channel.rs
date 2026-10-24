@@ -3008,6 +3008,9 @@ struct PendingFunding {
 
 	/// Fee credit the seller applied on that ack, in msat. `None` when omitted.
 	liquidity_fee_credit_msat: Option<u64>,
+
+	/// Raw `request_funding` from a `splice_init` we received.
+	liquidity_request: Option<Vec<u8>>,
 }
 
 /// A funding candidate that has been negotiated, together with our contribution, if any, to the
@@ -3126,6 +3129,7 @@ impl Writeable for PendingFundingWriteable<'_> {
 			(14, rbf_gate, option),
 			(15, self.pending_funding.liquidity_will_fund, (option, encoding: (Vec<u8>, WithoutLength))),
 			(17, self.pending_funding.liquidity_fee_credit_msat, option),
+			(19, self.pending_funding.liquidity_request, (option, encoding: (Vec<u8>, WithoutLength))),
 		});
 		Ok(())
 	}
@@ -3143,6 +3147,7 @@ impl Readable for PendingFunding {
 		let mut rbf_gate: Option<()> = None;
 		let mut liquidity_will_fund: Option<Vec<u8>> = None;
 		let mut liquidity_fee_credit_msat: Option<u64> = None;
+		let mut liquidity_request: Option<Vec<u8>> = None;
 
 		read_tlv_fields!(reader, {
 			(1, funding_negotiation, upgradable_option),
@@ -3155,6 +3160,7 @@ impl Readable for PendingFunding {
 			(14, rbf_gate, option),
 			(15, liquidity_will_fund, (option, encoding: (Vec<u8>, WithoutLength))),
 			(17, liquidity_fee_credit_msat, option),
+			(19, liquidity_request, (option, encoding: (Vec<u8>, WithoutLength))),
 		});
 
 		// TLV 11 (the candidate list, each funding bundled with its contribution) is authoritative
@@ -3190,6 +3196,7 @@ impl Readable for PendingFunding {
 			last_funding_feerate_sat_per_1000_weight,
 			liquidity_will_fund,
 			liquidity_fee_credit_msat,
+			liquidity_request,
 		})
 	}
 }
@@ -7541,6 +7548,11 @@ where
 {
 	pub fn context(&self) -> &ChannelContext<SP> {
 		&self.context
+	}
+
+	/// `request_funding` from a `splice_init` the counterparty sent, if any.
+	pub(super) fn inbound_liquidity_request(&self) -> Option<Vec<u8>> {
+		self.pending_splice.as_ref()?.liquidity_request.clone()
 	}
 
 	/// The seller's `will_fund` and fee credit from the latest splice ack, if one arrived.
@@ -13705,6 +13717,7 @@ where
 			last_funding_feerate_sat_per_1000_weight: None,
 			liquidity_will_fund: None,
 			liquidity_fee_credit_msat: None,
+			liquidity_request: None,
 		});
 
 		msgs::SpliceInit {
@@ -14089,9 +14102,9 @@ where
 			received_funding_txid: None,
 			sent_funding_txid: None,
 			last_funding_feerate_sat_per_1000_weight: None,
-			// The peer's purchase request is odd and ignored: we are not a seller.
 			liquidity_will_fund: None,
 			liquidity_fee_credit_msat: None,
+			liquidity_request: msg.request_funding.clone(),
 		});
 
 		Ok(msgs::SpliceAck {

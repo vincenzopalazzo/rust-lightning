@@ -415,6 +415,45 @@ impl FundingTemplate {
 		self.with_prior_contribution(min_feerate, max_feerate).add_outputs(outputs).build()
 	}
 
+	/// A splice that adds no inputs and no outputs of our own.
+	///
+	/// Used when the counterparty is asked to provide the liquidity (a
+	/// liquidity-ad `request_funding`). The returned contribution's
+	/// [`FundingContribution::net_value`] is the mining fee for the shared
+	/// input and output, paid from the channel balance. Attach the purchase
+	/// with [`FundingContribution::with_request_funding`].
+	pub fn request_remote_funding(
+		self, feerate: FeeRate, max_feerate: FeeRate,
+	) -> Result<FundingContribution, FundingContributionError> {
+		if self.shared_input.is_none() {
+			return Err(FundingContributionError::InvalidSpliceValue);
+		}
+		if feerate > max_feerate {
+			return Err(FundingContributionError::FeeRateExceedsMaximum { feerate, max_feerate });
+		}
+		if let Some(min_rbf_feerate) = self.min_rbf_feerate {
+			if feerate < min_rbf_feerate {
+				return Err(FundingContributionError::FeeRateBelowRbfMinimum {
+					feerate,
+					min_rbf_feerate,
+				});
+			}
+		}
+		let estimated_fee = estimate_transaction_fee(&[], &[], None, true, true, feerate);
+		Ok(FundingContribution {
+			estimated_fee,
+			inputs: Vec::new(),
+			outputs: Vec::new(),
+			change_output: None,
+			feerate,
+			max_feerate,
+			is_splice: true,
+			input_mode: None,
+			pending_components: None,
+			request_funding: None,
+		})
+	}
+
 	/// Creates a [`FundingContribution`] for an RBF (Replace-By-Fee) attempt on a pending splice.
 	///
 	/// This requires [`FundingTemplate::prior_contribution`] to be available. `feerate` overrides
@@ -2186,6 +2225,31 @@ mod tests {
 	use bitcoin::hashes::Hash;
 	use bitcoin::transaction::{Transaction, TxOut, Version};
 	use bitcoin::{Amount, FeeRate, Psbt, ScriptBuf, SignedAmount, WPubkeyHash, WScriptHash};
+
+	#[test]
+	fn remote_funding_request_pays_only_the_shared_fee() {
+		let template = FundingTemplate::new(
+			Some(Input {
+				outpoint: bitcoin::OutPoint::null(),
+				previous_utxo: TxOut {
+					value: Amount::from_sat(50_000),
+					script_pubkey: ScriptBuf::new(),
+				},
+				satisfaction_weight: 0,
+			}),
+			None,
+			None,
+			Amount::from_sat(50_000),
+		);
+		let feerate = FeeRate::from_sat_per_kwu(1_000);
+		let contribution = template.request_remote_funding(feerate, feerate).unwrap();
+		assert!(contribution.inputs().is_empty());
+		assert!(contribution.outputs().is_empty());
+		assert!(contribution.net_value().is_negative());
+		let request = vec![1, 2, 3, 4];
+		let contribution = contribution.with_request_funding(request.clone());
+		assert_eq!(contribution.request_funding(), Some(request.as_slice()));
+	}
 
 	#[test]
 	#[rustfmt::skip]
