@@ -347,6 +347,62 @@ fn rotate_through_iterators<T, I: Iterator<Item = T>>(mut vecs: Vec<I>) -> impl 
 ///   factor (to allow some margin for change in inbound), select the channel with the lowest
 ///   inbound capacity that is above this threshold.
 /// * If no `min_inbound_capacity_msat` is specified, or the counterparty has no channels above the
+/// Phoenix encodes the recipient in the route hint instead of a real channel.
+/// The short channel id starts with `0xff` and the other seven bytes are the
+/// tail of the recipient pubkey. The LSP treats that hop as on-the-fly funding.
+pub(super) fn phoenix_peer_id_scid(node_id: &PublicKey) -> u64 {
+	let bytes = node_id.serialize();
+	let mut id = 0xffu64;
+	for byte in &bytes[26..] {
+		id = (id << 8) | u64::from(*byte);
+	}
+	id
+}
+
+/// One hint per counterparty, using [`phoenix_peer_id_scid`] for our node.
+/// Used when no channel can receive the invoice amount. `peers` fills in
+/// when there is no channel yet.
+pub(super) fn phoenix_peer_id_hints(
+	our_node_id: PublicKey, channels: &[ChannelDetails], peers: impl IntoIterator<Item = PublicKey>,
+) -> Vec<RouteHint> {
+	let scid = phoenix_peer_id_scid(&our_node_id);
+	let mut by_peer: BTreeMap<PublicKey, (u32, u32, u16)> = BTreeMap::new();
+	for channel in channels.iter().filter(|channel| channel.is_channel_ready) {
+		let (base, proportional, cltv) = match channel.counterparty.forwarding_info.as_ref() {
+			Some(info) => {
+				(info.fee_base_msat, info.fee_proportional_millionths, info.cltv_expiry_delta)
+			},
+			None => (1_000, 100, 144),
+		};
+		by_peer
+			.entry(channel.counterparty.node_id)
+			.and_modify(|fees| {
+				fees.0 = fees.0.max(base);
+				fees.1 = fees.1.max(proportional);
+				fees.2 = fees.2.max(cltv);
+			})
+			.or_insert((base, proportional, cltv));
+	}
+	if by_peer.is_empty() {
+		for peer in peers {
+			by_peer.entry(peer).or_insert((1_000, 100, 144));
+		}
+	}
+	by_peer
+		.into_iter()
+		.map(|(peer, (base, proportional, cltv))| {
+			RouteHint(vec![RouteHintHop {
+				src_node_id: peer,
+				short_channel_id: scid,
+				fees: RoutingFees { base_msat: base, proportional_millionths: proportional },
+				cltv_expiry_delta: cltv,
+				htlc_minimum_msat: None,
+				htlc_maximum_msat: None,
+			}])
+		})
+		.collect()
+}
+
 ///   minimum + 10% scaling factor, select the channel with the highest inbound capacity per counterparty.
 /// * Prefer channels with capacity at least `min_inbound_capacity_msat` and where the channel
 ///   `is_usable` (i.e. the peer is connected).
@@ -589,6 +645,23 @@ impl<'a, 'b, L: Logger> WithChannelDetails<'a, 'b, L> {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	#[test]
+	fn phoenix_peer_id_scid_matches_the_lsp_encoding() {
+		// phoenixd 037d4174… invoice hint was 16737321x9111285x10758.
+		let phoenix = PublicKey::from_slice(&[
+			0x03, 0x7d, 0x41, 0x74, 0xbb, 0x16, 0xea, 0x36, 0xf7, 0x3b, 0x2a, 0x6e, 0x64, 0xbf,
+			0x88, 0xd9, 0x66, 0xb0, 0xf7, 0xc2, 0x8e, 0xa1, 0x0d, 0x23, 0x17, 0x32, 0x64, 0x29,
+			0x8b, 0x06, 0xf5, 0x2a, 0x06,
+		])
+		.unwrap();
+		let scid = phoenix_peer_id_scid(&phoenix);
+		let block = (scid >> 40) & 0xffffff;
+		let tx = (scid >> 16) & 0xffffff;
+		let vout = scid & 0xffff;
+		assert_eq!((block, tx, vout), (16_737_321, 9_111_285, 10_758));
+		assert_eq!(scid >> 56, 0xff);
+	}
 	use crate::chain::channelmonitor::HTLC_FAIL_BACK_BUFFER;
 	use crate::ln::channelmanager::{
 		Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId, PhantomRouteHints,

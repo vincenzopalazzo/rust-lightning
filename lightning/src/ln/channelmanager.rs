@@ -14851,18 +14851,26 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			invoice = invoice.amount_milli_satoshis(amount_msats);
 		}
 
-		// Keep the private-channel hint even when inbound cannot hold the
-		// amount. Phoenixd omits hints when the invoice advertises
-		// experimental trampoline and pays the node id instead; the testnet
-		// LSP then returns TrampolineFeeInsufficient and does not splice.
-		// A legacy trampoline names this channel, which is the path that
-		// funded a phoenixd peer.
-		let route_hints: Vec<_> = super::invoice_utils::sort_and_filter_channels(
-			self.list_channels(),
-			amount_msats,
-			&self.logger,
-		)
-		.collect();
+		let channels = self.list_channels();
+		let cannot_receive = amount_msats.is_some_and(|amount| {
+			!channels.iter().any(|channel| {
+				channel.is_channel_ready && channel.inbound_capacity_msat >= amount
+			})
+		});
+		// A real hint for a channel that cannot hold the payment makes the LSP
+		// fail that hop. Phoenix instead names the recipient with a 0xff
+		// short channel id, which is what makes the LSP send will_add_htlc.
+		let route_hints: Vec<_> = if cannot_receive {
+			let peers = self.per_peer_state.read().unwrap();
+			super::invoice_utils::phoenix_peer_id_hints(
+				self.get_our_node_id(),
+				&channels,
+				peers.keys().copied(),
+			)
+		} else {
+			super::invoice_utils::sort_and_filter_channels(channels, amount_msats, &self.logger)
+				.collect()
+		};
 		for hint in route_hints {
 			invoice = invoice.private_route(hint);
 		}
