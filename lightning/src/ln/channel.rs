@@ -1692,6 +1692,14 @@ where
 		}
 	}
 
+	pub fn as_unfunded_v2_mut(&mut self) -> Option<&mut PendingV2Channel<SP>> {
+		if let ChannelPhase::UnfundedV2(channel) = &mut self.phase {
+			Some(channel)
+		} else {
+			None
+		}
+	}
+
 	#[rustfmt::skip]
 	pub fn signer_maybe_unblocked<L: Logger, CBP>(
 		&mut self, chain_hash: ChainHash, best_block_height: u32, logger: &L, path_for_release_htlc: CBP
@@ -16410,7 +16418,9 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
 			},
-			funding_feerate_sat_per_1000_weight: self.context.feerate_per_kw,
+			funding_feerate_sat_per_1000_weight: self
+				.funding_negotiation_context
+				.funding_feerate_sat_per_1000_weight,
 			second_per_commitment_point,
 			locktime: self.funding_negotiation_context.funding_tx_locktime.to_consensus_u32(),
 			require_confirmed_inputs: None,
@@ -16521,6 +16531,64 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			interactive_tx_constructor,
 			unfunded_context,
 		})
+	}
+
+	/// The acceptor agreed. Derive the v2 channel id and start the interactive
+	/// funding transaction. Their contribution must be zero: we fund the
+	/// channel, and the reserve stays the spec's 1% rather than a v1 field.
+	pub fn peer_accepted<ES: EntropySource>(
+		&mut self, msg: &msgs::AcceptChannelV2, default_limits: &ChannelHandshakeLimits,
+		their_features: &InitFeatures, entropy_source: &ES, holder_node_id: PublicKey,
+	) -> Result<(ChannelId, Option<InteractiveTxMessageSend>), ChannelError> {
+		if msg.funding_satoshis != 0 {
+			return Err(ChannelError::close(format!(
+				"accept_channel2 contributed {} sat; a remote contribution is not implemented",
+				msg.funding_satoshis
+			)));
+		}
+		let channel_value = self.funding.get_value_satoshis();
+		let their_reserve = get_v2_channel_reserve_satoshis(
+			channel_value,
+			msg.common_fields.dust_limit_satoshis,
+			msg.disable_channel_reserve.is_some(),
+		)
+		.map_err(|()| ChannelError::close("channel value is below the dust limit".to_owned()))?;
+		self.context.do_accept_channel_checks(
+			&mut self.funding,
+			default_limits,
+			their_features,
+			&msg.common_fields,
+			their_reserve,
+		)?;
+
+		let channel_id = ChannelId::v2_from_revocation_basepoints(
+			&self.funding.get_holder_pubkeys().revocation_basepoint,
+			&self.funding.get_counterparty_pubkeys().revocation_basepoint,
+		);
+		self.context.channel_id = channel_id;
+
+		let shared_funding_output = TxOut {
+			value: Amount::from_sat(channel_value),
+			script_pubkey: self.funding.get_funding_redeemscript().to_p2wsh(),
+		};
+		let inputs = core::mem::take(&mut self.funding_negotiation_context.our_funding_inputs);
+		let (constructor, first_message) =
+			InteractiveTxConstructor::new_for_outbound(InteractiveTxConstructorArgs {
+				entropy_source,
+				holder_node_id,
+				counterparty_node_id: self.context.get_counterparty_node_id(),
+				channel_id,
+				feerate_sat_per_kw: self
+					.funding_negotiation_context
+					.funding_feerate_sat_per_1000_weight,
+				funding_tx_locktime: self.funding_negotiation_context.funding_tx_locktime,
+				inputs_to_contribute: inputs,
+				shared_funding_input: None,
+				shared_funding_output: SharedOwnedOutput::new(shared_funding_output, channel_value),
+				outputs_to_contribute: self.funding_negotiation_context.our_funding_outputs.clone(),
+			});
+		self.interactive_tx_constructor = Some(constructor);
+		Ok((channel_id, first_message))
 	}
 
 	/// Marks an inbound channel as accepted and generates a [`msgs::AcceptChannelV2`] message which

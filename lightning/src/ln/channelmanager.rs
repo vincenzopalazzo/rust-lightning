@@ -3987,6 +3987,7 @@ impl<
 			temporary_channel_id,
 			override_config,
 			None,
+			None,
 		)
 	}
 
@@ -4013,6 +4014,36 @@ impl<
 			temporary_channel_id,
 			override_config,
 			Some(TrustedChannelFeatures::ZeroReserve),
+			None,
+		)
+	}
+
+	/// Opens a dual-funded channel we pay for. `funding_inputs` cover
+	/// `channel_value_satoshis` plus the fee at `funding_feerate_sat_per_kw`;
+	/// `change_output` is added beside the funding output.
+	///
+	/// The peer must advertise `option_dual_fund`. The channel reserve is the
+	/// spec's 1%, not the v1 `channel_reserve_satoshis` field.
+	pub fn create_dual_funded_channel(
+		&self, their_network_key: PublicKey, channel_value_satoshis: u64, user_channel_id: u128,
+		override_config: Option<UserConfig>,
+		funding_inputs: Vec<crate::util::wallet_utils::ConfirmedUtxo>,
+		change_output: Option<bitcoin::TxOut>, funding_feerate_sat_per_kw: u32,
+	) -> Result<ChannelId, APIError> {
+		if funding_inputs.is_empty() {
+			return Err(APIError::APIMisuseError {
+				err: "dual-funded open needs at least one input".to_owned(),
+			});
+		}
+		self.create_channel_internal(
+			their_network_key,
+			channel_value_satoshis,
+			0,
+			user_channel_id,
+			None,
+			override_config,
+			None,
+			Some((funding_inputs, change_output.into_iter().collect(), funding_feerate_sat_per_kw)),
 		)
 	}
 
@@ -4021,6 +4052,11 @@ impl<
 		user_channel_id: u128, temporary_channel_id: Option<ChannelId>,
 		override_config: Option<UserConfig>,
 		trusted_channel_features: Option<TrustedChannelFeatures>,
+		v2_funding: Option<(
+			Vec<crate::util::wallet_utils::ConfirmedUtxo>,
+			Vec<bitcoin::TxOut>,
+			u32,
+		)>,
 	) -> Result<ChannelId, APIError> {
 		if channel_value_satoshis < crate::ln::channel::MIN_CHANNEL_VALUE_SATOSHIS {
 			return Err(APIError::APIMisuseError {
@@ -4057,11 +4093,60 @@ impl<
 			}
 		}
 
+		let outbound_scid_alias = self.create_and_insert_outbound_scid_alias();
+		let their_features = &peer_state.latest_features;
+		let config = self.config.read().unwrap();
+		let config = if let Some(config) = &override_config { config } else { &*config };
+		if let Some((inputs, change, feerate)) = v2_funding {
+			if !their_features.supports_dual_fund() {
+				self.outbound_scid_aliases.lock().unwrap().remove(&outbound_scid_alias);
+				return Err(APIError::APIMisuseError {
+					err: format!("peer {their_network_key} does not support dual funding"),
+				});
+			}
+			let mut channel = match PendingV2Channel::new_outbound(
+				&self.fee_estimator,
+				&self.entropy_source,
+				&self.signer_provider,
+				their_network_key,
+				their_features,
+				channel_value_satoshis,
+				inputs,
+				user_channel_id,
+				config,
+				self.best_block.read().unwrap().height,
+				outbound_scid_alias,
+				ConfirmationTarget::NonAnchorChannelFee,
+				&self.logger,
+				trusted_channel_features,
+			) {
+				Ok(res) => res,
+				Err(e) => {
+					self.outbound_scid_aliases.lock().unwrap().remove(&outbound_scid_alias);
+					return Err(e);
+				},
+			};
+			channel.funding_negotiation_context.funding_feerate_sat_per_1000_weight = feerate;
+			channel.funding_negotiation_context.our_funding_outputs = change;
+			let msg = channel.get_open_channel_v2(self.chain_hash);
+			let temporary_channel_id = channel.context.channel_id();
+			match peer_state.channel_by_id.entry(temporary_channel_id) {
+				hash_map::Entry::Occupied(_) => {
+					return Err(APIError::APIMisuseError {
+						err: "temporary channel id collision".to_owned(),
+					});
+				},
+				hash_map::Entry::Vacant(entry) => {
+					entry.insert(Channel::from(channel));
+				},
+			}
+			peer_state
+				.pending_msg_events
+				.push(MessageSendEvent::SendOpenChannelV2 { node_id: their_network_key, msg });
+			return Ok(temporary_channel_id);
+		}
+
 		let mut channel = {
-			let outbound_scid_alias = self.create_and_insert_outbound_scid_alias();
-			let their_features = &peer_state.latest_features;
-			let config = self.config.read().unwrap();
-			let config = if let Some(config) = &override_config { config } else { &*config };
 			match OutboundV1Channel::new(
 				&self.fee_estimator,
 				&self.entropy_source,
@@ -12031,6 +12116,53 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		Ok(())
 	}
 
+	fn internal_accept_channel_v2(
+		&self, counterparty_node_id: &PublicKey, msg: &msgs::AcceptChannelV2,
+	) -> Result<(), MsgHandleErrInternal> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
+			MsgHandleErrInternal::unreachable_no_such_peer(
+				counterparty_node_id,
+				msg.common_fields.temporary_channel_id,
+			)
+		})?;
+		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+		let peer_state = &mut *peer_state_lock;
+		let temporary_id = msg.common_fields.temporary_channel_id;
+		let limits = self.config.read().unwrap().channel_handshake_limits.clone();
+		let their_features = peer_state.latest_features.clone();
+		let (new_id, first_message) = {
+			let entry = peer_state.channel_by_id.get_mut(&temporary_id).ok_or_else(|| {
+				MsgHandleErrInternal::no_such_channel_for_peer(counterparty_node_id, temporary_id)
+			})?;
+			let unfunded = entry.as_unfunded_v2_mut().ok_or_else(|| {
+				MsgHandleErrInternal::send_err_msg_no_close(
+					"got accept_channel2 for a channel that is not a dual-funded open".to_owned(),
+					temporary_id,
+				)
+			})?;
+			unfunded
+				.peer_accepted(
+					msg,
+					&limits,
+					&their_features,
+					&self.entropy_source,
+					self.get_our_node_id(),
+				)
+				.map_err(|err| MsgHandleErrInternal::from_chan_no_close(err, temporary_id))?
+		};
+		if new_id != temporary_id {
+			let channel = peer_state.channel_by_id.remove(&temporary_id).expect("just looked up");
+			peer_state.channel_by_id.insert(new_id, channel);
+		}
+		if let Some(interactive) = first_message {
+			peer_state
+				.pending_msg_events
+				.push(interactive.into_msg_send_event(*counterparty_node_id));
+		}
+		Ok(())
+	}
+
 	fn internal_funding_created(
 		&self, counterparty_node_id: &PublicKey, msg: &msgs::FundingCreated,
 	) -> Result<(), MsgHandleErrInternal> {
@@ -17211,11 +17343,11 @@ impl<
 	fn handle_accept_channel_v2(
 		&self, counterparty_node_id: PublicKey, msg: &msgs::AcceptChannelV2,
 	) {
-		let err = Err(MsgHandleErrInternal::send_err_msg_no_close(
-			"Dual-funded channels not supported".to_owned(),
-			msg.common_fields.temporary_channel_id.clone(),
-		));
-		let _: Result<(), _> = self.handle_error(err, counterparty_node_id);
+		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let res = self.internal_accept_channel_v2(&counterparty_node_id, msg);
+			let _ = self.handle_error(res, counterparty_node_id);
+			NotifyOption::SkipPersistHandleEvents
+		});
 	}
 
 	fn handle_funding_created(&self, counterparty_node_id: PublicKey, msg: &msgs::FundingCreated) {
