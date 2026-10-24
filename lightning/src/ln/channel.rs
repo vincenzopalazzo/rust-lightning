@@ -16591,12 +16591,14 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				their_funding
 			)));
 		}
-		if buying_liquidity && their_funding == 0 {
-			return Err(ChannelError::close(
-				"the LSP accepted the purchase but contributed no satoshis".to_owned(),
-			));
-		}
-		let channel_value = our_funding.saturating_add(their_funding);
+		// The LSP often leaves `funding_satoshis` at 0 and adds the purchase
+		// as inputs during the interactive transaction. The value we asked
+		// for is already the placeholder channel value.
+		let channel_value = if buying_liquidity && their_funding == 0 {
+			self.funding.get_value_satoshis()
+		} else {
+			our_funding.saturating_add(their_funding)
+		};
 		if buying_liquidity {
 			let their_reserve = get_v2_channel_reserve_satoshis(
 				channel_value,
