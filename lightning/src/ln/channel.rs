@@ -16377,13 +16377,18 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 		Ok(chan)
 	}
 
-	/// We contribute nothing. The peer funds the channel in answer to `request_funding`.
+	/// The peer funds the channel in answer to `request_funding`.
+	///
+	/// Our contribution stays at 1000 sat. The LSP rejects an opener
+	/// contribution of 0 (`min=546 sat`) even when it is buying the liquidity.
 	pub fn request_counterparty_funding(&mut self, request_funding: Vec<u8>) {
-		self.funding_negotiation_context.our_funding_contribution = SignedAmount::ZERO;
+		const OPENER_CONTRIBUTION_SATS: i64 = 1000;
+		self.funding_negotiation_context.our_funding_contribution =
+			SignedAmount::from_sat(OPENER_CONTRIBUTION_SATS);
 		self.funding_negotiation_context.our_funding_inputs.clear();
 		self.funding_negotiation_context.liquidity_request = Some(request_funding);
 		self.funding.holder_selected_channel_reserve_satoshis = 0;
-		self.funding.value_to_self_msat = 0;
+		self.funding.value_to_self_msat = (OPENER_CONTRIBUTION_SATS as u64).saturating_mul(1000);
 	}
 
 	/// If we receive an error message, it may only be a rejection of the channel type we tried,
@@ -16595,7 +16600,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 		// as inputs during the interactive transaction. The value we asked
 		// for is already the placeholder channel value.
 		let channel_value = if buying_liquidity && their_funding == 0 {
-			self.funding.get_value_satoshis()
+			self.funding.get_value_satoshis().saturating_add(our_funding)
 		} else {
 			our_funding.saturating_add(their_funding)
 		};
