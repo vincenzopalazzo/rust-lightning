@@ -1992,8 +1992,8 @@ impl<
 												let _ = self.enqueue_message(peer, msg);
 												continue;
 											},
-											(msgs::DecodeError::UnknownRequiredFeature, _) => {
-												log_debug!(logger, "Received a message with an unknown required feature flag or TLV, you may want to update!");
+											(msgs::DecodeError::UnknownRequiredFeature, ty) => {
+												log_debug!(logger, "Received a message with an unknown required feature flag or TLV (type {ty:?}), you may want to update!");
 												return Err(PeerHandleError {});
 											},
 											(msgs::DecodeError::UnknownVersion, _) => {
