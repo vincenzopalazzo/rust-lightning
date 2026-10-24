@@ -5205,9 +5205,15 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		let channel_type = common_fields.channel_type.as_ref().ok_or_else(|| {
 			ChannelError::close("option_channel_type assumed to be supported".to_owned())
 		})?;
-		if channel_type != funding.get_channel_type() {
-			return Err(ChannelError::close(String::from(
-				"Channel Type in accept_channel didn't match the one sent in open_channel.",
+		// A purchase open advertises Phoenix taproot while the channel object
+		// stays anchors, which is the script we can build. The LSP echoes the
+		// type it accepted.
+		let phoenix_type = super::features::phoenix_simple_taproot_channel_type();
+		if channel_type != funding.get_channel_type() && channel_type != &phoenix_type {
+			return Err(ChannelError::close(format!(
+				"Channel Type in accept_channel didn't match the one sent in open_channel. accept {:02x?} ours {:02x?}",
+				channel_type.le_flags(),
+				funding.get_channel_type().le_flags(),
 			)));
 		}
 
