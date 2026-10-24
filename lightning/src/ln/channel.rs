@@ -2297,18 +2297,35 @@ where
 		&mut self, funding_txid_signed: Txid, witnesses: Vec<Witness>, best_block_height: u32,
 		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<FundingTxSigned, APIError> {
-		let phoenix_nonces = if let ChannelPhase::UnfundedV2(channel) = &self.phase {
-			match (
-				channel.funding_negotiation_context.our_nonce_k1,
-				channel.funding_negotiation_context.our_nonce_k2,
-				channel.funding_negotiation_context.their_commit_nonce,
-			) {
-				(Some(k1), Some(k2), Some(nonce)) => Some((k1, k2, nonce)),
-				_ => None,
-			}
-		} else {
-			None
-		};
+		let phoenix_nonces = self
+			.context()
+			.interactive_tx_signing_session
+			.as_ref()
+			.and_then(|session| {
+				let k1 = session.phoenix_k1.and_then(|bytes| SecretKey::from_slice(&bytes).ok())?;
+				let k2 = session.phoenix_k2.and_then(|bytes| SecretKey::from_slice(&bytes).ok())?;
+				let nonce_bytes = session.their_commit_nonce.as_ref()?;
+				if nonce_bytes.len() != 66 {
+					return None;
+				}
+				let mut nonce = [0u8; 66];
+				nonce.copy_from_slice(nonce_bytes);
+				Some((k1, k2, nonce))
+			})
+			.or_else(|| {
+				if let ChannelPhase::UnfundedV2(channel) = &self.phase {
+					match (
+						channel.funding_negotiation_context.our_nonce_k1,
+						channel.funding_negotiation_context.our_nonce_k2,
+						channel.funding_negotiation_context.their_commit_nonce,
+					) {
+						(Some(k1), Some(k2), Some(nonce)) => Some((k1, k2, nonce)),
+						_ => None,
+					}
+				} else {
+					None
+				}
+			});
 		let (context, funding, pending_splice) = match &mut self.phase {
 			ChannelPhase::Undefined => unreachable!(),
 			ChannelPhase::UnfundedV2(channel) => (&mut channel.context, &channel.funding, None),
@@ -2511,7 +2528,19 @@ where
 	) -> Result<(Option<ChannelMonitor<SP::EcdsaSigner>>, Option<ChannelMonitorUpdate>), ChannelError> {
 		let phase = core::mem::replace(&mut self.phase, ChannelPhase::Undefined);
 		match phase {
-			ChannelPhase::UnfundedV2(chan) => {
+			ChannelPhase::UnfundedV2(mut chan) => {
+				if let Some(session) = chan.context.interactive_tx_signing_session.as_mut() {
+					session.phoenix_k1 = chan
+						.funding_negotiation_context
+						.our_nonce_k1
+						.map(|secret| secret.secret_bytes());
+					session.phoenix_k2 = chan
+						.funding_negotiation_context
+						.our_nonce_k2
+						.map(|secret| secret.secret_bytes());
+					session.their_commit_nonce =
+						chan.funding_negotiation_context.their_commit_nonce.map(|nonce| nonce.to_vec());
+				}
 				let holder_commitment_point = match chan.unfunded_context.holder_commitment_point {
 					Some(point) => point,
 					None => {

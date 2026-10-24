@@ -525,6 +525,11 @@ pub(crate) struct InteractiveTxSigningSession {
 	shared_input_signature: Option<SharedInputSignature>,
 	holder_tx_signatures: Option<TxSignatures>,
 	counterparty_tx_signatures: Option<TxSignatures>,
+	/// Phoenix MuSig2 nonce secrets. Kept across the unfunded-to-funded
+	/// promotion so the partial can be attached after their commitment_signed.
+	pub phoenix_k1: Option<[u8; 32]>,
+	pub phoenix_k2: Option<[u8; 32]>,
+	pub their_commit_nonce: Option<Vec<u8>>,
 }
 
 impl InteractiveTxSigningSession {
@@ -904,6 +909,9 @@ impl_writeable_tlv_based!(InteractiveTxSigningSession, {
 	(7, counterparty_tx_signatures, required),
 	(9, holder_sends_tx_signatures_first, required),
 	(11, shared_input_signature, required),
+	(13, phoenix_k1, option),
+	(15, phoenix_k2, option),
+	(17, their_commit_nonce, option),
 });
 
 #[derive(Debug)]
@@ -1490,6 +1498,9 @@ macro_rules! define_state_transitions {
 					shared_input_signature,
 					holder_tx_signatures: None,
 					counterparty_tx_signatures: None,
+					phoenix_k1: None,
+					phoenix_k2: None,
+					their_commit_nonce: None,
 				};
 				Ok(NegotiationComplete(signing_session))
 			}
@@ -3333,6 +3344,9 @@ mod tests {
 			shared_input_signature: None,
 			holder_tx_signatures: None,
 			counterparty_tx_signatures: None,
+			phoenix_k1: None,
+			phoenix_k2: None,
+			their_commit_nonce: None,
 		}
 		.verify_interactive_tx_signatures(
 			&secp_ctx,
