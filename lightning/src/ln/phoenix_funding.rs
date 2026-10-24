@@ -389,7 +389,12 @@ pub(super) fn remote_commitment_sighash(
 	for byte in &blind_hash[26..32] {
 		blind = (blind << 8) | u64::from(*byte);
 	}
-	let obscured = (((1u64 << 48) - 1) ^ blind) & ((1u64 << 48) - 1);
+	// Eclair's first commitment index is 0. LDK stores that same
+	// transaction as `INITIAL_COMMITMENT_NUMBER` and encodes
+	// `obscure_factor XOR (INITIAL - number)`, which is the factor
+	// itself. XORing `(1 << 48) - 1` here changes the locktime, so the
+	// LSP rejects the partial as an invalid commitment signature.
+	let obscured = blind;
 	let sequence = 0x8000_0000 | u32::try_from((obscured >> 24) & 0x00ff_ffff).unwrap();
 	let locktime = 0x2000_0000 | u32::try_from(obscured & 0x00ff_ffff).unwrap();
 	let tx = Transaction {
@@ -523,6 +528,51 @@ mod tests {
 		output
 			.verify(&secp, &secp256k1::Message::from_digest(message), &signature)
 			.expect("aggregated MuSig2 signature");
+	}
+
+	#[test]
+	fn first_commitment_number_is_zero() {
+		let secp = Secp256k1::new();
+		let our_payment =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[2u8; 32]).unwrap());
+		let their_payment =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[3u8; 32]).unwrap());
+		let their_delayed =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[4u8; 32]).unwrap());
+		let revocation =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[5u8; 32]).unwrap());
+		let funding = TxOut { value: Amount::from_sat(17_500), script_pubkey: ScriptBuf::new() };
+		let outpoint = OutPoint { txid: bitcoin::Txid::from_byte_array([9u8; 32]), vout: 1 };
+		let (_, tx) = remote_commitment_sighash(
+			&secp,
+			outpoint,
+			&funding,
+			&our_payment,
+			&their_payment,
+			&their_delayed,
+			&revocation,
+			144,
+			253,
+			0,
+			17_500,
+			354,
+		)
+		.unwrap();
+		let mut preimage = Vec::new();
+		preimage.extend_from_slice(&our_payment.serialize());
+		preimage.extend_from_slice(&their_payment.serialize());
+		let blind_hash = sha256::Hash::hash(&preimage).to_byte_array();
+		let mut blind = 0u64;
+		for byte in &blind_hash[26..32] {
+			blind = (blind << 8) | u64::from(*byte);
+		}
+		let sequence = 0x8000_0000 | u32::try_from((blind >> 24) & 0x00ff_ffff).unwrap();
+		let locktime = 0x2000_0000 | u32::try_from(blind & 0x00ff_ffff).unwrap();
+		assert_eq!(tx.input[0].sequence, Sequence(sequence));
+		assert_eq!(tx.lock_time, LockTime::from_consensus(locktime));
+		let backwards = ((1u64 << 48) - 1) ^ blind;
+		let backwards_lock = 0x2000_0000 | u32::try_from(backwards & 0x00ff_ffff).unwrap();
+		assert_ne!(tx.lock_time, LockTime::from_consensus(backwards_lock));
 	}
 
 	#[test]
