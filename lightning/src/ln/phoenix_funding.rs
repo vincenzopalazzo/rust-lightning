@@ -312,20 +312,19 @@ fn p2tr_with_leaves(
 
 /// Sighash of the counterparty's first Phoenix taproot commitment.
 ///
-/// They pay the commitment fee. There are no HTLCs. Returns `None` when a
-/// balance is below dust after the fee.
+/// They pay the commitment fee. There are no HTLCs. A balance below
+/// `dust_limit_sat` is omitted, including its anchor. The fee still reserves
+/// both anchors, matching eclair. Returns `None` when nothing is left to sign.
 pub(super) fn remote_commitment_sighash(
 	secp: &Secp256k1<secp256k1::All>, funding_outpoint: OutPoint, funding_output: &TxOut,
 	our_payment: &PublicKey, their_payment: &PublicKey, their_delayed: &PublicKey,
 	revocation: &PublicKey, to_self_delay: u16, feerate_per_kw: u32, our_balance_sat: u64,
-	their_balance_sat: u64,
+	their_balance_sat: u64, dust_limit_sat: u64,
 ) -> Option<[u8; 32]> {
 	let fee_msat = u64::from(feerate_per_kw).saturating_mul(968).saturating_add(660_000);
 	let fee_sat = fee_msat / 1000;
 	let their_output = their_balance_sat.checked_sub(fee_sat)?;
-	if their_output < 546 || our_balance_sat < 546 {
-		return None;
-	}
+	let dust = dust_limit_sat.max(354);
 	let nums = nums_key();
 	let their_delayed_x = their_delayed.x_only_public_key().0;
 	let revocation_x = revocation.x_only_public_key().0;
@@ -368,12 +367,18 @@ pub(super) fn remote_commitment_sighash(
 		our_payment_x,
 		&[Builder::new().push_int(16).push_opcode(OP_CSV).into_script()],
 	);
-	let mut outputs = vec![
-		TxOut { value: Amount::from_sat(their_output), script_pubkey: to_local },
-		TxOut { value: Amount::from_sat(our_balance_sat), script_pubkey: to_remote },
-		TxOut { value: Amount::from_sat(330), script_pubkey: their_anchor },
-		TxOut { value: Amount::from_sat(330), script_pubkey: our_anchor },
-	];
+	let mut outputs = Vec::with_capacity(4);
+	if their_output >= dust {
+		outputs.push(TxOut { value: Amount::from_sat(their_output), script_pubkey: to_local });
+		outputs.push(TxOut { value: Amount::from_sat(330), script_pubkey: their_anchor });
+	}
+	if our_balance_sat >= dust {
+		outputs.push(TxOut { value: Amount::from_sat(our_balance_sat), script_pubkey: to_remote });
+		outputs.push(TxOut { value: Amount::from_sat(330), script_pubkey: our_anchor });
+	}
+	if outputs.is_empty() {
+		return None;
+	}
 	outputs.sort_by(|left, right| serialize(left).cmp(&serialize(right)));
 
 	let mut preimage = Vec::with_capacity(66);
@@ -518,6 +523,36 @@ mod tests {
 		output
 			.verify(&secp, &secp256k1::Message::from_digest(message), &signature)
 			.expect("aggregated MuSig2 signature");
+	}
+
+	#[test]
+	fn zero_opener_balance_still_has_a_commitment() {
+		let secp = Secp256k1::new();
+		let our_payment =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[2u8; 32]).unwrap());
+		let their_payment =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[3u8; 32]).unwrap());
+		let their_delayed =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[4u8; 32]).unwrap());
+		let revocation =
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[5u8; 32]).unwrap());
+		let funding = TxOut { value: Amount::from_sat(265_000), script_pubkey: ScriptBuf::new() };
+		let outpoint = OutPoint { txid: bitcoin::Txid::from_byte_array([9u8; 32]), vout: 1 };
+		let sighash = remote_commitment_sighash(
+			&secp,
+			outpoint,
+			&funding,
+			&our_payment,
+			&their_payment,
+			&their_delayed,
+			&revocation,
+			144,
+			253,
+			0,
+			265_000,
+			546,
+		);
+		assert!(sighash.is_some());
 	}
 
 	fn ours_plus(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {

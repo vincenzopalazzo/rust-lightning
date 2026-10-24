@@ -2243,6 +2243,8 @@ where
 		);
 		let our_balance = funding.value_to_self_msat / 1000;
 		let their_balance = funding.get_value_satoshis().saturating_sub(our_balance);
+		let dust_limit =
+			context.holder_dust_limit_satoshis.max(context.counterparty_dust_limit_satoshis);
 		let mut our_nonce = [0u8; 66];
 		our_nonce[..33]
 			.copy_from_slice(&PublicKey::from_secret_key(&context.secp_ctx, &k1).serialize());
@@ -2263,6 +2265,7 @@ where
 			context.feerate_per_kw,
 			our_balance,
 			their_balance,
+			dust_limit,
 		) {
 			Some(sighash) => sighash,
 			None => {
@@ -16525,16 +16528,15 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 
 	/// The peer funds the channel in answer to `request_funding`.
 	///
-	/// Our contribution stays at 1000 sat. The LSP rejects an opener
-	/// contribution of 0 (`min=546 sat`) even when it is buying the liquidity.
+	/// Our contribution is zero. A non-zero contribution with no wallet input
+	/// makes the funding transaction's outputs exceed its inputs, so the LSP
+	/// cannot sign it.
 	pub fn request_counterparty_funding(&mut self, request_funding: Vec<u8>) {
-		const OPENER_CONTRIBUTION_SATS: i64 = 1000;
-		self.funding_negotiation_context.our_funding_contribution =
-			SignedAmount::from_sat(OPENER_CONTRIBUTION_SATS);
+		self.funding_negotiation_context.our_funding_contribution = SignedAmount::ZERO;
 		self.funding_negotiation_context.our_funding_inputs.clear();
 		self.funding_negotiation_context.liquidity_request = Some(request_funding);
 		self.funding.holder_selected_channel_reserve_satoshis = 0;
-		self.funding.value_to_self_msat = (OPENER_CONTRIBUTION_SATS as u64).saturating_mul(1000);
+		self.funding.value_to_self_msat = 0;
 	}
 
 	/// If we receive an error message, it may only be a rejection of the channel type we tried,
