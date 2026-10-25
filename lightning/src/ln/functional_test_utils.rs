@@ -41,10 +41,10 @@ use crate::ln::peer_handler::IgnoringMessageHandler;
 use crate::ln::types::ChannelId;
 use crate::offers::payer_proof::PaidBolt12Invoice;
 use crate::onion_message::messenger::OnionMessenger;
-use crate::routing::gossip::{NetworkGraph, NetworkUpdate, P2PGossipSync};
+use crate::routing::gossip::{NetworkGraph, NetworkUpdate, NodeAlias, NodeId, P2PGossipSync};
 use crate::routing::router::{self, PaymentParameters, Route, RouteParameters};
 use crate::routing::router::{compute_fees, BlindedTail, TrampolineHop};
-use crate::sign::{EntropySource, RandomBytes, ReceiveAuthKey};
+use crate::sign::{EntropySource, NodeSigner, RandomBytes, ReceiveAuthKey};
 use crate::types::features::ChannelTypeFeatures;
 use crate::types::features::InitFeatures;
 use crate::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
@@ -2175,6 +2175,29 @@ pub fn update_nodes_with_chan_announce<'a, 'b, 'c, 'd>(
 		// forwarding info for local channels even if its not accepted in the network graph.
 		node.node.handle_channel_update(node_id_a, &upd_1);
 		node.node.handle_channel_update(node_id_b, &upd_2);
+	}
+}
+
+/// Delivers a `node_announcement` with an address for `nodes[idx]` to every node's network graph,
+/// letting others connect to it directly, e.g., as the introduction node of a blinded path.
+pub fn announce_node_address<'a, 'b, 'c>(nodes: &[Node<'a, 'b, 'c>], idx: usize) {
+	let announcement = msgs::UnsignedNodeAnnouncement {
+		features: nodes[idx].node.node_features(),
+		timestamp: 1,
+		node_id: NodeId::from_pubkey(&nodes[idx].node.get_our_node_id()),
+		rgb: [0; 3],
+		alias: NodeAlias([0; 32]),
+		addresses: vec![msgs::SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 9735 }],
+		excess_address_data: Vec::new(),
+		excess_data: Vec::new(),
+	};
+	let signature = nodes[idx]
+		.keys_manager
+		.sign_gossip_message(msgs::UnsignedGossipMessage::NodeAnnouncement(&announcement))
+		.unwrap();
+	let msg = msgs::NodeAnnouncement { signature, contents: announcement };
+	for node in nodes {
+		node.gossip_sync.handle_node_announcement(None, &msg).unwrap();
 	}
 }
 

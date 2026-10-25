@@ -35,7 +35,7 @@ use crate::ln::msgs::{
 	self, BaseMessageHandler, MessageSendEvent, OnionMessage, OnionMessageHandler, SocketAddress,
 };
 use crate::ln::onion_utils;
-use crate::routing::gossip::{NetworkGraph, NodeId, ReadOnlyNetworkGraph};
+use crate::routing::gossip::{NetworkGraph, NodeId, NodeInfo, ReadOnlyNetworkGraph};
 use crate::sign::{EntropySource, NodeSigner, ReceiveAuthKey, Recipient};
 use crate::types::features::{InitFeatures, NodeFeatures};
 use crate::util::async_poll::{MultiResultFuturePoller, ResultFuture};
@@ -565,8 +565,16 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource>
 		const MAX_PATHS: usize = 3;
 
 		let network_graph = network_graph.deref().read_only();
-		let is_recipient_announced =
-			network_graph.nodes().contains_key(&NodeId::from_pubkey(&recipient));
+		let recipient_info = network_graph.node(&NodeId::from_pubkey(&recipient));
+		let is_recipient_announced = recipient_info.is_some();
+
+		// Senders reach the introduction node by connecting to it, which needs the addresses from
+		// its node announcement. A recipient known only from its channel announcements can't be
+		// connected to, so introduce its paths through a peer that can, if it has one.
+		let has_addresses = |info: &NodeInfo| {
+			info.announcement_info.as_ref().map_or(false, |info| !info.addresses().is_empty())
+		};
+		let is_recipient_reachable = recipient_info.map_or(false, has_addresses);
 
 		let (size_constrained, path_len_incl_dummys) = match &context {
 			MessageContext::Offers(OffersContext::InvoiceRequest { .. })
@@ -610,7 +618,7 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource>
 		};
 
 		let has_one_peer = peers.len() == 1;
-		let mut paths = if !is_recipient_announced {
+		let mut paths = if !is_recipient_reachable {
 			let mut peer_info = peers
 				.map(|peer| MessageForwardNode {
 					short_channel_id: if compact_paths { peer.short_channel_id } else { None },
@@ -619,9 +627,13 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger, ES: EntropySource>
 				.filter_map(|peer| {
 					network_graph
 						.node(&NodeId::from_pubkey(&peer.node_id))
+						// A peer without addresses is no easier to reach than an announced recipient
+						.filter(|info| !is_recipient_announced || has_addresses(info))
 						.map(|info| (peer, info.is_tor_only(), info.channels.len()))
 						// Allow messages directly with the only peer
-						.or_else(|| has_one_peer.then(|| (peer, false, 0)))
+						.or_else(|| {
+							(has_one_peer && !is_recipient_announced).then(|| (peer, false, 0))
+						})
 				})
 				.collect::<Vec<_>>();
 

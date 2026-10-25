@@ -1476,6 +1476,82 @@ fn creates_and_pays_bolt12_invoice_for_currency_denominated_offer() {
 	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
 }
 
+/// Checks that an offer from a node with announced channels but no announced addresses uses a peer
+/// as its blinded paths' introduction node, as payers can't connect to the node directly.
+#[test]
+fn creates_offer_with_blinded_path_using_peer_when_recipient_has_no_address() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+	announce_node_address(&nodes, 1);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let offer = alice.node
+		.create_offer_builder().unwrap()
+		.amount_msats(10_000_000)
+		.build().unwrap();
+	assert_ne!(offer.issuer_signing_pubkey(), Some(alice_id));
+	assert!(!offer.paths().is_empty());
+	for path in offer.paths() {
+		assert!(check_compact_path_introduction_node(&path, bob, bob_id));
+	}
+
+	let payment_id = PaymentId([1; 32]);
+	bob.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+
+	let (invoice_request, _) = extract_invoice_request(alice, &onion_message);
+	assert_ne!(invoice_request.payer_signing_pubkey(), bob_id);
+}
+
+/// Checks that a refund from a node with announced channels but no announced addresses uses a peer
+/// as its blinded paths' introduction node, as payers can't connect to the node directly.
+#[test]
+fn creates_refund_with_blinded_path_using_peer_when_payer_has_no_address() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+	announce_node_address(&nodes, 0);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let absolute_expiry = Duration::from_secs(u64::MAX);
+	let payment_id = PaymentId([1; 32]);
+	let refund = bob.node
+		.create_refund_builder(10_000_000, absolute_expiry, payment_id, Retry::Attempts(0), RouteParametersConfig::default())
+		.unwrap()
+		.build().unwrap();
+	assert_ne!(refund.payer_signing_pubkey(), bob_id);
+	assert!(!refund.paths().is_empty());
+	for path in refund.paths() {
+		assert!(check_compact_path_introduction_node(&path, alice, alice_id));
+	}
+	expect_recent_payment!(bob, RecentPaymentDetails::AwaitingInvoice, payment_id);
+
+	let expected_invoice = alice.node.request_refund_payment(&refund).unwrap();
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice, expected_invoice);
+}
+
 /// Checks that an offer can be created using an unannounced node as a blinded path's introduction
 /// node. This is only preferred if there are no other options which may indicated either the offer
 /// is intended for the unannounced node or that the node is actually announced (e.g., an LSP) but
