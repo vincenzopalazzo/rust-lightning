@@ -15074,7 +15074,11 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		// A real hint for a channel that cannot hold the payment makes the LSP
 		// fail that hop. Phoenix instead names the recipient with a 0xff
 		// short channel id, which is what makes the LSP send will_add_htlc.
+		// Bit 149 tells phoenixd to trampoline to our node id. Without it,
+		// phoenixd converts the payment to a legacy route and the LSP fails
+		// the fee before will_add_htlc.
 		let route_hints: Vec<_> = if cannot_receive {
+			invoice = invoice.experimental_trampoline();
 			let peers = self.per_peer_state.read().unwrap();
 			super::invoice_utils::phoenix_peer_id_hints(
 				self.get_our_node_id(),

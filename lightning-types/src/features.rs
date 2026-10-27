@@ -1340,6 +1340,16 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn experimental_trampoline_is_optional_bit_149() {
+		let mut features = Bolt11InvoiceFeatures::empty();
+		features.set_experimental_trampoline_optional();
+		let flags = features.le_flags();
+		assert!(flags.len() > 18);
+		assert_eq!(flags[18] & 0x20, 0x20);
+		assert!(!features.requires_unknown_bits());
+	}
+
+	#[test]
 	fn sanity_test_unknown_bits() {
 		let features = ChannelFeatures::empty();
 		assert!(!features.requires_unknown_bits());
