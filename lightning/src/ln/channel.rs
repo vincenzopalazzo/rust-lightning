@@ -7297,8 +7297,20 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			if tx.txid() == funding_txo.txid {
 				let tx = tx.tx();
 				let txo_idx = funding_txo.index as usize;
-				if txo_idx >= tx.output.len() || tx.output[txo_idx].script_pubkey != funding.get_funding_redeemscript().to_p2wsh() ||
-						tx.output[txo_idx].value.to_sat() != funding.get_value_satoshis() {
+				// A Phoenix purchase pays a taproot output, not the p2wsh of
+				// the legacy redeemscript. Treating that as a bogus funding
+				// transaction panics the node when the purchase confirms.
+				let phoenix_script = super::phoenix_funding::funding_script(
+					&self.secp_ctx,
+					funding.holder_funding_pubkey(),
+					funding.counterparty_funding_pubkey(),
+				);
+				let output_ok = tx.output.get(txo_idx).is_some_and(|output| {
+					(output.script_pubkey == funding.get_funding_redeemscript().to_p2wsh()
+						|| output.script_pubkey == phoenix_script)
+						&& output.value.to_sat() == funding.get_value_satoshis()
+				});
+				if !output_ok {
 					if funding.is_outbound() {
 						// If we generated the funding transaction and it doesn't match what it
 						// should, the client is really broken and we should just panic and
