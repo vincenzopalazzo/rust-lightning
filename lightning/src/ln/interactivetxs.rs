@@ -530,6 +530,9 @@ pub(crate) struct InteractiveTxSigningSession {
 	pub phoenix_k1: Option<[u8; 32]>,
 	pub phoenix_k2: Option<[u8; 32]>,
 	pub their_commit_nonce: Option<Vec<u8>>,
+	/// Public nonce for our commitment index 1. Sent in `channel_reestablish`
+	/// so a taproot peer does not force-close for a missing nonce.
+	pub phoenix_next_nonce: Option<Vec<u8>>,
 }
 
 impl InteractiveTxSigningSession {
@@ -912,6 +915,7 @@ impl_writeable_tlv_based!(InteractiveTxSigningSession, {
 	(13, phoenix_k1, option),
 	(15, phoenix_k2, option),
 	(17, their_commit_nonce, option),
+	(19, phoenix_next_nonce, option),
 });
 
 #[derive(Debug)]
@@ -1501,6 +1505,7 @@ macro_rules! define_state_transitions {
 					phoenix_k1: None,
 					phoenix_k2: None,
 					their_commit_nonce: None,
+					phoenix_next_nonce: None,
 				};
 				Ok(NegotiationComplete(signing_session))
 			}
@@ -3347,6 +3352,7 @@ mod tests {
 			phoenix_k1: None,
 			phoenix_k2: None,
 			their_commit_nonce: None,
+			phoenix_next_nonce: None,
 		}
 		.verify_interactive_tx_signatures(
 			&secp_ctx,

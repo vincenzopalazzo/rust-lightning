@@ -1000,6 +1000,10 @@ pub struct ChannelReestablish {
 	/// Phoenix `splice_prototype` puts the legacy next-funding txid in even
 	/// TLV 0. It is not the official TLV 1. Kept so the message decodes.
 	pub experimental_next_funding: Option<Txid>,
+	/// Taproot next-commitment nonces, TLV 22. One entry is a 32-byte
+	/// txid followed by a 66-byte public nonce. A peer that is waiting
+	/// for confirmations force-closes if this is missing.
+	pub next_local_nonces: Option<Vec<u8>>,
 	/// The last funding txid sent by the sending node, which may be:
 	/// - the txid of the last `splice_locked` it sent, otherwise
 	/// - the txid of the funding transaction if it sent `channel_ready`, or else
@@ -3233,6 +3237,7 @@ impl_writeable_msg!(ChannelReestablish, {
 	(0, experimental_next_funding, option),
 	(1, next_funding, option),
 	(5, my_current_funding_locked, option),
+	(22, next_local_nonces, (option, encoding: (Vec<u8>, WithoutLength))),
 });
 
 impl Writeable for NextFunding {
@@ -4812,6 +4817,7 @@ mod tests {
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
 			experimental_next_funding: None,
+			next_local_nonces: None,
 			my_current_funding_locked: None,
 		};
 
@@ -4868,6 +4874,7 @@ mod tests {
 				retransmit_flags: 1,
 			}),
 			experimental_next_funding: None,
+			next_local_nonces: None,
 			my_current_funding_locked: None,
 		};
 
@@ -4933,6 +4940,7 @@ mod tests {
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
 			experimental_next_funding: None,
+			next_local_nonces: None,
 			my_current_funding_locked: Some(msgs::FundingLocked {
 				txid: Txid::from_raw_hash(
 					bitcoin::hashes::Hash::from_slice(&[
@@ -7341,6 +7349,36 @@ mod tests {
 			"accountable={:?} with override={:?} not eq to expected={:?}",
 			decoded.accountable, accountable_override, expected
 		);
+	}
+
+	#[test]
+	fn reestablish_carries_the_next_commitment_nonce() {
+		let txid = Txid::from_raw_hash(bitcoin::hashes::Hash::from_slice(&[9u8; 32]).unwrap());
+		let nonce = [7u8; 66];
+		let mut body = Vec::new();
+		txid.write(&mut body).unwrap();
+		body.extend_from_slice(&nonce);
+		assert_eq!(body.len(), 98);
+		let msg = msgs::ChannelReestablish {
+			channel_id: ChannelId::from_bytes([1; 32]),
+			next_local_commitment_number: 1,
+			next_remote_commitment_number: 0,
+			your_last_per_commitment_secret: [0; 32],
+			my_current_per_commitment_point: pubkey(1),
+			next_funding: None,
+			experimental_next_funding: None,
+			next_local_nonces: Some(body.clone()),
+			my_current_funding_locked: None,
+		};
+		let encoded = msg.encode();
+		let mut tail = vec![22, 98];
+		tail.extend_from_slice(&body);
+		assert_eq!(&encoded[encoded.len() - tail.len()..], tail.as_slice());
+		let decoded = <msgs::ChannelReestablish as LengthReadable>::read_from_fixed_length_buffer(
+			&mut &encoded[..],
+		)
+		.unwrap();
+		assert_eq!(decoded.next_local_nonces.as_deref(), Some(body.as_slice()));
 	}
 
 	#[test]

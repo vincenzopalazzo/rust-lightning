@@ -13919,6 +13919,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							my_current_per_commitment_point: PublicKey::from_slice(&[2u8; 33]).unwrap(),
 							next_funding: None,
 							experimental_next_funding: None,
+							next_local_nonces: None,
 							my_current_funding_locked: None,
 						},
 					});

@@ -2545,6 +2545,7 @@ where
 						.map(|secret| secret.secret_bytes());
 					session.their_commit_nonce =
 						chan.funding_negotiation_context.their_commit_nonce.map(|nonce| nonce.to_vec());
+					session.phoenix_next_nonce = chan.funding_negotiation_context.our_next_nonce;
 				}
 				let holder_commitment_point = match chan.unfunded_context.holder_commitment_point {
 					Some(point) => point,
@@ -3458,6 +3459,7 @@ impl FundingNegotiation {
 			our_nonce_k1: None,
 			our_nonce_k2: None,
 			their_commit_nonce: None,
+			our_next_nonce: None,
 		};
 
 		let (interactive_tx_constructor, first_message) = funding_negotiation_context
@@ -7491,6 +7493,8 @@ pub(super) struct FundingNegotiationContext {
 	pub our_nonce_k2: Option<SecretKey>,
 	/// The peer's current-commitment nonce from `tx_complete` TLV 4.
 	pub their_commit_nonce: Option<[u8; 66]>,
+	/// Public nonce for commitment index 1, the second 66 bytes of `tx_complete`.
+	pub our_next_nonce: Option<Vec<u8>>,
 }
 
 impl FundingNegotiationContext {
@@ -13474,6 +13478,36 @@ where
 		let my_current_funding_locked = self.maybe_get_my_current_funding_locked();
 		self.context.funding_locked_txid_sent_in_reestablish =
 			my_current_funding_locked.as_ref().map(|funding_locked| funding_locked.txid);
+		// Phoenix taproot force-closes a channel that is still waiting for
+		// confirmations when `channel_reestablish` omits TLV 22. The value is
+		// the funding txid plus the 66-byte public nonce we already sent as
+		// the second nonce in `tx_complete`.
+		let stored_nonce = self
+			.context
+			.interactive_tx_signing_session
+			.as_ref()
+			.and_then(|session| session.phoenix_next_nonce.clone())
+			.filter(|nonce| nonce.len() == 66);
+		let funding_txid = self.funding.get_funding_txid().or_else(|| {
+			self.context.interactive_tx_signing_session.as_ref().map(|session| {
+				session.unsigned_tx().compute_txid()
+			})
+		});
+		let next_local_nonces = match (stored_nonce, funding_txid) {
+			(Some(nonce), Some(txid)) => {
+				let mut bytes = Vec::with_capacity(98);
+				txid.write(&mut bytes).expect("funding txid");
+				bytes.extend_from_slice(&nonce);
+				log_info!(logger, "Sending next commitment nonce on channel_reestablish for {}", &self.context.channel_id());
+				Some(bytes)
+			},
+			_ => None,
+		};
+		let my_current_per_commitment_point = if next_local_nonces.is_some() {
+			self.holder_commitment_point.current_point().unwrap_or_else(|| self.holder_commitment_point.next_point())
+		} else {
+			dummy_pubkey
+		};
 		msgs::ChannelReestablish {
 			channel_id: self.context.channel_id(),
 			// The protocol has two different commitment number concepts - the "commitment
@@ -13495,9 +13529,10 @@ where
 			// overflow here.
 			next_remote_commitment_number: INITIAL_COMMITMENT_NUMBER - self.context.counterparty_next_commitment_transaction_number - 1,
 			your_last_per_commitment_secret: remote_last_secret,
-			my_current_per_commitment_point: dummy_pubkey,
+			my_current_per_commitment_point,
 			next_funding: self.maybe_get_next_funding(),
 			experimental_next_funding: None,
+			next_local_nonces,
 			my_current_funding_locked,
 		}
 	}
@@ -15650,6 +15685,7 @@ where
 						our_nonce_k1: None,
 						our_nonce_k2: None,
 						their_commit_nonce: None,
+						our_next_nonce: None,
 					};
 
 					if self.pending_splice.is_some() {
@@ -16560,6 +16596,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			our_nonce_k1: None,
 			our_nonce_k2: None,
 			their_commit_nonce: None,
+			our_next_nonce: None,
 		};
 		let chan = Self {
 			funding,
@@ -16750,6 +16787,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			our_nonce_k1: None,
 			our_nonce_k2: None,
 			their_commit_nonce: None,
+			our_next_nonce: None,
 		};
 		let shared_funding_output = TxOut {
 			value: Amount::from_sat(funding.get_value_satoshis()),
@@ -16859,6 +16897,10 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 		if let Some(nonces) = &generated_nonces {
 			self.funding_negotiation_context.our_nonce_k1 = Some(nonces.k1);
 			self.funding_negotiation_context.our_nonce_k2 = Some(nonces.k2);
+			if nonces.wire.len() >= 132 {
+				self.funding_negotiation_context.our_next_nonce =
+					Some(nonces.wire[66..132].to_vec());
+			}
 		}
 		let commit_nonces = generated_nonces.map(|nonces| nonces.wire);
 		let shared_funding_output = TxOut { value: Amount::from_sat(channel_value), script_pubkey };
