@@ -441,6 +441,9 @@ pub struct ChannelReady {
 	/// The sender will accept payments to be forwarded over this SCID and forward them to this
 	/// messages' recipient.
 	pub short_channel_id_alias: Option<u64>,
+	/// Taproot verification nonce for the sender's next commitment, TLV 4.
+	/// A peer that is waiting for confirmations puts this on `channel_ready`.
+	pub next_local_nonce: Option<Vec<u8>>,
 }
 
 /// A randomly chosen number that is used to identify inputs within an interactive transaction
@@ -3332,6 +3335,7 @@ impl_writeable_msg!(ChannelReady, {
 	next_per_commitment_point,
 }, {
 	(1, short_channel_id_alias, option),
+	(4, next_local_nonce, (option, encoding: (Vec<u8>, WithoutLength))),
 });
 
 pub(crate) fn write_features_up_to_13<W: Writer>(
@@ -5892,10 +5896,36 @@ mod tests {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			next_per_commitment_point: pubkey_1,
 			short_channel_id_alias: None,
+			next_local_nonce: None,
 		};
 		let encoded_value = channel_ready.encode();
 		let target_value = <Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f").unwrap();
 		assert_eq!(encoded_value, target_value);
+	}
+
+	#[test]
+	fn channel_ready_carries_the_next_commitment_nonce() {
+		let secp_ctx = Secp256k1::new();
+		let (_, pubkey_1) = get_keys_from!(
+			"0101010101010101010101010101010101010101010101010101010101010101",
+			secp_ctx
+		);
+		let nonce = vec![7u8; 66];
+		let channel_ready = msgs::ChannelReady {
+			channel_id: ChannelId::from_bytes([2; 32]),
+			next_per_commitment_point: pubkey_1,
+			short_channel_id_alias: None,
+			next_local_nonce: Some(nonce.clone()),
+		};
+		let encoded = channel_ready.encode();
+		let mut tail = vec![4, 66];
+		tail.extend_from_slice(&nonce);
+		assert_eq!(&encoded[encoded.len() - tail.len()..], tail.as_slice());
+		let decoded = <msgs::ChannelReady as LengthReadable>::read_from_fixed_length_buffer(
+			&mut &encoded[..],
+		)
+		.unwrap();
+		assert_eq!(decoded.next_local_nonce.as_deref(), Some(nonce.as_slice()));
 	}
 
 	#[test]

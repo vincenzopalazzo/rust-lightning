@@ -12569,10 +12569,17 @@ where
 	) -> Option<msgs::ChannelReady> {
 		if self.holder_commitment_point.can_advance() {
 			self.context.signer_pending_channel_ready = false;
+			let next_local_nonce = self
+				.context
+				.interactive_tx_signing_session
+				.as_ref()
+				.and_then(|session| session.phoenix_next_nonce.clone())
+				.filter(|nonce| nonce.len() == 66);
 			Some(msgs::ChannelReady {
 				channel_id: self.context.channel_id(),
 				next_per_commitment_point: self.holder_commitment_point.next_point(),
 				short_channel_id_alias: Some(self.context.outbound_scid_alias),
+				next_local_nonce,
 			})
 		} else {
 			log_debug!(logger, "Not producing channel_ready: the holder commitment point is not available.");
