@@ -3413,6 +3413,196 @@ fn test_inbound_reload_without_init_mon() {
 	do_test_inbound_reload_without_init_mon(false, false);
 }
 
+fn do_test_reload_with_completed_init_mon(outbound: bool, use_0conf: bool, reconstruct: bool) {
+	// The initial monitor is persisted asynchronously and the `ChannelManager` is serialized
+	// before that completion is delivered. On reload the monitor is present. The channel should
+	// resume as if `MonitorEvent::Completed` had been processed: `ChannelPending`, and a funding
+	// broadcast when we are the funder.
+	//
+	// Reproduction of https://github.com/lightningdevkit/rust-lightning/issues/4765
+	// (forgejo #5539). This fails on current main.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+
+	let persister;
+	let new_chain_monitor;
+
+	let mut chan_config = test_default_channel_config();
+	chan_config.channel_handshake_limits.trust_own_funding_0conf = true;
+
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(chan_config.clone()), Some(chan_config)]);
+	let node_reload;
+
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	nodes[0].node.create_channel(node_b_id, 100000, 10001, 43, None, None).unwrap();
+	nodes[1].node.handle_open_channel(
+		node_a_id,
+		&get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id),
+	);
+
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match events[0] {
+		Event::OpenChannelRequest { temporary_channel_id: chan_id, .. } => {
+			if use_0conf {
+				nodes[1]
+					.node
+					.accept_inbound_channel_from_trusted_peer(
+						&chan_id,
+						&node_a_id,
+						0,
+						TrustedChannelFeatures::ZeroConf,
+						None,
+					)
+					.unwrap();
+			} else {
+				nodes[1].node.accept_inbound_channel(&chan_id, &node_a_id, 0, None).unwrap();
+			}
+		},
+		_ => panic!("Unexpected event"),
+	};
+
+	nodes[0].node.handle_accept_channel(
+		node_b_id,
+		&get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id),
+	);
+
+	let (temporary_channel_id, funding_tx, ..) =
+		create_funding_transaction(&nodes[0], &node_b_id, 100000, 43);
+
+	nodes[0]
+		.node
+		.funding_transaction_generated(temporary_channel_id, node_b_id, funding_tx)
+		.unwrap();
+	check_added_monitors(&nodes[0], 0);
+
+	let funding_created_msg =
+		get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, node_b_id);
+	if !outbound {
+		chanmon_cfgs[1].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+	}
+	nodes[1].node.handle_funding_created(node_a_id, &funding_created_msg);
+	check_added_monitors(&nodes[1], 1);
+	if outbound {
+		// The acceptor's initial monitor persistence completed, so it resumes immediately.
+		expect_channel_pending_event(&nodes[1], &node_a_id);
+	}
+
+	let bs_signed_locked = nodes[1].node.get_and_clear_pending_msg_events();
+	// A paused acceptor holds `channel_ready` until the initial monitor persistence completes, so
+	// a 0conf acceptor only emits it when its own persist already completed (the outbound cases).
+	let acceptor_sent_channel_ready = use_0conf && outbound;
+	assert_eq!(bs_signed_locked.len(), if acceptor_sent_channel_ready { 2 } else { 1 });
+	match &bs_signed_locked[0] {
+		MessageSendEvent::SendFundingSigned { msg, .. } => {
+			if outbound {
+				chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+			}
+			nodes[0].node.handle_funding_signed(node_b_id, &msg);
+			check_added_monitors(&nodes[0], 1);
+		},
+		_ => panic!("Unexpected event"),
+	}
+	if acceptor_sent_channel_ready {
+		match &bs_signed_locked[1] {
+			MessageSendEvent::SendChannelReady { msg, .. } => {
+				nodes[0].node.handle_channel_ready(node_b_id, &msg);
+			},
+			_ => panic!("Unexpected event"),
+		}
+	}
+	if outbound {
+		assert!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty());
+		assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+		assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+	} else {
+		expect_channel_pending_event(&nodes[0], &node_b_id);
+		assert!(!nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty());
+		if use_0conf {
+			let as_ready = get_event_msg!(nodes[0], MessageSendEvent::SendChannelReady, node_b_id);
+			nodes[1].node.handle_channel_ready(node_a_id, &as_ready);
+		}
+		assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
+	}
+
+	// Serialize the paused manager, then reload it with the monitor that `watch_channel` already
+	// holds in memory. That is the "write completed, completion never delivered" crash window.
+	// Completion is intentionally not delivered via `channel_monitor_updated`.
+	let stuck = if outbound { 0 } else { 1 };
+	let channel_id = nodes[stuck].node.list_channels()[0].channel_id;
+	let mon = get_monitor!(nodes[stuck], channel_id).encode();
+	let node_ser = nodes[stuck].node.encode();
+
+	// `load_existing_monitor` re-registers watches. Drop the pre-reload registrations so the
+	// framework's monitor/watch consistency check sees only the reloaded set.
+	nodes[stuck].chain_source.watched_txn.lock().unwrap().clear();
+	nodes[stuck].chain_source.watched_outputs.lock().unwrap().clear();
+
+	let mons = &[&mon[..]];
+	reload_node!(
+		nodes[stuck],
+		&node_ser,
+		mons,
+		persister,
+		new_chain_monitor,
+		node_reload,
+		Some(reconstruct)
+	);
+
+	assert_eq!(
+		nodes[stuck].node.list_channels().len(),
+		1,
+		"the initial monitor was loaded, so the channel must not be dropped"
+	);
+	let events = nodes[stuck].node.get_and_clear_pending_events();
+	assert!(
+		matches!(events.first(), Some(Event::ChannelPending { .. })),
+		"reloaded with a durable initial monitor but the channel did not resume; events={events:?}"
+	);
+	if outbound {
+		assert!(
+			!nodes[stuck].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty(),
+			"funder did not broadcast the funding transaction after reload"
+		);
+	}
+}
+
+#[test]
+fn test_outbound_reload_with_completed_init_mon() {
+	do_test_reload_with_completed_init_mon(true, false, false);
+}
+
+#[test]
+fn test_outbound_reload_with_completed_init_mon_rebuild() {
+	do_test_reload_with_completed_init_mon(true, false, true);
+}
+
+#[test]
+fn test_inbound_reload_with_completed_init_mon() {
+	do_test_reload_with_completed_init_mon(false, false, false);
+}
+
+#[test]
+fn test_inbound_reload_with_completed_init_mon_rebuild() {
+	do_test_reload_with_completed_init_mon(false, false, true);
+}
+
+#[test]
+fn test_inbound_0conf_reload_with_completed_init_mon() {
+	do_test_reload_with_completed_init_mon(false, true, false);
+}
+
+#[test]
+fn test_inbound_0conf_reload_with_completed_init_mon_rebuild() {
+	do_test_reload_with_completed_init_mon(false, true, true);
+}
+
 #[derive(PartialEq, Eq)]
 enum BlockedUpdateComplMode {
 	Async,
