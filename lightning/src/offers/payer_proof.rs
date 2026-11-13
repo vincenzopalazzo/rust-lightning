@@ -35,7 +35,7 @@ use crate::offers::invoice_request::{
 use crate::offers::merkle::{self, SignError, TaggedHash, TlvRecord, TlvStream, SIGNATURE_TYPES};
 use crate::offers::offer::{
 	ExperimentalOfferTlvStream, OfferTlvStream, EXPERIMENTAL_OFFER_TYPES, OFFER_DESCRIPTION_TYPE,
-	OFFER_ISSUER_TYPE,
+	OFFER_ISSUER_TYPE, OFFER_PAYMENT_TOKEN_TYPE,
 };
 use crate::offers::parse::{Bech32Encode, Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
 use crate::offers::payer::PAYER_METADATA_TYPE;
@@ -380,6 +380,15 @@ impl<S: SigningPubkeyStrategy> PayerProofBuilder<S> {
 		self
 	}
 
+	/// Include the `payment_token` of a point-of-sale per-order offer in the proof, as a
+	/// point-of-sale device requires to check it, per [bLIP 56].
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn include_payment_token(mut self) -> Self {
+		self.included_types.insert(OFFER_PAYMENT_TOKEN_TYPE);
+		self
+	}
+
 	/// Include the invoice creation timestamp in the proof.
 	pub fn include_invoice_created_at(mut self) -> Self {
 		self.included_types.insert(INVOICE_CREATED_AT_TYPE);
@@ -665,6 +674,16 @@ impl PayerProof {
 	/// The issuer's signing public key (the key that signed the invoice).
 	pub fn issuer_signing_pubkey(&self) -> PublicKey {
 		self.contents.issuer_signing_pubkey
+	}
+
+	/// The `payment_token` of the paid point-of-sale per-order offer, as defined by [bLIP 56], if
+	/// the proof discloses it. The value is returned exactly as it appears in the invoice.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn payment_token(&self) -> Option<&[u8]> {
+		TlvStream::new(&self.bytes)
+			.find(|record| record.r#type == OFFER_PAYMENT_TOKEN_TYPE)
+			.map(|record| record.value_bytes)
 	}
 
 	/// The payment hash.
