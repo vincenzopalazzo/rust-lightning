@@ -28,3 +28,4 @@ mod functional_tests;
 pub mod messenger;
 pub mod offers;
 pub mod packet;
+pub mod pos_notification;
