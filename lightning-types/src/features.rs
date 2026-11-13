@@ -83,6 +83,9 @@
 //!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
 //! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
+//! - `PaymentNotifications` - supports delivering payment notifications for point-of-sale offers
+//!   (see [bLIP 56](https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md)
+//!   for more information).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -235,7 +238,76 @@ mod sealed {
 		// Byte 7
 		Trampoline,
 	]);
-	define_context!(OfferContext, []);
+	define_context!(OfferContext, [
+		// Byte 0
+		,
+		// Byte 1
+		,
+		// Byte 2
+		,
+		// Byte 3
+		,
+		// Byte 4
+		,
+		// Byte 5
+		,
+		// Byte 6
+		,
+		// Byte 7
+		,
+		// Byte 8
+		,
+		// Byte 9
+		,
+		// Byte 10
+		,
+		// Byte 11
+		,
+		// Byte 12
+		,
+		// Byte 13
+		,
+		// Byte 14
+		,
+		// Byte 15
+		,
+		// Byte 16
+		,
+		// Byte 17
+		,
+		// Byte 18
+		,
+		// Byte 19
+		,
+		// Byte 20
+		,
+		// Byte 21
+		,
+		// Byte 22
+		,
+		// Byte 23
+		,
+		// Byte 24
+		,
+		// Byte 25
+		,
+		// Byte 26
+		,
+		// Byte 27
+		,
+		// Byte 28
+		,
+		// Byte 29
+		,
+		// Byte 30
+		,
+		// Byte 31
+		,
+		// Byte 32
+		,
+		// Byte 33
+		PaymentNotifications,
+	]);
 	define_context!(InvoiceRequestContext, []);
 	define_context!(Bolt12InvoiceContext, [
 		// Byte 0
@@ -761,6 +833,18 @@ mod sealed {
 		clear_dns_resolution,
 		supports_dns_resolution,
 		requires_dns_resolution
+	);
+
+	define_feature!(
+		265,
+		PaymentNotifications,
+		[OfferContext],
+		"Feature flags for point-of-sale payment notifications.",
+		set_payment_notifications_optional,
+		set_payment_notifications_required,
+		clear_payment_notifications,
+		supports_payment_notifications,
+		requires_payment_notifications
 	);
 
 	// Note: update the module-level docs when a new feature bit is added!
@@ -1390,6 +1474,23 @@ mod tests {
 		assert!(features.supports_keysend());
 		assert!(features.set_optional_feature_bit(255).is_ok());
 		assert!(features.set_required_feature_bit(256).is_err());
+	}
+
+	#[test]
+	fn payment_notifications_offer_feature() {
+		let mut features = OfferFeatures::empty();
+		assert!(!features.supports_payment_notifications());
+		assert!(!features.requires_unknown_bits());
+
+		features.set_payment_notifications_optional();
+		assert!(features.supports_payment_notifications());
+		assert!(!features.requires_payment_notifications());
+		assert!(!features.supports_unknown_bits());
+		assert_eq!(features.le_flags().len(), 34);
+		assert_eq!(features.le_flags()[33], 0b0000_0010);
+
+		features.clear_payment_notifications();
+		assert!(!features.supports_payment_notifications());
 	}
 
 	#[test]

@@ -900,6 +900,17 @@ macro_rules! invoice_accessors { ($self: ident, $contents: expr) => {
 		$contents.issuer_signing_pubkey()
 	}
 
+	/// The `payment_token` a point-of-sale device sealed into the per-order offer, copied verbatim
+	/// from the [`InvoiceRequest`].
+	///
+	/// From [`Offer::payment_token`]; `None` if the offer had none or if the invoice was created in
+	/// response to a [`Refund`].
+	///
+	/// [`Offer::payment_token`]: crate::offers::offer::Offer::payment_token
+	pub fn payment_token(&$self) -> Option<&[u8]> {
+		$contents.payment_token()
+	}
+
 	/// An unpredictable series of bytes from the payer.
 	///
 	/// From [`InvoiceRequest::payer_metadata`] or [`Refund::payer_metadata`].
@@ -1239,6 +1250,15 @@ impl InvoiceContents {
 		match self {
 			InvoiceContents::ForOffer { invoice_request, .. } => {
 				invoice_request.inner.offer.issuer_signing_pubkey()
+			},
+			InvoiceContents::ForRefund { .. } => None,
+		}
+	}
+
+	fn payment_token(&self) -> Option<&[u8]> {
+		match self {
+			InvoiceContents::ForOffer { invoice_request, .. } => {
+				invoice_request.inner.offer.payment_token()
 			},
 			InvoiceContents::ForRefund { .. } => None,
 		}
@@ -1635,7 +1655,7 @@ type FullInvoiceTlvStreamRef<'a> = (
 	InvoiceRequestTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
 	SignatureTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceRequestTlvStreamRef,
 	ExperimentalInvoiceTlvStreamRef,
 );
@@ -1679,7 +1699,7 @@ type PartialInvoiceTlvStreamRef<'a> = (
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
 	InvoiceTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceRequestTlvStreamRef,
 	ExperimentalInvoiceTlvStreamRef,
 );
@@ -2108,7 +2128,11 @@ mod tests {
 					held_htlc_available_paths: None,
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None,
+				},
 				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
@@ -2211,7 +2235,11 @@ mod tests {
 					held_htlc_available_paths: None,
 				},
 				SignatureTlvStreamRef { signature: Some(&invoice.signature()) },
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None,
+				},
 				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
 				ExperimentalInvoiceTlvStreamRef { experimental_baz: None },
 			),
@@ -2297,6 +2325,64 @@ mod tests {
 			Ok(_) => panic!("expected error"),
 			Err(e) => assert_eq!(e, Bolt12SemanticError::AlreadyExpired),
 		}
+	}
+
+	#[test]
+	fn carries_per_order_offer_records_into_invoice() {
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+
+		let notification_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![BlindedHop { blinded_node_id: pubkey(42), encrypted_payload: vec![0; 43] }],
+		);
+		let payment_token = vec![5; 120];
+		let offer = OfferBuilder::new(recipient_pubkey())
+			.build()
+			.unwrap()
+			.with_per_order_records(
+				1000,
+				"order".to_string(),
+				None,
+				vec![notification_path.clone()],
+				payment_token.clone(),
+			)
+			.unwrap();
+
+		let invoice_request = offer
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		assert_eq!(invoice_request.notification_paths(), &[notification_path.clone()]);
+		assert_eq!(invoice_request.payment_token(), Some(&payment_token[..]));
+
+		let invoice = invoice_request
+			.respond_with_no_std(payment_paths(), payment_hash(), now())
+			.unwrap()
+			.build()
+			.unwrap()
+			.sign(recipient_sign)
+			.unwrap();
+		assert_eq!(invoice.payment_token(), Some(&payment_token[..]));
+
+		let token_record = |bytes: &[u8]| {
+			TlvStream::new(bytes)
+				.find(|record| record.r#type == 1_000_000_003)
+				.map(|record| record.record_bytes.to_vec())
+		};
+		assert!(token_record(&offer.bytes).is_some());
+		assert_eq!(token_record(&invoice_request.bytes), token_record(&offer.bytes));
+		assert_eq!(token_record(&invoice.bytes), token_record(&offer.bytes));
+
+		let mut buffer = Vec::new();
+		invoice.write(&mut buffer).unwrap();
+		let parsed = Bolt12Invoice::try_from(buffer).unwrap();
+		assert_eq!(parsed.payment_token(), Some(&payment_token[..]));
 	}
 
 	#[test]

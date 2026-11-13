@@ -828,6 +828,8 @@ impl RefundContents {
 		};
 
 		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			notification_paths: None,
+			payment_token: None,
 			#[cfg(test)]
 			experimental_foo: self.experimental_foo,
 		};
@@ -877,7 +879,7 @@ type RefundTlvStreamRef<'a> = (
 	PayerTlvStreamRef<'a>,
 	OfferTlvStreamRef<'a>,
 	InvoiceRequestTlvStreamRef<'a>,
-	ExperimentalOfferTlvStreamRef,
+	ExperimentalOfferTlvStreamRef<'a>,
 	ExperimentalInvoiceRequestTlvStreamRef,
 );
 
@@ -947,6 +949,8 @@ impl TryFrom<RefundTlvStream> for RefundContents {
 				offer_from_hrn,
 			},
 			ExperimentalOfferTlvStream {
+				notification_paths: _,
+				payment_token: _,
 				#[cfg(test)]
 				experimental_foo,
 			},
@@ -1136,7 +1140,11 @@ mod tests {
 					paths: None,
 					offer_from_hrn: None,
 				},
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None,
+				},
 				ExperimentalInvoiceRequestTlvStreamRef { experimental_bar: None },
 			),
 		);
