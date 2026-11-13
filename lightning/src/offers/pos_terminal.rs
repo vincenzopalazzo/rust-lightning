@@ -32,6 +32,7 @@ use crate::io;
 use crate::ln::msgs::{DecodeError, MAX_VALUE_MSAT};
 use crate::offers::offer::{Offer, Quantity};
 use crate::offers::parse::Bolt12ParseError;
+use crate::offers::payer_proof::PayerProof;
 use crate::offers::payment_token::{payment_token_hash, SealedOrder};
 use crate::onion_message::messenger::{Responder, ResponseInstruction};
 use crate::onion_message::pos_notification::{
@@ -337,6 +338,45 @@ pub fn check_notification(
 	NotificationCheck::Accepted { settles_order, additional_payment: !settles_order }
 }
 
+/// Checks a customer's payer proof against the order whose `notification_path` it arrived over,
+/// as the draft requires of the point-of-sale device, at time `now` (since the Unix epoch).
+///
+/// The proof must already have been parsed, which verifies its signatures and that its preimage
+/// matches its payment hash. It is accepted only if it is signed by the order's issuer key, never
+/// one taken from the proof alone, discloses exactly the `payment_token` the device sealed for the
+/// order, and discloses an invoice amount of at least the order's. Expiry applies as for
+/// notifications. Returns `None` if the proof is not accepted.
+pub fn check_payment_proof(
+	order: &PosOrder, proof: &PayerProof, now: Duration, expiry_grace_period: Duration,
+) -> Option<NotificationCheck> {
+	if proof.issuer_signing_pubkey() != order.issuer_id {
+		return None;
+	}
+	if proof.payment_token() != Some(&order.payment_token[..]) {
+		return None;
+	}
+	if proof.invoice_amount_msats()? < order.amount_msats {
+		return None;
+	}
+
+	let payment_hash = proof.payment_hash();
+	let is_known_payment = |payment: &PosOrderPayment| payment.payment_hash == payment_hash;
+	if let Some(payment) = &order.payment {
+		if is_known_payment(payment) || order.additional_payments.iter().any(is_known_payment) {
+			let settles_order = false;
+			let additional_payment = false;
+			return Some(NotificationCheck::Accepted { settles_order, additional_payment });
+		}
+	} else if let Some(expiry) = order.absolute_expiry {
+		if now > expiry + expiry_grace_period {
+			return None;
+		}
+	}
+
+	let settles_order = order.payment.is_none();
+	Some(NotificationCheck::Accepted { settles_order, additional_payment: !settles_order })
+}
+
 /// Checks that `template` can be used to build per-order offers on `chain_hash`.
 pub fn check_template(template: &Offer, chain_hash: ChainHash) -> Result<(), PosTemplateError> {
 	if !template.offer_features().supports_payment_notifications() {
@@ -550,27 +590,16 @@ impl<ES: EntropySource, NS: NodeSigner, L: Logger> PosTerminal<ES, NS, L> {
 			},
 		};
 
-		{
-			let mut failed_checks = self.failed_signature_checks.lock().unwrap();
-			if let Some((window_start, failures)) = failed_checks.get(&order_id) {
-				let window_open = now < *window_start + SIGNATURE_CHECK_WINDOW;
-				if window_open && *failures >= MAX_FAILED_SIGNATURE_CHECKS {
-					log_trace!(logger, "Not verifying payment notification: budget exhausted");
-					return None;
-				}
-				if !window_open {
-					failed_checks.remove(&order_id);
-				}
-			}
+		if self.signature_budget_exhausted(order_id, now) {
+			log_trace!(logger, "Not verifying payment notification: budget exhausted");
+			return None;
 		}
 
 		let expiry_grace_period = self.config.expiry_grace_period;
 		match check_notification(order, &notification, now, expiry_grace_period) {
 			NotificationCheck::Unattributable => {
 				log_debug!(logger, "Ignoring payment notification with an invalid signature");
-				let mut failed_checks = self.failed_signature_checks.lock().unwrap();
-				let entry = failed_checks.entry(order_id).or_insert((now, 0));
-				entry.1 += 1;
+				self.record_failed_signature_check(order_id, now);
 				None
 			},
 			NotificationCheck::Refused(reason) => {
@@ -583,29 +612,104 @@ impl<ES: EntropySource, NS: NodeSigner, L: Logger> PosTerminal<ES, NS, L> {
 				}))
 			},
 			NotificationCheck::Accepted { settles_order, additional_payment } => {
-				let amount_msats = notification.amount_msats();
 				let payment = PosOrderPayment {
 					payment_hash,
 					preimage: notification.preimage(),
-					amount_msats,
+					amount_msats: notification.amount_msats(),
 					accepted_at: now,
 					notification: Some(notification.bytes().to_vec()),
 				};
-				if settles_order {
-					log_info!(logger, "Order paid");
-					order.payment = Some(payment);
-					let event = PosEvent::OrderPaid { order_id, payment_hash, amount_msats };
-					self.pending_events.lock().unwrap().push(event);
-				} else if additional_payment {
-					log_info!(logger, "Order paid again by a different payment");
-					order.additional_payments.push(payment);
-					let event =
-						PosEvent::AdditionalPayment { order_id, payment_hash, amount_msats };
-					self.pending_events.lock().unwrap().push(event);
-				}
+				self.record_payment(order, payment, settles_order, additional_payment);
 				Some(PosNotificationMessage::NotificationAck(NotificationAck { payment_hash }))
 			},
 		}
+	}
+
+	/// Processes a customer's payment proof that arrived over the `notification_path` of
+	/// `order_id`, at time `now`. Returns whether it was accepted. Proofs are never answered.
+	fn process_payment_proof(
+		&self, proof: PaymentProof, order_id: PosOrderId, now: Duration,
+	) -> bool {
+		let mut orders = self.orders.lock().unwrap();
+		let order = match orders.get_mut(&order_id) {
+			Some(order) => order,
+			None => return false,
+		};
+
+		// Parsing verifies two signatures, so it shares the order's budget with notifications.
+		if self.signature_budget_exhausted(order_id, now) {
+			log_trace!(self.logger, "Not verifying payment proof: budget exhausted");
+			return false;
+		}
+		let proof = match proof.parse() {
+			Ok(proof) => proof,
+			Err(e) => {
+				log_debug!(self.logger, "Ignoring invalid payment proof: {:?}", e);
+				self.record_failed_signature_check(order_id, now);
+				return false;
+			},
+		};
+
+		let expiry_grace_period = self.config.expiry_grace_period;
+		match check_payment_proof(order, &proof, now, expiry_grace_period) {
+			Some(NotificationCheck::Accepted { settles_order, additional_payment }) => {
+				let amount_msats =
+					proof.invoice_amount_msats().expect("checked by check_payment_proof");
+				let payment = PosOrderPayment {
+					payment_hash: proof.payment_hash(),
+					preimage: proof.payment_preimage(),
+					amount_msats,
+					accepted_at: now,
+					notification: None,
+				};
+				self.record_payment(order, payment, settles_order, additional_payment);
+				true
+			},
+			_ => {
+				log_debug!(self.logger, "Ignoring payment proof that is not for this order");
+				self.record_failed_signature_check(order_id, now);
+				false
+			},
+		}
+	}
+
+	/// Records an accepted payment for `order` and reports it.
+	fn record_payment(
+		&self, order: &mut PosOrder, payment: PosOrderPayment, settles_order: bool,
+		additional_payment: bool,
+	) {
+		let (order_id, payment_hash, amount_msats) =
+			(order.order_id, payment.payment_hash, payment.amount_msats);
+		let logger = WithContext::from(&self.logger, None, None, Some(payment_hash));
+		if settles_order {
+			log_info!(logger, "Order paid");
+			order.payment = Some(payment);
+			let event = PosEvent::OrderPaid { order_id, payment_hash, amount_msats };
+			self.pending_events.lock().unwrap().push(event);
+		} else if additional_payment {
+			log_info!(logger, "Order paid again by a different payment");
+			order.additional_payments.push(payment);
+			let event = PosEvent::AdditionalPayment { order_id, payment_hash, amount_msats };
+			self.pending_events.lock().unwrap().push(event);
+		}
+	}
+
+	/// Whether the order's budget of failed signature checks is used up for the current window.
+	fn signature_budget_exhausted(&self, order_id: PosOrderId, now: Duration) -> bool {
+		let mut failed_checks = self.failed_signature_checks.lock().unwrap();
+		match failed_checks.get(&order_id) {
+			Some((window_start, _)) if now >= *window_start + SIGNATURE_CHECK_WINDOW => {
+				failed_checks.remove(&order_id);
+				false
+			},
+			Some((_, failures)) => *failures >= MAX_FAILED_SIGNATURE_CHECKS,
+			None => false,
+		}
+	}
+
+	fn record_failed_signature_check(&self, order_id: PosOrderId, now: Duration) {
+		let mut failed_checks = self.failed_signature_checks.lock().unwrap();
+		failed_checks.entry(order_id).or_insert((now, 0)).1 += 1;
 	}
 }
 
@@ -635,8 +739,12 @@ impl<ES: EntropySource, NS: NodeSigner, L: Logger> PosNotificationMessageHandler
 	) {
 	}
 
-	fn handle_payment_proof(&self, _message: PaymentProof, _context: PosNotificationContext) {
-		log_trace!(self.logger, "Ignoring payment proof: not supported yet");
+	fn handle_payment_proof(&self, message: PaymentProof, context: PosNotificationContext) {
+		let order_id = match context {
+			PosNotificationContext::NotificationPath { order_id } => PosOrderId(order_id),
+			PosNotificationContext::ReplyPath { .. } => return,
+		};
+		self.process_payment_proof(message, order_id, self.duration_since_epoch());
 	}
 }
 

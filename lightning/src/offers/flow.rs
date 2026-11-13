@@ -47,6 +47,7 @@ use crate::offers::invoice_request::{
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Amount, DerivedMetadata, Offer, OfferBuilder};
 use crate::offers::parse::Bolt12SemanticError;
+use crate::offers::payer_proof::PayerProof;
 use crate::offers::payment_notification::UnsignedPaymentNotification;
 use crate::offers::pos_merchant::{
 	check_pos_invoice_request, payment_notification_retry_ticks, PaymentNotificationOutcome,
@@ -64,7 +65,7 @@ use crate::onion_message::messenger::{
 };
 use crate::onion_message::offers::OffersMessage;
 use crate::onion_message::packet::OnionMessageContents;
-use crate::onion_message::pos_notification::{NackReason, PosNotificationMessage};
+use crate::onion_message::pos_notification::{NackReason, PaymentProof, PosNotificationMessage};
 use crate::routing::router::Router;
 use crate::sign::{EntropySource, ReceiveAuthKey};
 use crate::sync::{Mutex, RwLock};
@@ -1526,6 +1527,18 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		};
 		pending.remove(index);
 		Some(outcome)
+	}
+
+	/// Queues a customer's payer proof for a point-of-sale per-order offer, as defined by
+	/// [bLIP 56], to be sent to the device that built the offer over `notification_path`, one of
+	/// the offer's notification paths.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn enqueue_payment_proof(&self, proof: &PayerProof, notification_path: BlindedMessagePath) {
+		let message = PosNotificationMessage::PaymentProof(PaymentProof::new(proof));
+		let destination = Destination::BlindedPath(notification_path);
+		let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+		self.pending_pos_notification_messages.lock().unwrap().push((message, instructions));
 	}
 
 	/// Releases the point-of-sale payment notifications that need to be sent.

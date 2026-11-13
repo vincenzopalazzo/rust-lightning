@@ -19,6 +19,7 @@ use crate::blinded_path::payment::{Bolt12OfferContext, PaymentContext};
 use crate::blinded_path::BlindedHop;
 use crate::blinded_path::EmptyNodeIdLookUp;
 use crate::events::Event;
+use crate::events::PaidBolt12Invoice;
 use crate::ln::channelmanager::PaymentId;
 use crate::ln::functional_test_utils::*;
 use crate::ln::msgs::Init;
@@ -29,6 +30,7 @@ use crate::offers::invoice::Bolt12Invoice;
 use crate::offers::invoice_request::{InvoiceRequest, PayerFields};
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Offer, Quantity};
+use crate::offers::payer_proof::PayerProof;
 use crate::offers::payment_notification::PaymentNotification;
 use crate::offers::payment_token::{payment_token_hash, SealedOrder};
 use crate::offers::pos_merchant::PosPaymentData;
@@ -37,6 +39,7 @@ use crate::offers::pos_terminal::{PosConfig, PosEvent, PosTerminal};
 use crate::onion_message::messenger::{DefaultMessageRouter, OnionMessenger};
 use crate::onion_message::messenger::{Destination, MessageSendInstructions, PeeledOnion};
 use crate::onion_message::offers::OffersMessage;
+use crate::onion_message::pos_notification::PaymentProof;
 use crate::onion_message::pos_notification::{
 	NackReason, NotificationAck, NotificationNack, PosNotificationMessage,
 };
@@ -44,6 +47,7 @@ use crate::routing::gossip::NetworkGraph;
 use crate::sign::NodeSigner;
 use crate::types::features::InitFeatures;
 use crate::types::payment::PaymentHash;
+use crate::types::payment::PaymentPreimage;
 use crate::util::ser::{ReadableArgs, Writeable};
 use crate::util::test_utils::{TestKeysInterface, TestLogger};
 
@@ -613,6 +617,23 @@ fn deliver_notification<'a, 'b, 'c>(
 	merchant.onion_messenger.handle_onion_message(pos_id, &answer);
 }
 
+/// Sets up a point-of-sale device connected to `$merchant`: keys, a [`PosTerminal`] and its
+/// [`PosMessenger`], bound to the given names.
+macro_rules! point_of_sale {
+	($merchant: expr, $keys: ident, $logger: ident, $graph: ident, $terminal: ident,
+	 $messenger: ident, $pos_id: ident) => {
+		let $keys = TestKeysInterface::new(&[9; 32], Network::Testnet);
+		let $logger = TestLogger::with_id("pos".to_string());
+		let $graph = NetworkGraph::new(Network::Testnet, &$logger);
+		let chain = ChainHash::using_genesis_block(Network::Testnet);
+		let config = PosConfig::new(chain, Some($merchant.node.get_our_node_id()));
+		let $terminal = PosTerminal::new(&$keys, &$keys, &$logger, config);
+		let $messenger = pos_messenger(&$keys, &$logger, &$graph, &$terminal);
+		let $pos_id = $keys.get_node_id(crate::sign::Recipient::Node).unwrap();
+		connect_pos(&$messenger, $pos_id, $merchant);
+	};
+}
+
 #[test]
 fn point_of_sale_terminal_settles_paid_order() {
 	let chanmon_cfgs = create_chanmon_cfgs(2);
@@ -621,21 +642,8 @@ fn point_of_sale_terminal_settles_paid_order() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
 	let (customer, merchant) = (&nodes[0], &nodes[1]);
-	let merchant_id = merchant.node.get_our_node_id();
 
-	let pos_keys = TestKeysInterface::new(&[9; 32], Network::Testnet);
-	let pos_logger = TestLogger::with_id("pos".to_string());
-	let pos_graph = NetworkGraph::new(Network::Testnet, &pos_logger);
-	let chain = ChainHash::using_genesis_block(Network::Testnet);
-	let terminal = PosTerminal::new(
-		&pos_keys,
-		&pos_keys,
-		&pos_logger,
-		PosConfig::new(chain, Some(merchant_id)),
-	);
-	let pos = pos_messenger(&pos_keys, &pos_logger, &pos_graph, &terminal);
-	let pos_id = pos_keys.get_node_id(crate::sign::Recipient::Node).unwrap();
-	connect_pos(&pos, pos_id, merchant);
+	point_of_sale!(merchant, pos_keys, pos_logger, pos_graph, terminal, pos, pos_id);
 
 	// The merchant hands its template to the device, which shows the customer a per-order offer.
 	let template = merchant.node.create_pos_offer_template().unwrap();
@@ -676,21 +684,8 @@ fn point_of_sale_terminal_refuses_resealed_offer() {
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
 	let (customer, merchant) = (&nodes[0], &nodes[1]);
-	let merchant_id = merchant.node.get_our_node_id();
 
-	let pos_keys = TestKeysInterface::new(&[9; 32], Network::Testnet);
-	let pos_logger = TestLogger::with_id("pos".to_string());
-	let pos_graph = NetworkGraph::new(Network::Testnet, &pos_logger);
-	let chain = ChainHash::using_genesis_block(Network::Testnet);
-	let terminal = PosTerminal::new(
-		&pos_keys,
-		&pos_keys,
-		&pos_logger,
-		PosConfig::new(chain, Some(merchant_id)),
-	);
-	let pos = pos_messenger(&pos_keys, &pos_logger, &pos_graph, &terminal);
-	let pos_id = pos_keys.get_node_id(crate::sign::Recipient::Node).unwrap();
-	connect_pos(&pos, pos_id, merchant);
+	point_of_sale!(merchant, pos_keys, pos_logger, pos_graph, terminal, pos, pos_id);
 
 	let template = merchant.node.create_pos_offer_template().unwrap();
 	let (order_id, offer) =
@@ -770,4 +765,132 @@ fn point_of_sale_terminal_settles_order_after_restart() {
 		resolved_notifications(merchant),
 		vec![(invoice.payment_hash(), PaymentNotificationOutcome::Acknowledged)]
 	);
+}
+
+/// The customer's payer proof for `invoice`, disclosing what a point-of-sale device needs to check
+/// it, or not disclosing the payment token if `include_payment_token` is false.
+fn customer_payment_proof<'a, 'b, 'c>(
+	customer: &Node<'a, 'b, 'c>, invoice: &Bolt12Invoice, preimage: PaymentPreimage,
+	payment_id: PaymentId, include_payment_token: bool,
+) -> PayerProof {
+	let expanded_key = customer.keys_manager.get_expanded_key();
+	let builder = PaidBolt12Invoice::Bolt12Invoice(invoice.clone())
+		.prove_payer_derived(preimage, &expanded_key, payment_id, &Secp256k1::new())
+		.unwrap()
+		.include_invoice_amount();
+	let builder = if include_payment_token { builder.include_payment_token() } else { builder };
+	builder.build_and_sign().unwrap()
+}
+
+/// Takes the notification `merchant` sends to the device without delivering it, as if it were
+/// lost, returning its preimage.
+fn lose_notification<'a, 'b, 'c>(
+	merchant: &Node<'a, 'b, 'c>, pos: &PosMessenger, pos_id: PublicKey,
+) -> PaymentPreimage {
+	let message = merchant.onion_messenger.next_onion_message_for_peer(pos_id).unwrap();
+	match pos.peel_onion_message(&message) {
+		Ok(PeeledOnion::PosNotification(
+			PosNotificationMessage::PaymentNotification(notification),
+			_,
+			_,
+		)) => notification.preimage(),
+		_ => panic!("Unexpected onion message"),
+	}
+}
+
+/// Delivers a payment proof the customer queued to the device, through the merchant, which
+/// introduces the device's notification paths.
+fn deliver_proof<'a, 'b, 'c>(
+	customer: &Node<'a, 'b, 'c>, merchant: &Node<'a, 'b, 'c>, pos: &PosMessenger, pos_id: PublicKey,
+) {
+	let merchant_id = merchant.node.get_our_node_id();
+	let message = customer.onion_messenger.next_onion_message_for_peer(merchant_id).unwrap();
+	merchant.onion_messenger.handle_onion_message(customer.node.get_our_node_id(), &message);
+	let message = merchant.onion_messenger.next_onion_message_for_peer(pos_id).unwrap();
+	pos.handle_onion_message(merchant_id, &message);
+}
+
+#[test]
+fn point_of_sale_terminal_accepts_payment_proof() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+	let (customer, merchant) = (&nodes[0], &nodes[1]);
+	point_of_sale!(merchant, pos_keys, pos_logger, pos_graph, terminal, pos, pos_id);
+
+	let template = merchant.node.create_pos_offer_template().unwrap();
+	let (order_id, offer) =
+		terminal.create_order(&template, 5_000_000, "espresso".to_string(), None).unwrap();
+	let payment_id = PaymentId([1; 32]);
+	let path = offer.notification_paths()[0].clone();
+	let invoice = pay_and_claim(customer, merchant, &template, &offer, path, payment_id);
+	let payment_hash = invoice.payment_hash();
+
+	// The merchant's notification never arrives, but the customer proves the payment themselves.
+	let preimage = lose_notification(merchant, &pos, pos_id);
+	let proof = customer_payment_proof(customer, &invoice, preimage, payment_id, true);
+	customer.node.send_pos_payment_proof(&proof, &offer).unwrap();
+	deliver_proof(customer, merchant, &pos, pos_id);
+
+	let events = terminal.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	assert!(matches!(
+		&events[0],
+		PosEvent::OrderPaid { order_id: paid, payment_hash: hash, amount_msats: 5_000_000 }
+			if *paid == order_id && *hash == payment_hash
+	));
+	let payment = terminal.order(&order_id).unwrap().payment.unwrap();
+	assert_eq!(payment.payment_hash, payment_hash);
+	assert_eq!(payment.notification, None);
+
+	// The merchant's retry is then acknowledged as for an order already paid.
+	merchant.node.timer_tick_occurred();
+	deliver_notification(merchant, &pos, pos_id);
+	assert!(terminal.get_and_clear_pending_events().is_empty());
+	assert_eq!(
+		resolved_notifications(merchant),
+		vec![(payment_hash, PaymentNotificationOutcome::Acknowledged)]
+	);
+}
+
+#[test]
+fn point_of_sale_terminal_ignores_proof_for_another_order() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+	let (customer, merchant) = (&nodes[0], &nodes[1]);
+	point_of_sale!(merchant, pos_keys, pos_logger, pos_graph, terminal, pos, pos_id);
+
+	// Two orders at the same price; only the first is paid.
+	let template = merchant.node.create_pos_offer_template().unwrap();
+	let (paid_id, paid) =
+		terminal.create_order(&template, 5_000_000, "espresso".to_string(), None).unwrap();
+	let (unpaid_id, unpaid) =
+		terminal.create_order(&template, 5_000_000, "espresso".to_string(), None).unwrap();
+	let payment_id = PaymentId([1; 32]);
+	let path = paid.notification_paths()[0].clone();
+	let invoice = pay_and_claim(customer, merchant, &template, &paid, path, payment_id);
+	deliver_notification(merchant, &pos, pos_id);
+	terminal.get_and_clear_pending_events();
+	resolved_notifications(merchant);
+	let preimage = terminal.order(&paid_id).unwrap().payment.unwrap().preimage;
+
+	// A proof must disclose the token, and is only sent for the offer it proves.
+	let proof = customer_payment_proof(customer, &invoice, preimage, payment_id, false);
+	assert!(customer.node.send_pos_payment_proof(&proof, &paid).is_err());
+	let proof = customer_payment_proof(customer, &invoice, preimage, payment_id, true);
+	assert!(customer.node.send_pos_payment_proof(&proof, &unpaid).is_err());
+
+	// Sent down the unpaid order's path anyway, the device does not take it for that order.
+	let destination = Destination::BlindedPath(unpaid.notification_paths()[0].clone());
+	let message = PosNotificationMessage::PaymentProof(PaymentProof::new(&proof));
+	let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+	customer.onion_messenger.send_onion_message(message, instructions).unwrap();
+	deliver_proof(customer, merchant, &pos, pos_id);
+	assert!(terminal.get_and_clear_pending_events().is_empty());
+	assert!(terminal.order(&unpaid_id).unwrap().payment.is_none());
 }

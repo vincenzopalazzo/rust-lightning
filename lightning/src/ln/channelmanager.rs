@@ -104,6 +104,7 @@ use crate::offers::invoice_request::{InvoiceRequest, InvoiceRequestVerifiedFromO
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Offer, OfferFromHrn};
 use crate::offers::parse::Bolt12SemanticError;
+use crate::offers::payer_proof::PayerProof;
 use crate::offers::pos_merchant::{PendingPaymentNotification, PosPaymentData};
 use crate::offers::refund::Refund;
 use crate::offers::static_invoice::StaticInvoice;
@@ -15925,6 +15926,30 @@ impl<
 	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
 	pub fn create_pos_offer_template(&self) -> Result<Offer, Bolt12SemanticError> {
 		self.flow.create_pos_offer_template(&self.entropy_source, self.get_peers_for_blinded_path())
+	}
+
+	/// Sends a payer proof for a paid point-of-sale per-order offer, as defined by [bLIP 56], to the
+	/// point-of-sale device that built the offer, over the offer's notification path. The device
+	/// then learns of the payment even if the merchant's notification never reaches it.
+	///
+	/// The proof must disclose the offer's `payment_token` and the invoice amount, as built using
+	/// [`PayerProofBuilder::include_payment_token`] and
+	/// [`PayerProofBuilder::include_invoice_amount`]; the device rejects any other.
+	///
+	/// Errors if `offer` has no notification path or payment token, or if `proof` does not
+	/// disclose that payment token and an invoice amount.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	/// [`PayerProofBuilder::include_payment_token`]: crate::offers::payer_proof::PayerProofBuilder::include_payment_token
+	/// [`PayerProofBuilder::include_invoice_amount`]: crate::offers::payer_proof::PayerProofBuilder::include_invoice_amount
+	pub fn send_pos_payment_proof(&self, proof: &PayerProof, offer: &Offer) -> Result<(), ()> {
+		let payment_token = offer.payment_token().ok_or(())?;
+		if proof.payment_token() != Some(payment_token) || proof.invoice_amount_msats().is_none() {
+			return Err(());
+		}
+		let notification_path = offer.notification_paths().first().ok_or(())?;
+		self.flow.enqueue_payment_proof(proof, notification_path.clone());
+		Ok(())
 	}
 
 	/// Pays for an [`Offer`] using the given parameters by creating an [`InvoiceRequest`] and
