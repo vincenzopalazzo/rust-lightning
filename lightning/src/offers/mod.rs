@@ -29,6 +29,7 @@ pub mod payer_proof;
 pub mod payment_notification;
 pub mod payment_token;
 pub mod pos_merchant;
+pub mod pos_terminal;
 pub mod refund;
 pub mod selective_disclosure;
 pub(crate) mod signer;
