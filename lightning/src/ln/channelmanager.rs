@@ -18369,8 +18369,11 @@ impl<
 						None
 					};
 
-				let invoice_request = match self.flow.verify_invoice_request(invoice_request, context) {
-					Ok(InvreqResponseInstructions::SendInvoice(invoice_request)) => invoice_request,
+				let (invoice_request, payment_metadata) = match self.flow.verify_invoice_request(invoice_request, context) {
+					Ok(InvreqResponseInstructions::SendInvoice(invoice_request)) => (invoice_request, payment_metadata),
+					Ok(InvreqResponseInstructions::SendPosInvoice { invoice_request, payment_metadata }) => {
+						(InvoiceRequestVerifiedFromOffer::DerivedKeys(invoice_request), Some(payment_metadata))
+					},
 					Ok(InvreqResponseInstructions::SendStaticInvoice { recipient_id, invoice_slot, invoice_request }) => {
 						self.pending_events.lock().unwrap().push_back((Event::StaticInvoiceRequested {
 							recipient_id, invoice_slot, reply_path: responder, invoice_request,

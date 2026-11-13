@@ -46,6 +46,7 @@ use crate::offers::invoice_request::{
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Amount, DerivedMetadata, Offer, OfferBuilder};
 use crate::offers::parse::Bolt12SemanticError;
+use crate::offers::pos_merchant::check_pos_invoice_request;
 use crate::offers::refund::{Refund, RefundBuilder};
 use crate::offers::signer;
 use crate::offers::static_invoice::{StaticInvoice, StaticInvoiceBuilder};
@@ -396,6 +397,20 @@ pub enum InvreqResponseInstructions {
 	/// We are the recipient of this payment, and a [`Bolt12Invoice`] should be sent in response to
 	/// the invoice request since it is now verified.
 	SendInvoice(InvoiceRequestVerifiedFromOffer),
+	/// We are the merchant for a point-of-sale per-order offer, as defined by [bLIP 56], and the
+	/// request passed the checks against the order sealed into it. A [`Bolt12Invoice`] should be
+	/// sent in response, with `payment_metadata` in its payment paths so that the point-of-sale
+	/// device can be notified once the payment settles.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	SendPosInvoice {
+		/// The verified invoice request, to be responded to using the template's keys.
+		invoice_request: VerifiedInvoiceRequest<DerivedSigningPubkey>,
+		/// The [`PosPaymentData`] to embed in the invoice's payment paths.
+		///
+		/// [`PosPaymentData`]: crate::offers::pos_merchant::PosPaymentData
+		payment_metadata: BTreeMap<u64, Vec<u8>>,
+	},
 	/// We are a static invoice server and should respond to this invoice request by retrieving the
 	/// [`StaticInvoice`] corresponding to the `recipient_id` and `invoice_slot` and calling
 	/// [`OffersMessageFlow::enqueue_static_invoice`].
@@ -456,6 +471,23 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		let nonce = match context {
 			None if invoice_request.metadata().is_some() => None,
 			Some(OffersContext::InvoiceRequest { nonce, payment_metadata: _ }) => Some(nonce),
+			Some(OffersContext::PosTemplateInvoiceRequest { nonce }) => {
+				let invoice_request =
+					invoice_request.verify_for_pos_template(nonce, expanded_key)?;
+				let payment_data = check_pos_invoice_request(
+					&invoice_request.inner,
+					nonce,
+					&invoice_request.keys.0.secret_key(),
+					self.chain_hash,
+				)
+				.map_err(|e| {
+					log_trace!(self.logger, "Invalid point-of-sale invoice request: {:?}", e);
+				})?;
+				return Ok(InvreqResponseInstructions::SendPosInvoice {
+					invoice_request,
+					payment_metadata: payment_data.to_payment_metadata(),
+				});
+			},
 			Some(OffersContext::StaticInvoiceRequested {
 				recipient_id,
 				invoice_slot,
