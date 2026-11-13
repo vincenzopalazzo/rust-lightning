@@ -439,6 +439,20 @@ pub enum OffersContext {
 		/// [`Bolt11Invoice::payment_metadata`]: lightning_invoice::Bolt11Invoice::payment_metadata
 		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>,
 	},
+	/// Context used by a [`BlindedMessagePath`] within a point-of-sale offer template, as defined by
+	/// [bLIP 56].
+	///
+	/// This variant is received when handling an [`InvoiceRequest`] for a per-order offer a
+	/// point-of-sale device built from the template. The device changes the offer's records, so the
+	/// request cannot be authenticated by the offer's metadata; instead, the template's signing keys
+	/// are derived from the nonce alone and must match the offer's issuer id.
+	///
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	PosTemplateInvoiceRequest {
+		/// The nonce the template's signing keys are derived from.
+		nonce: Nonce,
+	},
 	/// Context used by a [`BlindedMessagePath`] within the [`Offer`] of an async recipient.
 	///
 	/// This variant is received by the static invoice server when handling an [`InvoiceRequest`] on
@@ -715,6 +729,9 @@ impl_ser_tlv_based_enum!(OffersContext,
 	},
 	(4, OutboundPaymentForOffer) => {
 		(0, payment_id, required),
+	},
+	(5, PosTemplateInvoiceRequest) => {
+		(0, nonce, required),
 	},
 );
 

@@ -192,6 +192,19 @@ impl NackReason {
 	}
 }
 
+impl Writeable for NackReason {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.to_code().write(w)
+	}
+}
+
+impl crate::util::ser::Readable for NackReason {
+	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
+		let code: u8 = crate::util::ser::Readable::read(r)?;
+		Ok(Self::from_code(code))
+	}
+}
+
 /// A payer proof sent by a customer to a point-of-sale device, so the device can learn of a
 /// payment independently of the merchant.
 ///

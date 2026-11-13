@@ -21,6 +21,7 @@ use bitcoin::secp256k1::{self, PublicKey, Secp256k1};
 
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext,
+	PosNotificationContext,
 };
 use crate::blinded_path::payment::{
 	AsyncBolt12OfferContext, BlindedPaymentPath, Bolt12OfferContext, Bolt12RefundContext,
@@ -46,7 +47,13 @@ use crate::offers::invoice_request::{
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Amount, DerivedMetadata, Offer, OfferBuilder};
 use crate::offers::parse::Bolt12SemanticError;
+use crate::offers::payment_notification::UnsignedPaymentNotification;
+use crate::offers::pos_merchant::{
+	check_pos_invoice_request, payment_notification_retry_ticks, PaymentNotificationOutcome,
+	PendingPaymentNotification, PosPaymentData, MAX_PAYMENT_NOTIFICATION_ATTEMPTS,
+};
 use crate::offers::refund::{Refund, RefundBuilder};
+use crate::offers::signer;
 use crate::offers::static_invoice::{StaticInvoice, StaticInvoiceBuilder};
 use crate::onion_message::async_payments::{
 	AsyncPaymentsMessage, HeldHtlcAvailable, OfferPaths, OfferPathsRequest, ServeStaticInvoice,
@@ -57,10 +64,11 @@ use crate::onion_message::messenger::{
 };
 use crate::onion_message::offers::OffersMessage;
 use crate::onion_message::packet::OnionMessageContents;
+use crate::onion_message::pos_notification::{NackReason, PosNotificationMessage};
 use crate::routing::router::Router;
 use crate::sign::{EntropySource, ReceiveAuthKey};
 use crate::sync::{Mutex, RwLock};
-use crate::types::payment::{PaymentHash, PaymentSecret};
+use crate::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use crate::util::logger::Logger;
 use crate::util::ser::Writeable;
 
@@ -89,6 +97,10 @@ pub struct OffersMessageFlow<MR: MessageRouter, L: Logger> {
 
 	pending_async_payments_messages: Mutex<Vec<(AsyncPaymentsMessage, MessageSendInstructions)>>,
 	async_receive_offer_cache: Mutex<AsyncReceiveOfferCache>,
+
+	pending_payment_notifications: Mutex<Vec<PendingPaymentNotification>>,
+	pending_pos_notification_messages:
+		Mutex<Vec<(PosNotificationMessage, MessageSendInstructions)>>,
 
 	logger: L,
 }
@@ -119,8 +131,20 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 
 			async_receive_offer_cache: Mutex::new(AsyncReceiveOfferCache::new()),
 
+			pending_payment_notifications: Mutex::new(Vec::new()),
+			pending_pos_notification_messages: Mutex::new(Vec::new()),
+
 			logger,
 		}
+	}
+
+	/// Restores the point-of-sale payment notifications that were awaiting an answer, as returned
+	/// by [`Self::writeable_pending_payment_notifications`] before a restart.
+	pub(crate) fn with_pending_payment_notifications(
+		mut self, pending_payment_notifications: Vec<PendingPaymentNotification>,
+	) -> Self {
+		self.pending_payment_notifications = Mutex::new(pending_payment_notifications);
+		self
 	}
 
 	/// If we are an async recipient, on startup we'll interactively build offers and static invoices
@@ -395,6 +419,20 @@ pub enum InvreqResponseInstructions {
 	/// We are the recipient of this payment, and a [`Bolt12Invoice`] should be sent in response to
 	/// the invoice request since it is now verified.
 	SendInvoice(InvoiceRequestVerifiedFromOffer),
+	/// We are the merchant for a point-of-sale per-order offer, as defined by [bLIP 56], and the
+	/// request passed the checks against the order sealed into it. A [`Bolt12Invoice`] should be
+	/// sent in response, with `payment_metadata` in its payment paths so that the point-of-sale
+	/// device can be notified once the payment settles.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	SendPosInvoice {
+		/// The verified invoice request, to be responded to using the template's keys.
+		invoice_request: VerifiedInvoiceRequest<DerivedSigningPubkey>,
+		/// The [`PosPaymentData`] to embed in the invoice's payment paths.
+		///
+		/// [`PosPaymentData`]: crate::offers::pos_merchant::PosPaymentData
+		payment_metadata: BTreeMap<u64, Vec<u8>>,
+	},
 	/// We are a static invoice server and should respond to this invoice request by retrieving the
 	/// [`StaticInvoice`] corresponding to the `recipient_id` and `invoice_slot` and calling
 	/// [`OffersMessageFlow::enqueue_static_invoice`].
@@ -455,6 +493,23 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		let nonce = match context {
 			None if invoice_request.metadata().is_some() => None,
 			Some(OffersContext::InvoiceRequest { nonce, payment_metadata: _ }) => Some(nonce),
+			Some(OffersContext::PosTemplateInvoiceRequest { nonce }) => {
+				let invoice_request =
+					invoice_request.verify_for_pos_template(nonce, expanded_key)?;
+				let payment_data = check_pos_invoice_request(
+					&invoice_request.inner,
+					nonce,
+					&invoice_request.keys.0.secret_key(),
+					self.chain_hash,
+				)
+				.map_err(|e| {
+					log_trace!(self.logger, "Invalid point-of-sale invoice request: {:?}", e);
+				})?;
+				return Ok(InvreqResponseInstructions::SendPosInvoice {
+					invoice_request,
+					payment_metadata: payment_data.to_payment_metadata(),
+				});
+			},
 			Some(OffersContext::StaticInvoiceRequested {
 				recipient_id,
 				invoice_slot,
@@ -641,6 +696,37 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				.map_err(|_| Bolt12SemanticError::MissingPaths)
 		})
 		.map(|(builder, _)| builder)
+	}
+
+	/// Creates a point-of-sale offer template, as defined by [bLIP 56], to hand to a point-of-sale
+	/// device that builds per-order offers from it.
+	///
+	/// The template has no amount or description, names an issuer id derived only from a nonce in
+	/// its blinded path, and sets the `payment_notifications` feature. Invoice requests for the
+	/// per-order offers built from it are recognized by [`Self::verify_invoice_request`] even
+	/// though the device changes the offer's records.
+	///
+	/// Uses the [`MessageRouter`] provided at construction to build the template's blinded path.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn create_pos_offer_template<ES: EntropySource>(
+		&self, entropy_source: ES, peers: Vec<MessageForwardNode>,
+	) -> Result<Offer, Bolt12SemanticError> {
+		let nonce = Nonce::from_entropy_source(entropy_source);
+		let keys = signer::derive_pos_template_keys(nonce, &self.inbound_payment_key);
+		let context = MessageContext::Offers(OffersContext::PosTemplateInvoiceRequest { nonce });
+		let path = self
+			.create_blinded_paths(peers, context)
+			.map_err(|_| Bolt12SemanticError::MissingPaths)?
+			.into_iter()
+			.next()
+			.ok_or(Bolt12SemanticError::MissingPaths)?;
+
+		OfferBuilder::new(keys.public_key())
+			.chain_hash(self.chain_hash)
+			.supports_payment_notifications()
+			.path(path)
+			.build()
 	}
 
 	/// Create an offer for receiving async payments as an often-offline recipient.
@@ -1312,6 +1398,148 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		&self,
 	) -> Vec<(AsyncPaymentsMessage, MessageSendInstructions)> {
 		core::mem::take(&mut self.pending_async_payments_messages.lock().unwrap())
+	}
+
+	/// Signs and sends a payment notification to the point-of-sale device that built the
+	/// per-order offer a settled payment was for, as defined by [bLIP 56], and keeps it until it is
+	/// answered or retries on timer ticks give up on it.
+	///
+	/// The notification is signed with the template's issuer key and says the payment of
+	/// `amount_msats` (the amount claimed, not the amount invoiced) settled. It is sent over the
+	/// notification path from `payment_data`, with a fresh reply path to us. Nothing is sent if a
+	/// notification for `payment_hash` is already awaiting an answer.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn enqueue_payment_notification<ES: EntropySource>(
+		&self, payment_data: &PosPaymentData, payment_hash: PaymentHash, preimage: PaymentPreimage,
+		amount_msats: u64, entropy_source: ES,
+	) {
+		let mut pending = self.pending_payment_notifications.lock().unwrap();
+		if pending.iter().any(|p| p.notification.payment_hash() == payment_hash) {
+			return;
+		}
+
+		let keys = signer::derive_pos_template_keys(
+			payment_data.template_nonce,
+			&self.inbound_payment_key,
+		);
+		let notification = UnsignedPaymentNotification::new(
+			&entropy_source,
+			payment_data.payment_token_hash,
+			payment_hash,
+			preimage,
+			amount_msats,
+		)
+		.sign_with_keys(&keys, &self.secp_ctx);
+
+		// The device answers by connecting to the reply path's first node, so the path starts at
+		// us: a device without channels is normally connected to its merchant.
+		let context = PosNotificationContext::ReplyPath { payment_hash };
+		let reply_path = BlindedMessagePath::new(
+			&[],
+			self.get_our_node_id(),
+			self.get_receive_auth_key(),
+			MessageContext::PosNotification(context),
+			true,
+			&entropy_source,
+			&self.secp_ctx,
+		);
+
+		let pending_notification = PendingPaymentNotification {
+			notification,
+			notification_path: payment_data.notification_path.clone(),
+			reply_path,
+			attempts: 1,
+			ticks_until_retry: payment_notification_retry_ticks(1),
+			last_nack: None,
+		};
+		self.enqueue_pos_notification_message(&pending_notification);
+		pending.push(pending_notification);
+	}
+
+	fn enqueue_pos_notification_message(&self, pending: &PendingPaymentNotification) {
+		let message = PosNotificationMessage::PaymentNotification(pending.notification.clone());
+		let instructions = MessageSendInstructions::WithSpecifiedReplyPath {
+			destination: Destination::BlindedPath(pending.notification_path.clone()),
+			reply_path: pending.reply_path.clone(),
+		};
+		self.pending_pos_notification_messages.lock().unwrap().push((message, instructions));
+	}
+
+	/// Resends point-of-sale payment notifications whose retry delay elapsed, doubling the delay
+	/// each time, and gives up on those sent [`MAX_PAYMENT_NOTIFICATION_ATTEMPTS`] times.
+	///
+	/// Returns the notifications given up on, and whether any notification is still pending, in
+	/// which case its retry state changed and should be persisted.
+	pub(crate) fn payment_notification_timer_tick(
+		&self,
+	) -> (Vec<(PaymentHash, PaymentNotificationOutcome)>, bool) {
+		let mut given_up = Vec::new();
+		let mut pending = self.pending_payment_notifications.lock().unwrap();
+		pending.retain_mut(|pending| {
+			pending.ticks_until_retry = pending.ticks_until_retry.saturating_sub(1);
+			if pending.ticks_until_retry > 0 {
+				return true;
+			}
+			if pending.attempts >= MAX_PAYMENT_NOTIFICATION_ATTEMPTS {
+				let outcome = match pending.last_nack {
+					Some(reason) => PaymentNotificationOutcome::Refused { reason },
+					None => PaymentNotificationOutcome::Unanswered,
+				};
+				given_up.push((pending.notification.payment_hash(), outcome));
+				return false;
+			}
+			pending.attempts += 1;
+			pending.ticks_until_retry = payment_notification_retry_ticks(pending.attempts);
+			self.enqueue_pos_notification_message(pending);
+			true
+		});
+		let any_pending = !pending.is_empty();
+		(given_up, any_pending)
+	}
+
+	/// Handles an answer to a point-of-sale payment notification: a `notification_ack` if `nack` is
+	/// `None`, otherwise a `notification_nack` with that reason.
+	///
+	/// `context_payment_hash` comes from the reply path the answer arrived over and
+	/// `payment_hash` from the answer itself; they must match a notification still awaiting an
+	/// answer. An `unknown_order` nack is not final, since the device may have lost its state and
+	/// recovered it; the notification keeps being retried. Returns the notification's outcome if
+	/// it is now settled.
+	pub(crate) fn handle_payment_notification_answer(
+		&self, context_payment_hash: PaymentHash, payment_hash: PaymentHash,
+		nack: Option<NackReason>,
+	) -> Option<PaymentNotificationOutcome> {
+		if context_payment_hash != payment_hash {
+			log_trace!(self.logger, "Ignoring payment notification answer for another payment");
+			return None;
+		}
+		let mut pending = self.pending_payment_notifications.lock().unwrap();
+		let index = pending.iter().position(|p| p.notification.payment_hash() == payment_hash)?;
+		let outcome = match nack {
+			None => PaymentNotificationOutcome::Acknowledged,
+			Some(NackReason::UnknownOrder) => {
+				pending[index].last_nack = Some(NackReason::UnknownOrder);
+				return None;
+			},
+			Some(reason) => PaymentNotificationOutcome::Refused { reason },
+		};
+		pending.remove(index);
+		Some(outcome)
+	}
+
+	/// Releases the point-of-sale payment notifications that need to be sent.
+	pub fn release_pending_pos_notification_messages(
+		&self,
+	) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		core::mem::take(&mut self.pending_pos_notification_messages.lock().unwrap())
+	}
+
+	/// The point-of-sale payment notifications awaiting an answer, to be persisted.
+	pub(crate) fn writeable_pending_payment_notifications(
+		&self,
+	) -> Vec<PendingPaymentNotification> {
+		self.pending_payment_notifications.lock().unwrap().clone()
 	}
 
 	/// Retrieve an [`Offer`] for receiving async payments as an often-offline recipient. Will only

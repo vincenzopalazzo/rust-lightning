@@ -578,7 +578,7 @@ type TestOnionMessenger<'chan_man, 'node_cfg, 'chan_mon_cfg> = OnionMessenger<
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	IgnoringMessageHandler,
-	IgnoringMessageHandler,
+	&'chan_man TestChannelManager<'node_cfg, 'chan_mon_cfg>,
 	IgnoringMessageHandler,
 >;
 
@@ -1468,6 +1468,7 @@ macro_rules! _reload_node_inner {
 		$node.node = &$new_channelmanager;
 		$node.onion_messenger.set_offers_handler(&$new_channelmanager);
 		$node.onion_messenger.set_async_payments_handler(&$new_channelmanager);
+		$node.onion_messenger.set_pos_notification_handler(&$new_channelmanager);
 	};
 }
 
@@ -5105,7 +5106,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(
 			&chan_mgrs[i],
 			&chan_mgrs[i],
 			IgnoringMessageHandler {},
-			IgnoringMessageHandler {},
+			&chan_mgrs[i],
 			IgnoringMessageHandler {},
 			true,
 		);

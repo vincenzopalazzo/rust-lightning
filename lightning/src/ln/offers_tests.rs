@@ -156,7 +156,7 @@ fn check_dummy_hopped_path_length<'a, 'b, 'c>(
 		&& hops.iter().take(hops.len() - 1).all(|hop| hop.encrypted_payload.len() == first_hop_len)
 }
 
-fn route_bolt12_payment<'a, 'b, 'c>(
+pub(super) fn route_bolt12_payment<'a, 'b, 'c>(
 	node: &Node<'a, 'b, 'c>, path: &[&Node<'a, 'b, 'c>], invoice: &Bolt12Invoice
 ) {
 	// Monitor added when handling the invoice onion message.
@@ -176,7 +176,7 @@ fn route_bolt12_payment<'a, 'b, 'c>(
 	do_pass_along_path(args);
 }
 
-fn claim_bolt12_payment<'a, 'b, 'c>(
+pub(super) fn claim_bolt12_payment<'a, 'b, 'c>(
 	node: &Node<'a, 'b, 'c>, path: &[&Node<'a, 'b, 'c>], expected_payment_context: PaymentContext, invoice: &Bolt12Invoice,
 	expected_extra_fees_msat: Option<u64>,
 ) {
@@ -257,7 +257,7 @@ pub(super) fn extract_invoice_request<'a, 'b, 'c>(
 	}
 }
 
-fn extract_invoice<'a, 'b, 'c>(node: &Node<'a, 'b, 'c>, message: &OnionMessage) -> (Bolt12Invoice, BlindedMessagePath) {
+pub(super) fn extract_invoice<'a, 'b, 'c>(node: &Node<'a, 'b, 'c>, message: &OnionMessage) -> (Bolt12Invoice, BlindedMessagePath) {
 	match node.onion_messenger.peel_onion_message(message) {
 		Ok(PeeledOnion::Offers(message, _, reply_path)) => match message {
 			OffersMessage::InvoiceRequest(invoice_request) => panic!("Unexpected invoice_request: {:?}", invoice_request),

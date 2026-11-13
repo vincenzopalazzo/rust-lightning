@@ -290,6 +290,22 @@ pub(super) fn derive_keys(nonce: Nonce, expanded_key: &ExpandedKey) -> Keypair {
 	Keypair::from_secret_key(&secp_ctx, &privkey)
 }
 
+/// Derives the signing [`Keypair`] of a point-of-sale offer template from the given [`Nonce`].
+///
+/// Unlike the keys of other offers, these do not depend on the offer's records, since a
+/// point-of-sale device changes them when building per-order offers from the template. That the
+/// nonce is genuine is established by the authenticated blinded path it arrives over.
+pub(crate) fn derive_pos_template_keys(nonce: Nonce, expanded_key: &ExpandedKey) -> Keypair {
+	const IV_BYTES: &[u8; IV_LEN] = b"LDK PoS Tmpl ~~~";
+	let mut hmac = expanded_key.hmac_for_offer();
+	hmac.input(IV_BYTES);
+	hmac.input(&nonce.0);
+
+	let secp_ctx = Secp256k1::new();
+	let privkey = SecretKey::from_slice(Hmac::from_engine(hmac).as_byte_array()).unwrap();
+	Keypair::from_secret_key(&secp_ctx, &privkey)
+}
+
 /// Re-derives the payer signing keypair from the on-wire payer `metadata`.
 ///
 /// Performs the same derivation as keys created by [`Metadata::derive_from`] when using

@@ -82,7 +82,7 @@ use crate::offers::offer::{
 };
 use crate::offers::parse::{Bolt12ParseError, Bolt12SemanticError, ParsedMessage};
 use crate::offers::payer::{PayerContents, PayerTlvStream, PayerTlvStreamRef};
-use crate::offers::signer::{Metadata, MetadataMaterial};
+use crate::offers::signer::{self, Metadata, MetadataMaterial};
 use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::types::features::InvoiceRequestFeatures;
 use crate::types::payment::PaymentHash;
@@ -920,6 +920,35 @@ macro_rules! invoice_request_verify_method {
 		};
 
 		Ok(verified)
+	}
+
+/// Verifies that the request was for a per-order offer built from a point-of-sale offer template
+	/// created with the given key, by deriving the template's signing keys from the nonce included
+	/// with the [`BlindedMessagePath`] the request was sent through and matching them against the
+	/// offer's issuer id.
+	///
+	/// Unlike [`Self::verify_using_recipient_data`], the offer's records are not authenticated,
+	/// since a point-of-sale device changes them when building per-order offers.
+	///
+	/// [`BlindedMessagePath`]: crate::blinded_path::message::BlindedMessagePath
+	#[rustfmt::skip]
+	pub fn verify_for_pos_template(
+		$self: $self_type, nonce: Nonce, key: &ExpandedKey,
+	) -> Result<VerifiedInvoiceRequest<DerivedSigningPubkey>, ()> {
+		let keys = signer::derive_pos_template_keys(nonce, key);
+		if $self.contents.inner.offer.issuer_signing_pubkey() != Some(keys.public_key()) {
+			return Err(());
+		}
+
+		let offer_id = OfferId::from_valid_bolt12_tlv_stream(&$self.bytes);
+		let inner = {
+			#[cfg(not(c_bindings))]
+			{ $self }
+			#[cfg(c_bindings)]
+			{ $self.clone() }
+		};
+
+		Ok(VerifiedInvoiceRequest { offer_id, inner, keys: DerivedSigningPubkey(keys) })
 	}
 	};
 }
