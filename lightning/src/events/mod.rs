@@ -33,6 +33,7 @@ use crate::ln::types::ChannelId;
 use crate::offers::invoice::Bolt12Invoice;
 use crate::offers::invoice_request::InvoiceRequest;
 pub use crate::offers::payer_proof::PaidBolt12Invoice;
+use crate::offers::pos_merchant::PaymentNotificationOutcome;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::onion_message::messenger::Responder;
 use crate::routing::gossip::NetworkUpdate;
@@ -1236,6 +1237,28 @@ pub enum Event {
 		/// Only filled in for payments received on LDK versions 0.1 and higher.
 		payment_id: Option<PaymentId>,
 	},
+	/// A payment notification sent to a point-of-sale device, as defined by [bLIP 56], was
+	/// answered or given up on.
+	///
+	/// When a payment for a per-order offer built from a template created with
+	/// [`ChannelManager::create_pos_offer_template`] settles, a notification is sent to the device
+	/// that built the offer and retried until the device answers. The payment has already been
+	/// claimed by then, so any outcome other than
+	/// [`PaymentNotificationOutcome::Acknowledged`] needs reconciliation with the device's
+	/// operator.
+	///
+	/// # Failure Behavior and Persistence
+	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
+	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	/// [`ChannelManager::create_pos_offer_template`]: crate::ln::channelmanager::ChannelManager::create_pos_offer_template
+	PaymentNotificationResolved {
+		/// The payment hash of the settled payment the notification was for.
+		payment_hash: PaymentHash,
+		/// How the notification ended.
+		outcome: PaymentNotificationOutcome,
+	},
 	/// Indicates that a peer connection with a node is needed in order to send an [`OnionMessage`].
 	///
 	/// Typically, this happens when a [`MessageRouter`] is unable to find a complete path to a
@@ -2239,7 +2262,8 @@ impl Event {
 			| Event::SpliceNegotiated { .. }
 			| Event::SpliceNegotiationFailed { .. }
 			| Event::DiscardFunding { .. }
-			| Event::HTLCHandlingFailed { .. } => true,
+			| Event::HTLCHandlingFailed { .. }
+			| Event::PaymentNotificationResolved { .. } => true,
 		}
 	}
 }
@@ -2701,6 +2725,13 @@ impl Writeable for Event {
 					(6, counterparty_node_id, required),
 					(8, funding_txo, required),
 					(9, funding_redeem_script, option),
+				});
+			},
+			&Event::PaymentNotificationResolved { ref payment_hash, ref outcome } => {
+				67u8.write(writer)?;
+				write_tlv_fields!(writer, {
+					(1, payment_hash, required),
+					(3, outcome, required),
 				});
 			},
 			&Event::ConnectionNeeded { ref node_id, ref addresses } => {
@@ -3665,6 +3696,19 @@ impl MaybeReadable for Event {
 						(3, addresses, required_vec),
 					});
 					Ok(Some(Event::ConnectionNeeded { node_id: node_id.0.unwrap(), addresses }))
+				};
+				f()
+			},
+			67u8 => {
+				let mut f = || {
+					_init_and_read_len_prefixed_tlv_fields!(reader, {
+						(1, payment_hash, required),
+						(3, outcome, required),
+					});
+					Ok(Some(Event::PaymentNotificationResolved {
+						payment_hash: payment_hash.0.unwrap(),
+						outcome: outcome.0.unwrap(),
+					}))
 				};
 				f()
 			},

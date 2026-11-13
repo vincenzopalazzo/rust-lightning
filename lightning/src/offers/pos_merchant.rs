@@ -29,7 +29,9 @@ use crate::io::Cursor;
 use crate::offers::invoice_request::InvoiceRequest;
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::Amount;
+use crate::offers::payment_notification::PaymentNotification;
 use crate::offers::payment_token::{payment_token_hash, SealedOrder};
+use crate::onion_message::pos_notification::NackReason;
 use crate::prelude::*;
 use crate::util::ser::{Readable, Writeable};
 
@@ -85,6 +87,66 @@ impl PosPaymentData {
 		Some(Self { template_nonce, payment_token_hash, notification_path })
 	}
 }
+
+/// How many times a merchant sends a payment notification before giving up on an answer.
+pub const MAX_PAYMENT_NOTIFICATION_ATTEMPTS: u8 = 8;
+
+/// How many timer ticks to wait after sending a payment notification for the `attempt`-th time
+/// (counting from 1) before sending it again: doubling from one tick up to an hour's worth, so all
+/// [`MAX_PAYMENT_NOTIFICATION_ATTEMPTS`] span about three hours at one tick a minute.
+pub(crate) fn payment_notification_retry_ticks(attempt: u8) -> u16 {
+	1u16.checked_shl(attempt.saturating_sub(1) as u32).unwrap_or(u16::MAX).min(60)
+}
+
+/// How a payment notification sent to a point-of-sale device ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaymentNotificationOutcome {
+	/// The device acknowledged the notification.
+	Acknowledged,
+	/// The device refused the notification. The payment has already been claimed, so this needs
+	/// reconciliation with the device's operator.
+	Refused {
+		/// Why the device refused it.
+		reason: NackReason,
+	},
+	/// The device did not answer any of the attempts. The payment has already been claimed, so this
+	/// needs reconciliation with the device's operator.
+	Unanswered,
+}
+
+impl_ser_tlv_based_enum!(PaymentNotificationOutcome,
+	(0, Acknowledged) => {},
+	(2, Refused) => {
+		(0, reason, required),
+	},
+	(4, Unanswered) => {},
+);
+
+/// A payment notification that has been sent and not yet answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingPaymentNotification {
+	/// The signed notification, sent unchanged on every attempt.
+	pub(crate) notification: PaymentNotification,
+	/// Where the notification is sent.
+	pub(crate) notification_path: BlindedMessagePath,
+	/// The reply path built for this notification, used on every attempt.
+	pub(crate) reply_path: BlindedMessagePath,
+	/// How many times the notification has been sent.
+	pub(crate) attempts: u8,
+	/// Timer ticks left before the next attempt.
+	pub(crate) ticks_until_retry: u16,
+	/// The reason of an `unknown_order` nack, which is retried rather than final.
+	pub(crate) last_nack: Option<NackReason>,
+}
+
+impl_ser_tlv_based!(PendingPaymentNotification, {
+	(0, notification, required),
+	(2, notification_path, required),
+	(4, reply_path, required),
+	(6, attempts, required),
+	(8, ticks_until_retry, required),
+	(9, last_nack, option),
+});
 
 /// Why an invoice request for a point-of-sale per-order offer was rejected.
 ///

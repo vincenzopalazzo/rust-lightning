@@ -12,21 +12,32 @@
 //! The point-of-sale device is played by a fixture that builds per-order offers from the
 //! merchant's template with the wire types alone.
 
-use crate::blinded_path::message::{BlindedMessagePath, OffersContext};
+use crate::blinded_path::message::{
+	BlindedMessagePath, MessageContext, MessageForwardNode, OffersContext, PosNotificationContext,
+};
 use crate::blinded_path::payment::{Bolt12OfferContext, PaymentContext};
 use crate::blinded_path::BlindedHop;
+use crate::events::Event;
 use crate::ln::channelmanager::PaymentId;
 use crate::ln::functional_test_utils::*;
-use crate::ln::msgs::{OnionMessage, OnionMessageHandler};
+use crate::ln::msgs::{BaseMessageHandler, OnionMessage, OnionMessageHandler};
 use crate::ln::offers_tests::{claim_bolt12_payment, extract_invoice, route_bolt12_payment};
+use crate::offers::invoice::Bolt12Invoice;
 use crate::offers::invoice_request::{InvoiceRequest, PayerFields};
 use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Offer, Quantity};
+use crate::offers::payment_notification::PaymentNotification;
 use crate::offers::payment_token::{payment_token_hash, SealedOrder};
 use crate::offers::pos_merchant::PosPaymentData;
-use crate::onion_message::messenger::PeeledOnion;
+use crate::offers::pos_merchant::{PaymentNotificationOutcome, MAX_PAYMENT_NOTIFICATION_ATTEMPTS};
+use crate::onion_message::messenger::{Destination, MessageSendInstructions, PeeledOnion};
 use crate::onion_message::offers::OffersMessage;
+use crate::onion_message::pos_notification::{
+	NackReason, NotificationAck, NotificationNack, PosNotificationMessage,
+};
 use crate::sign::NodeSigner;
+use crate::types::payment::PaymentHash;
+use crate::util::ser::Writeable;
 
 use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
@@ -159,23 +170,16 @@ fn request_invoice<'a, 'b, 'c>(
 	peel_invoice_request(merchant, &message)
 }
 
-#[test]
-fn pays_for_per_order_offer() {
-	let chanmon_cfgs = create_chanmon_cfgs(2);
-	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
-	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
-
-	let customer = &nodes[0];
-	let merchant = &nodes[1];
+/// Has `customer` pay `offer`, a per-order offer built from `template` whose notification path is
+/// `notification_path`, and has `merchant` claim the payment. Returns the invoice that was paid.
+fn pay_and_claim<'a, 'b, 'c>(
+	customer: &Node<'a, 'b, 'c>, merchant: &Node<'a, 'b, 'c>, template: &Offer, offer: &Offer,
+	notification_path: BlindedMessagePath, payment_id: PaymentId,
+) -> Bolt12Invoice {
 	let merchant_id = merchant.node.get_our_node_id();
 	let customer_id = customer.node.get_our_node_id();
 
-	let template = merchant.node.create_pos_offer_template().unwrap();
-	let offer = fixture_order_offer(&template, 5_000_000, "espresso");
-	let payment_id = PaymentId([1; 32]);
-	let (invoice_request, context) = request_invoice(customer, merchant, &offer, None, payment_id);
+	let (invoice_request, context) = request_invoice(customer, merchant, offer, None, payment_id);
 	let nonce = match context {
 		Some(OffersContext::PosTemplateInvoiceRequest { nonce }) => nonce,
 		context => panic!("Unexpected context: {:?}", context),
@@ -188,13 +192,12 @@ fn pays_for_per_order_offer() {
 	// The invoice is signed with the template's issuer id and carries the token byte for byte.
 	assert_eq!(invoice.signing_pubkey(), template.issuer_signing_pubkey().unwrap());
 	assert_eq!(invoice.payment_token(), offer.payment_token());
-	assert_eq!(invoice.amount_msats(), 5_000_000);
 
 	// What the merchant needs to notify the device travels in the payment paths.
 	let payment_data = PosPaymentData {
 		template_nonce: nonce,
 		payment_token_hash: payment_token_hash(offer.payment_token().unwrap()),
-		notification_path: fixture_notification_path(),
+		notification_path,
 	};
 	let payment_context = PaymentContext::Bolt12Offer(Bolt12OfferContext {
 		offer_id: offer.id(),
@@ -209,7 +212,25 @@ fn pays_for_per_order_offer() {
 
 	route_bolt12_payment(customer, &[merchant], &invoice);
 	// The customer also pays the proportional fee of the dummy hops in the payment path.
-	claim_bolt12_payment(customer, &[merchant], payment_context, &invoice, Some(25));
+	let dummy_hop_fees = invoice.amount_msats() / 200_000;
+	claim_bolt12_payment(customer, &[merchant], payment_context, &invoice, Some(dummy_hop_fees));
+	invoice
+}
+
+#[test]
+fn pays_for_per_order_offer() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let (customer, merchant) = (&nodes[0], &nodes[1]);
+	let template = merchant.node.create_pos_offer_template().unwrap();
+	let offer = fixture_order_offer(&template, 5_000_000, "espresso");
+	let path = fixture_notification_path();
+	let invoice = pay_and_claim(customer, merchant, &template, &offer, path, PaymentId([1; 32]));
+	assert_eq!(invoice.amount_msats(), 5_000_000);
 }
 
 #[test]
@@ -266,4 +287,262 @@ fn rejects_invalid_per_order_invoice_requests() {
 	let offer = fixture_order_offer(&template, 5_000, "espresso");
 	request_invoice(customer, merchant, &offer, Some(6_000), PaymentId([43; 32]));
 	assert!(merchant.onion_messenger.next_onion_message_for_peer(customer_id).is_some());
+}
+
+/// A `notification_path` built by `pos`, introduced by `merchant`, as a point-of-sale device
+/// connected to its merchant would build one.
+fn pos_notification_path<'a, 'b, 'c>(
+	pos: &Node<'a, 'b, 'c>, merchant: &Node<'a, 'b, 'c>,
+) -> BlindedMessagePath {
+	let intro =
+		MessageForwardNode { node_id: merchant.node.get_our_node_id(), short_channel_id: None };
+	let context = PosNotificationContext::NotificationPath { order_id: [7; 32] };
+	BlindedMessagePath::new(
+		&[intro],
+		pos.node.get_our_node_id(),
+		pos.keys_manager.get_receive_auth_key(),
+		MessageContext::PosNotification(context),
+		false,
+		pos.keys_manager,
+		&Secp256k1::new(),
+	)
+}
+
+/// Takes the next payment notification `merchant` sends to `pos`, as `pos` receives it, along with
+/// the reply path to answer over.
+fn receive_notification<'a, 'b, 'c>(
+	merchant: &Node<'a, 'b, 'c>, pos: &Node<'a, 'b, 'c>,
+) -> Option<(PaymentNotification, BlindedMessagePath)> {
+	let message =
+		merchant.onion_messenger.next_onion_message_for_peer(pos.node.get_our_node_id())?;
+	match pos.onion_messenger.peel_onion_message(&message) {
+		Ok(PeeledOnion::PosNotification(
+			PosNotificationMessage::PaymentNotification(notification),
+			PosNotificationContext::NotificationPath { order_id },
+			Some(reply_path),
+		)) => {
+			assert_eq!(order_id, [7; 32]);
+			Some((notification, reply_path))
+		},
+		Ok(_) => panic!("Unexpected onion message"),
+		Err(e) => panic!("Failed to process onion message {:?}", e),
+	}
+}
+
+/// Has `pos` send `answer` to `merchant` over `destination`.
+fn answer<'a, 'b, 'c>(
+	pos: &Node<'a, 'b, 'c>, merchant: &Node<'a, 'b, 'c>, answer: PosNotificationMessage,
+	destination: Destination,
+) {
+	let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+	pos.onion_messenger.send_onion_message(answer, instructions).unwrap();
+	let merchant_id = merchant.node.get_our_node_id();
+	let message = pos.onion_messenger.next_onion_message_for_peer(merchant_id).unwrap();
+	merchant.onion_messenger.handle_onion_message(pos.node.get_our_node_id(), &message);
+}
+
+fn ack(payment_hash: PaymentHash) -> PosNotificationMessage {
+	PosNotificationMessage::NotificationAck(NotificationAck { payment_hash })
+}
+
+fn nack(payment_hash: PaymentHash, reason: NackReason) -> PosNotificationMessage {
+	PosNotificationMessage::NotificationNack(NotificationNack { payment_hash, reason })
+}
+
+fn resolved_notifications<'a, 'b, 'c>(
+	merchant: &Node<'a, 'b, 'c>,
+) -> Vec<(PaymentHash, PaymentNotificationOutcome)> {
+	merchant
+		.node
+		.get_and_clear_pending_events()
+		.into_iter()
+		.filter_map(|event| match event {
+			Event::PaymentNotificationResolved { payment_hash, outcome } => {
+				Some((payment_hash, outcome))
+			},
+			_ => None,
+		})
+		.collect()
+}
+
+/// Sets up a customer (node 0) with a channel to a merchant (node 1), and a point-of-sale device
+/// (node 2) connected to the merchant without channels. The customer pays a per-order offer whose
+/// notification path leads to the device, and the merchant claims it.
+macro_rules! settle_order {
+	($nodes: expr) => {{
+		create_announced_chan_between_nodes_with_value(&$nodes, 0, 1, 10_000_000, 1_000_000_000);
+		let (customer, merchant, pos) = (&$nodes[0], &$nodes[1], &$nodes[2]);
+		let template = merchant.node.create_pos_offer_template().unwrap();
+		let path = pos_notification_path(pos, merchant);
+		let issuer_id = template.issuer_signing_pubkey().unwrap();
+		let token = fixture_token(&issuer_id, 5_000_000, "espresso");
+		let offer = fixture_offer_with(&template, 5_000_000, "espresso", vec![path.clone()], token);
+		let invoice =
+			pay_and_claim(customer, merchant, &template, &offer, path, PaymentId([1; 32]));
+		(template, offer, invoice)
+	}};
+}
+
+#[test]
+fn notifies_point_of_sale_of_settled_payment() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (template, offer, invoice) = settle_order!(nodes);
+	let (merchant, pos) = (&nodes[1], &nodes[2]);
+
+	let (notification, reply_path) = receive_notification(merchant, pos).unwrap();
+	let payment_hash = invoice.payment_hash();
+
+	// Signed by the template's issuer key and bound to this order's token and payment.
+	assert!(notification.verify(template.issuer_signing_pubkey().unwrap()).is_ok());
+	assert_eq!(
+		notification.payment_token_hash(),
+		payment_token_hash(offer.payment_token().unwrap())
+	);
+	assert_eq!(notification.payment_hash(), payment_hash);
+	assert_eq!(PaymentHash::from(notification.preimage()), payment_hash);
+	// The amount claimed, which includes the dummy-hop fees the customer paid on top of the
+	// invoice, is what the notification reports.
+	assert!(notification.amount_msats() > invoice.amount_msats());
+
+	// The reply path starts at the merchant, which the device is connected to.
+	assert_eq!(
+		reply_path.introduction_node(),
+		&crate::blinded_path::IntroductionNode::NodeId(merchant.node.get_our_node_id())
+	);
+
+	answer(pos, merchant, ack(payment_hash), Destination::BlindedPath(reply_path));
+	assert_eq!(
+		resolved_notifications(merchant),
+		vec![(payment_hash, PaymentNotificationOutcome::Acknowledged)]
+	);
+
+	// Once acknowledged, the notification is not sent again.
+	for _ in 0..100 {
+		merchant.node.timer_tick_occurred();
+	}
+	assert!(receive_notification(merchant, pos).is_none());
+	assert!(resolved_notifications(merchant).is_empty());
+}
+
+#[test]
+fn retries_payment_notification_until_answered() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (_, _, invoice) = settle_order!(nodes);
+	let (merchant, pos) = (&nodes[1], &nodes[2]);
+	let payment_hash = invoice.payment_hash();
+
+	// The first attempt goes unanswered; retries come after 1, 2 and 4 ticks.
+	let (first, reply_path) = receive_notification(merchant, pos).unwrap();
+	let mut sent_at = Vec::new();
+	for tick in 1..=7 {
+		merchant.node.timer_tick_occurred();
+		if let Some((notification, retry_reply_path)) = receive_notification(merchant, pos) {
+			// Retries are the same notification, answerable over the same reply path.
+			assert_eq!(notification, first);
+			assert_eq!(retry_reply_path, reply_path);
+			sent_at.push(tick);
+		}
+	}
+	assert_eq!(sent_at, vec![1, 3, 7]);
+
+	// An answer for another payment is ignored, as is one sent outside the reply path.
+	answer(pos, merchant, ack(PaymentHash([1; 32])), Destination::BlindedPath(reply_path.clone()));
+	answer(pos, merchant, ack(payment_hash), Destination::Node(merchant.node.get_our_node_id()));
+	assert!(resolved_notifications(merchant).is_empty());
+
+	// A refusal ends the retries and is reported for reconciliation.
+	let reason = NackReason::OrderExpired;
+	answer(pos, merchant, nack(payment_hash, reason), Destination::BlindedPath(reply_path));
+	assert_eq!(
+		resolved_notifications(merchant),
+		vec![(payment_hash, PaymentNotificationOutcome::Refused { reason })]
+	);
+	for _ in 0..100 {
+		merchant.node.timer_tick_occurred();
+	}
+	assert!(receive_notification(merchant, pos).is_none());
+}
+
+#[test]
+fn gives_up_on_payment_notification() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (_, _, invoice) = settle_order!(nodes);
+	let (merchant, pos) = (&nodes[1], &nodes[2]);
+	let payment_hash = invoice.payment_hash();
+
+	// The device says it does not know the order, which may be a state loss it recovers from,
+	// so the merchant keeps trying.
+	let (_, reply_path) = receive_notification(merchant, pos).unwrap();
+	let reason = NackReason::UnknownOrder;
+	answer(pos, merchant, nack(payment_hash, reason), Destination::BlindedPath(reply_path));
+	assert!(resolved_notifications(merchant).is_empty());
+
+	let mut attempts = 1;
+	let mut outcomes = Vec::new();
+	for _ in 0..200 {
+		merchant.node.timer_tick_occurred();
+		if receive_notification(merchant, pos).is_some() {
+			attempts += 1;
+		}
+		outcomes.extend(resolved_notifications(merchant));
+	}
+	assert_eq!(attempts, MAX_PAYMENT_NOTIFICATION_ATTEMPTS);
+
+	// It gives up eventually, reporting the last answer it got.
+	assert_eq!(outcomes, vec![(payment_hash, PaymentNotificationOutcome::Refused { reason })]);
+}
+
+#[test]
+fn keeps_payment_notification_across_restart() {
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let persister;
+	let chain_monitor;
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let merchant_deserialized;
+	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+	let (_, _, invoice) = settle_order!(nodes);
+	let payment_hash = invoice.payment_hash();
+
+	// The notification is sent but its answer is lost.
+	assert!(receive_notification(&nodes[1], &nodes[2]).is_some());
+
+	let channel_id = nodes[1].node.list_channels()[0].channel_id;
+	let monitor = get_monitor!(nodes[1], channel_id).encode();
+	let manager = nodes[1].node.encode();
+	reload_node!(nodes[1], &manager, &[&monitor], persister, chain_monitor, merchant_deserialized);
+	let merchant_id = nodes[1].node.get_our_node_id();
+	nodes[2].node.peer_disconnected(merchant_id);
+	nodes[2].onion_messenger.peer_disconnected(merchant_id);
+	connect_nodes(&nodes[1], &nodes[2]);
+
+	// The merchant resumes retrying after the restart, and the answer then settles it.
+	merchant_tick_until_sent(&nodes[1], &nodes[2], payment_hash);
+}
+
+fn merchant_tick_until_sent<'a, 'b, 'c>(
+	merchant: &Node<'a, 'b, 'c>, pos: &Node<'a, 'b, 'c>, payment_hash: PaymentHash,
+) {
+	for _ in 0..10 {
+		merchant.node.timer_tick_occurred();
+		if let Some((notification, reply_path)) = receive_notification(merchant, pos) {
+			assert_eq!(notification.payment_hash(), payment_hash);
+			answer(pos, merchant, ack(payment_hash), Destination::BlindedPath(reply_path));
+			assert_eq!(
+				resolved_notifications(merchant),
+				vec![(payment_hash, PaymentNotificationOutcome::Acknowledged)]
+			);
+			return;
+		}
+	}
+	panic!("The notification was not retried");
 }

@@ -1512,6 +1512,11 @@ impl<
 		self.async_payments_handler = async_payments_handler;
 	}
 
+	#[cfg(any(test, feature = "_test_utils"))]
+	pub fn set_pos_notification_handler(&mut self, pos_notification_handler: PNH) {
+		self.pos_notification_handler = pos_notification_handler;
+	}
+
 	/// Sends an [`OnionMessage`] based on its [`MessageSendInstructions`].
 	pub fn send_onion_message<T: OnionMessageContents>(
 		&self, contents: T, instructions: MessageSendInstructions,
@@ -2459,7 +2464,7 @@ pub type SimpleArcOnionMessenger<M, T, F, L> = OnionMessenger<
 	Arc<SimpleArcChannelManager<M, T, F, L>>,
 	Arc<SimpleArcChannelManager<M, T, F, L>>,
 	IgnoringMessageHandler,
-	IgnoringMessageHandler,
+	Arc<SimpleArcChannelManager<M, T, F, L>>,
 	IgnoringMessageHandler,
 >;
 
@@ -2481,7 +2486,7 @@ pub type SimpleRefOnionMessenger<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, 'j, M, T, F
 		&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L>,
 		&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L>,
 		IgnoringMessageHandler,
-		IgnoringMessageHandler,
+		&'j SimpleRefChannelManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, M, T, F, L>,
 		IgnoringMessageHandler,
 	>;
 
