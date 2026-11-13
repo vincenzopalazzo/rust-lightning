@@ -64,6 +64,7 @@ pub fn do_test<L: Logger>(data: &[u8], logger: &L) {
 			&offers_msg_handler,
 			&async_payments_msg_handler,
 			IgnoringMessageHandler {}, // TODO: Move to ChannelManager once it supports DNSSEC.
+			IgnoringMessageHandler {},
 			&custom_msg_handler,
 		);
 

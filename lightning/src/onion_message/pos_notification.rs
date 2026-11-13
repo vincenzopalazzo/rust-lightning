@@ -16,14 +16,18 @@
 //!
 //! [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
 
+use crate::blinded_path::message::PosNotificationContext;
 use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
 use crate::offers::parse::Bolt12ParseError;
 use crate::offers::payer_proof::PayerProof;
+use crate::onion_message::messenger::{MessageSendInstructions, Responder, ResponseInstruction};
 use crate::onion_message::packet::OnionMessageContents;
 use crate::prelude::*;
 use crate::types::payment::PaymentHash;
 use crate::util::ser::{ReadableArgs, Writeable, Writer};
+
+use core::ops::Deref;
 
 pub use crate::offers::payment_notification::PaymentNotification;
 
@@ -38,6 +42,66 @@ const NOTIFICATION_ACK_LEN: usize = 32;
 
 /// The length of a [`NotificationNack`] on the wire.
 const NOTIFICATION_NACK_LEN: usize = 33;
+
+/// A handler for an [`OnionMessage`] containing a point-of-sale payment notification message as
+/// its payload.
+///
+/// Messages are only passed to the handler when they arrived over a blinded path this node built
+/// with a [`PosNotificationContext`], as authenticated by the [`OnionMessenger`]; any other is
+/// dropped. A point-of-sale device receives [`PaymentNotification`]s and [`PaymentProof`]s over a
+/// per-order offer's `notification_path`, and a merchant receives [`NotificationAck`]s and
+/// [`NotificationNack`]s over the reply paths of the notifications it sent.
+///
+/// [`OnionMessage`]: crate::ln::msgs::OnionMessage
+/// [`OnionMessenger`]: crate::onion_message::messenger::OnionMessenger
+pub trait PosNotificationMessageHandler {
+	/// Handles a [`PaymentNotification`] from a merchant, returning the [`NotificationAck`] or
+	/// [`NotificationNack`] to answer it with, if any.
+	fn handle_payment_notification(
+		&self, message: PaymentNotification, context: PosNotificationContext,
+		responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)>;
+
+	/// Handles a [`NotificationAck`] from a point-of-sale device.
+	fn handle_notification_ack(&self, message: NotificationAck, context: PosNotificationContext);
+
+	/// Handles a [`NotificationNack`] from a point-of-sale device.
+	fn handle_notification_nack(&self, message: NotificationNack, context: PosNotificationContext);
+
+	/// Handles a [`PaymentProof`] from a customer.
+	fn handle_payment_proof(&self, message: PaymentProof, context: PosNotificationContext);
+
+	/// Releases any [`PosNotificationMessage`]s that need to be sent.
+	///
+	/// Typically, this is used for messages initiating a message flow rather than in response to
+	/// another message, such as a merchant's [`PaymentNotification`].
+	fn release_pending_messages(&self) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		vec![]
+	}
+}
+
+impl<T: PosNotificationMessageHandler + ?Sized, D: Deref<Target = T>> PosNotificationMessageHandler
+	for D
+{
+	fn handle_payment_notification(
+		&self, message: PaymentNotification, context: PosNotificationContext,
+		responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)> {
+		self.deref().handle_payment_notification(message, context, responder)
+	}
+	fn handle_notification_ack(&self, message: NotificationAck, context: PosNotificationContext) {
+		self.deref().handle_notification_ack(message, context)
+	}
+	fn handle_notification_nack(&self, message: NotificationNack, context: PosNotificationContext) {
+		self.deref().handle_notification_nack(message, context)
+	}
+	fn handle_payment_proof(&self, message: PaymentProof, context: PosNotificationContext) {
+		self.deref().handle_payment_proof(message, context)
+	}
+	fn release_pending_messages(&self) -> Vec<(PosNotificationMessage, MessageSendInstructions)> {
+		self.deref().release_pending_messages()
+	}
+}
 
 /// Possible point-of-sale payment notification messages sent and received via an
 /// [`OnionMessage`].

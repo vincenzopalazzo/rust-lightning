@@ -392,6 +392,10 @@ pub enum MessageContext {
 	///
 	/// [`CustomOnionMessageHandler::CustomMessage`]: crate::onion_message::messenger::CustomOnionMessageHandler::CustomMessage
 	Custom(Vec<u8>),
+	/// Context specific to a [`PosNotificationMessage`].
+	///
+	/// [`PosNotificationMessage`]: crate::onion_message::pos_notification::PosNotificationMessage
+	PosNotification(PosNotificationContext),
 }
 
 /// Contains data specific to an [`OffersMessage`].
@@ -686,6 +690,7 @@ impl_ser_tlv_based_enum!(MessageContext,
 	{1, Custom} => (),
 	{2, AsyncPayments} => (),
 	{3, DNSResolver} => (),
+	{4, PosNotification} => (),
 );
 
 // Note: Several TLV fields (`nonce`, `hmac`, etc.) were removed in LDK v0.2 following the
@@ -759,6 +764,47 @@ pub struct DNSResolverContext {
 impl_ser_tlv_based!(DNSResolverContext, {
 	(0, nonce, required),
 });
+
+/// Contains data specific to a [`PosNotificationMessage`], as defined by [bLIP 56].
+///
+/// [`PosNotificationMessage`]: crate::onion_message::pos_notification::PosNotificationMessage
+/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum PosNotificationContext {
+	/// Context used by a point-of-sale device in the `notification_path` of a per-order offer.
+	///
+	/// This variant is received with a [`PaymentNotification`] from the merchant or a
+	/// [`PaymentProof`] from the customer. Since the path was built for a single order, it is what
+	/// identifies the order the message is for.
+	///
+	/// [`PaymentNotification`]: crate::onion_message::pos_notification::PaymentNotification
+	/// [`PaymentProof`]: crate::onion_message::pos_notification::PaymentProof
+	NotificationPath {
+		/// An identifier the point-of-sale device chose for the order when building the path.
+		order_id: [u8; 32],
+	},
+	/// Context used by a merchant in the reply path of a [`PaymentNotification`].
+	///
+	/// This variant is received with a [`NotificationAck`] or [`NotificationNack`] from the
+	/// point-of-sale device, and identifies the notification being answered.
+	///
+	/// [`PaymentNotification`]: crate::onion_message::pos_notification::PaymentNotification
+	/// [`NotificationAck`]: crate::onion_message::pos_notification::NotificationAck
+	/// [`NotificationNack`]: crate::onion_message::pos_notification::NotificationNack
+	ReplyPath {
+		/// The payment hash of the settled payment the notification was sent for.
+		payment_hash: PaymentHash,
+	},
+}
+
+impl_ser_tlv_based_enum!(PosNotificationContext,
+	(0, NotificationPath) => {
+		(0, order_id, required),
+	},
+	(1, ReplyPath) => {
+		(0, payment_hash, required),
+	},
+);
 
 /// Represents the padding round off size (in bytes) that is used
 /// to pad message blinded path's [`BlindedHop`]
