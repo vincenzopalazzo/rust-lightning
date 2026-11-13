@@ -90,8 +90,8 @@ use crate::onion_message::dns_resolution::HumanReadableName;
 use crate::types::features::OfferFeatures;
 use crate::types::string::PrintableString;
 use crate::util::ser::{
-	CursorReadable, HighZeroBytesDroppedBigSize, LengthLimitedRead, LengthReadable, Readable,
-	WithoutLength, Writeable, Writer,
+	BigSize, CursorReadable, HighZeroBytesDroppedBigSize, LengthLimitedRead, LengthReadable,
+	Readable, WithoutLength, Writeable, Writer,
 };
 use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
@@ -247,6 +247,8 @@ macro_rules! offer_explicit_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(signing_pubkey),
+					notification_paths: None,
+					payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -301,6 +303,8 @@ macro_rules! offer_derived_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(node_id),
+					notification_paths: None,
+					payment_token: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -632,6 +636,8 @@ pub(super) struct OfferContents {
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
 	issuer_signing_pubkey: Option<PublicKey>,
+	notification_paths: Option<Vec<BlindedMessagePath>>,
+	payment_token: Option<Vec<u8>>,
 	#[cfg(test)]
 	experimental_foo: Option<u64>,
 }
@@ -708,6 +714,28 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 	pub fn issuer_signing_pubkey(&$self) -> Option<bitcoin::secp256k1::PublicKey> {
 		$contents.issuer_signing_pubkey()
 	}
+
+	/// Blinded onion message paths to the point-of-sale device that constructed a per-order offer,
+	/// over which the offer's recipient delivers a payment notification once the payment settles.
+	///
+	/// Empty if the offer does not carry a `notification_path` record.
+	///
+	/// See [bLIP 56] for more information.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn notification_paths(&$self) -> &[$crate::blinded_path::message::BlindedMessagePath] {
+		$contents.notification_paths()
+	}
+
+	/// An opaque `payment_token` sealing a per-order offer's amount, description and order
+	/// metadata to the offer's issuer, as constructed by a point-of-sale device.
+	///
+	/// See [bLIP 56] for more information.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn payment_token(&$self) -> Option<&[u8]> {
+		$contents.payment_token()
+	}
 } }
 
 impl Offer {
@@ -763,6 +791,63 @@ impl Offer {
 			self.contents.paths.as_deref(),
 		)
 		.is_ok()
+	}
+
+	/// Returns a copy of this offer with the records a point-of-sale device adds to a merchant's
+	/// offer template to make a per-order offer, as defined by [bLIP 56]: the amount (in
+	/// millisatoshis), the description, optionally an absolute expiry, the `notification_path`s
+	/// and the `payment_token`.
+	///
+	/// Every other record, including any this implementation does not understand, is kept byte
+	/// for byte, and existing records of the replaced types are dropped. An amount denominated in
+	/// a currency is replaced by the bitcoin amount. If `absolute_expiry` is `None`, any expiry
+	/// the offer already has is kept.
+	///
+	/// This only rewrites records; it does not check that the offer is usable as a template, nor
+	/// that `payment_token` seals the given amount and description.
+	///
+	/// Errors if the resulting offer is invalid, for example if `amount_msats` is zero or exceeds
+	/// the maximum payment amount.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn with_per_order_records(
+		&self, amount_msats: u64, description: String, absolute_expiry: Option<Duration>,
+		notification_paths: Vec<BlindedMessagePath>, payment_token: Vec<u8>,
+	) -> Result<Offer, Bolt12ParseError> {
+		let mut new_records = vec![
+			(OFFER_AMOUNT_TYPE, HighZeroBytesDroppedBigSize(amount_msats).encode()),
+			(OFFER_DESCRIPTION_TYPE, WithoutLength(&description).encode()),
+			(OFFER_NOTIFICATION_PATH_TYPE, WithoutLength(&notification_paths).encode()),
+			(OFFER_PAYMENT_TOKEN_TYPE, payment_token),
+		];
+		if let Some(absolute_expiry) = absolute_expiry {
+			let seconds = HighZeroBytesDroppedBigSize(absolute_expiry.as_secs()).encode();
+			new_records.push((OFFER_ABSOLUTE_EXPIRY_TYPE, seconds));
+		}
+
+		let is_replaced = |r#type: u64| {
+			r#type == OFFER_CURRENCY_TYPE || new_records.iter().any(|(t, _)| *t == r#type)
+		};
+		let mut records: Vec<(u64, Vec<u8>)> = TlvStream::new(&self.bytes)
+			.filter(|record| !is_replaced(record.r#type))
+			.map(|record| (record.r#type, record.record_bytes.to_vec()))
+			.collect();
+		for (r#type, value) in new_records.iter() {
+			let mut record = Vec::with_capacity(value.len() + 18);
+			BigSize(*r#type).write(&mut record).expect("writing to a Vec never fails");
+			BigSize(value.len() as u64).write(&mut record).expect("writing to a Vec never fails");
+			record.extend_from_slice(value);
+			records.push((*r#type, record));
+		}
+		records.sort_unstable_by_key(|(r#type, _)| *r#type);
+
+		let len = records.iter().map(|(_, record)| record.len()).sum();
+		let mut bytes = Vec::with_capacity(len);
+		for (_, record) in records {
+			bytes.extend_from_slice(&record);
+		}
+
+		Offer::try_from(bytes)
 	}
 
 	pub(super) fn tlv_stream_iter<'a>(
@@ -1008,6 +1093,14 @@ impl OfferContents {
 		self.issuer_signing_pubkey
 	}
 
+	pub fn notification_paths(&self) -> &[BlindedMessagePath] {
+		self.notification_paths.as_ref().map(|paths| paths.as_slice()).unwrap_or(&[])
+	}
+
+	pub fn payment_token(&self) -> Option<&[u8]> {
+		self.payment_token.as_ref().map(|token| token.as_slice())
+	}
+
 	pub(super) fn verify_using_metadata<T: secp256k1::Signing>(
 		&self, bytes: &[u8], key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
@@ -1090,6 +1183,8 @@ impl OfferContents {
 		};
 
 		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			notification_paths: self.notification_paths.as_ref(),
+			payment_token: self.payment_token.as_ref(),
 			#[cfg(test)]
 			experimental_foo: self.experimental_foo,
 		};
@@ -1226,8 +1321,17 @@ pub(super) const OFFER_TYPES: core::ops::Range<u64> = 1..80;
 /// TLV record type for [`Offer::metadata`].
 const OFFER_METADATA_TYPE: u64 = 4;
 
+/// TLV record type for the currency of [`Offer::amount`].
+const OFFER_CURRENCY_TYPE: u64 = 6;
+
+/// TLV record type for [`Offer::amount`].
+const OFFER_AMOUNT_TYPE: u64 = 8;
+
 /// TLV record type for [`Offer::description`].
 pub(super) const OFFER_DESCRIPTION_TYPE: u64 = 10;
+
+/// TLV record type for [`Offer::absolute_expiry`].
+const OFFER_ABSOLUTE_EXPIRY_TYPE: u64 = 14;
 
 /// TLV record type for [`Offer::issuer`].
 pub(super) const OFFER_ISSUER_TYPE: u64 = 18;
@@ -1238,11 +1342,11 @@ const OFFER_ISSUER_ID_TYPE: u64 = 22;
 tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 	(2, chains: (Vec<ChainHash>, WithoutLength)),
 	(OFFER_METADATA_TYPE, metadata: (Vec<u8>, WithoutLength)),
-	(6, currency: [u8; 3]),
-	(8, amount: (u64, HighZeroBytesDroppedBigSize)),
+	(OFFER_CURRENCY_TYPE, currency: [u8; 3]),
+	(OFFER_AMOUNT_TYPE, amount: (u64, HighZeroBytesDroppedBigSize)),
 	(OFFER_DESCRIPTION_TYPE, description: (String, WithoutLength)),
 	(12, features: (OfferFeatures, WithoutLength)),
-	(14, absolute_expiry: (u64, HighZeroBytesDroppedBigSize)),
+	(OFFER_ABSOLUTE_EXPIRY_TYPE, absolute_expiry: (u64, HighZeroBytesDroppedBigSize)),
 	(16, paths: (Vec<BlindedMessagePath>, WithoutLength)),
 	(OFFER_ISSUER_TYPE, issuer: (String, WithoutLength)),
 	(20, quantity_max: (u64, HighZeroBytesDroppedBigSize)),
@@ -1252,18 +1356,38 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 /// Valid type range for experimental offer TLV records.
 pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
 
+/// TLV record type for [`Offer::notification_paths`], as defined by [bLIP 56].
+///
+/// Odd, so that a wallet unaware of the record still accepts the offer and copies the record into
+/// its `invoice_request`.
+///
+/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+pub(super) const OFFER_NOTIFICATION_PATH_TYPE: u64 = 1_000_000_001;
+
+/// TLV record type for [`Offer::payment_token`], as defined by [bLIP 56].
+///
+/// Odd, so that a wallet unaware of the record still accepts the offer and copies the record into
+/// its `invoice_request`, and from there into the invoice.
+///
+/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+pub(super) const OFFER_PAYMENT_TOKEN_TYPE: u64 = 1_000_000_003;
+
 #[cfg(not(test))]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATH_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_PAYMENT_TOKEN_TYPE, payment_token: (Vec<u8>, WithoutLength)),
 });
 
 #[cfg(test)]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(OFFER_NOTIFICATION_PATH_TYPE, notification_paths: (Vec<BlindedMessagePath>, WithoutLength)),
+	(OFFER_PAYMENT_TOKEN_TYPE, payment_token: (Vec<u8>, WithoutLength)),
 	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
 });
 
 type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
 
-type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef);
+type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef<'a>);
 
 impl CursorReadable for FullOfferTlvStream {
 	fn read<R: AsRef<[u8]>>(r: &mut io::Cursor<R>) -> Result<Self, DecodeError> {
@@ -1318,6 +1442,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 				issuer_id,
 			},
 			ExperimentalOfferTlvStream {
+				notification_paths,
+				payment_token,
 				#[cfg(test)]
 				experimental_foo,
 			},
@@ -1374,6 +1500,8 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 			paths,
 			supported_quantity,
 			issuer_signing_pubkey,
+			notification_paths,
+			payment_token,
 			#[cfg(test)]
 			experimental_foo,
 		})
@@ -1468,7 +1596,11 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef {
+					notification_paths: None,
+					payment_token: None,
+					experimental_foo: None,
+				},
 			),
 		);
 
@@ -2287,13 +2419,192 @@ mod tests {
 		}
 	}
 
+	fn per_order_template() -> Offer {
+		let blinded_path = BlindedMessagePath::from_blinded_path(
+			pubkey(40),
+			pubkey(41),
+			vec![
+				BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
+				BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] },
+			],
+		);
+		let mut features = OfferFeatures::empty();
+		features.set_payment_notifications_optional();
+
+		OfferBuilder::new(pubkey(42))
+			.path(blinded_path)
+			.features_unchecked(features)
+			.experimental_foo(42)
+			.build()
+			.unwrap()
+	}
+
+	fn notification_path() -> BlindedMessagePath {
+		BlindedMessagePath::from_blinded_path(
+			pubkey(45),
+			pubkey(46),
+			vec![BlindedHop { blinded_node_id: pubkey(47), encrypted_payload: vec![1; 32] }],
+		)
+	}
+
+	#[test]
+	fn builds_offer_with_per_order_records() {
+		let template = per_order_template();
+		assert_eq!(template.notification_paths(), &[]);
+		assert_eq!(template.payment_token(), None);
+
+		let expiry = Duration::from_secs(1_800_000_000);
+		let offer = template
+			.with_per_order_records(
+				50_000,
+				"coffee, large".to_string(),
+				Some(expiry),
+				vec![notification_path()],
+				vec![7; 100],
+			)
+			.unwrap();
+
+		assert_eq!(offer.amount(), Some(Amount::Bitcoin { amount_msats: 50_000 }));
+		assert_eq!(offer.description(), Some(PrintableString("coffee, large")));
+		assert_eq!(offer.absolute_expiry(), Some(expiry));
+		assert_eq!(offer.notification_paths(), &[notification_path()]);
+		assert_eq!(offer.payment_token(), Some(&[7; 100][..]));
+		assert_ne!(offer.id(), template.id());
+
+		// Everything the template carried is kept, including the feature bit and the
+		// experimental record this implementation only knows about in tests.
+		assert_eq!(offer.paths(), template.paths());
+		assert_eq!(offer.issuer_signing_pubkey(), template.issuer_signing_pubkey());
+		assert_eq!(offer.offer_features(), template.offer_features());
+		assert!(offer.offer_features().supports_payment_notifications());
+		assert_eq!(offer.contents.experimental_foo, Some(42));
+
+		// The rebuilt bytes are the canonical encoding of the parsed offer.
+		let mut buffer = Vec::new();
+		offer.contents.write(&mut buffer).unwrap();
+		assert_eq!(offer.bytes, buffer);
+		assert_eq!(Offer::try_from(buffer).unwrap(), offer);
+	}
+
+	#[test]
+	fn keeps_unknown_records_with_per_order_records() {
+		let mut features = OfferFeatures::empty();
+		features.set_payment_notifications_optional();
+		let template = OfferBuilder::new(pubkey(42)).features_unchecked(features).build().unwrap();
+		let mut bytes = Vec::new();
+		template.write(&mut bytes).unwrap();
+
+		let unknown_type = 1_000_000_005;
+		BigSize(unknown_type).write(&mut bytes).unwrap();
+		BigSize(3).write(&mut bytes).unwrap();
+		bytes.extend_from_slice(&[1, 2, 3]);
+		let template = Offer::try_from(bytes).unwrap();
+
+		let offer = template
+			.with_per_order_records(
+				1_000,
+				"tea".to_string(),
+				None,
+				vec![notification_path()],
+				vec![9],
+			)
+			.unwrap();
+
+		let unknown_record = |offer: &Offer| {
+			super::TlvStream::new(&offer.bytes)
+				.find(|record| record.r#type == unknown_type)
+				.map(|record| record.record_bytes.to_vec())
+		};
+		assert!(unknown_record(&template).is_some());
+		assert_eq!(unknown_record(&offer), unknown_record(&template));
+		assert_eq!(offer.payment_token(), Some(&[9][..]));
+	}
+
+	#[test]
+	fn replaces_records_with_per_order_records() {
+		let template = per_order_template()
+			.with_per_order_records(
+				1_000,
+				"tea".to_string(),
+				None,
+				vec![notification_path()],
+				vec![1],
+			)
+			.unwrap();
+
+		let expiry = Duration::from_secs(1_900_000_000);
+		let offer = template
+			.with_per_order_records(2_000, "cake".to_string(), Some(expiry), vec![], vec![2, 2])
+			.unwrap();
+		assert_eq!(offer.amount(), Some(Amount::Bitcoin { amount_msats: 2_000 }));
+		assert_eq!(offer.description(), Some(PrintableString("cake")));
+		assert_eq!(offer.absolute_expiry(), Some(expiry));
+		assert_eq!(offer.notification_paths(), &[]);
+		assert_eq!(offer.payment_token(), Some(&[2, 2][..]));
+
+		// An expiry already present is kept when none is given.
+		let offer = offer
+			.with_per_order_records(
+				3_000,
+				"pie".to_string(),
+				None,
+				vec![notification_path()],
+				vec![3],
+			)
+			.unwrap();
+		assert_eq!(offer.absolute_expiry(), Some(expiry));
+
+		// A currency amount is replaced by the bitcoin amount.
+		let currency_offer = OfferBuilder::new(pubkey(42))
+			.amount(Amount::Currency {
+				iso4217_code: CurrencyCode::new(*b"USD").unwrap(),
+				amount: 10,
+			})
+			.description("dinner".to_string())
+			.build_unchecked();
+		let offer = currency_offer
+			.with_per_order_records(4_000, "lunch".to_string(), None, vec![], vec![4])
+			.unwrap();
+		assert_eq!(offer.amount(), Some(Amount::Bitcoin { amount_msats: 4_000 }));
+	}
+
+	#[test]
+	fn fails_building_offer_with_invalid_per_order_records() {
+		let template = per_order_template();
+		match template.with_per_order_records(0, "tea".to_string(), None, vec![], vec![1]) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => {
+				assert_eq!(
+					e,
+					Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidAmount)
+				)
+			},
+		}
+		match template.with_per_order_records(
+			MAX_VALUE_MSAT + 1,
+			"tea".to_string(),
+			None,
+			vec![],
+			vec![1],
+		) {
+			Ok(_) => panic!("expected error"),
+			Err(e) => {
+				assert_eq!(
+					e,
+					Bolt12ParseError::InvalidSemantics(Bolt12SemanticError::InvalidAmount)
+				)
+			},
+		}
+	}
+
 	#[test]
 	fn parses_offer_with_experimental_tlv_records() {
 		let offer = OfferBuilder::new(pubkey(42)).build().unwrap();
 
 		let mut encoded_offer = Vec::new();
 		offer.write(&mut encoded_offer).unwrap();
-		BigSize(EXPERIMENTAL_OFFER_TYPES.start + 1).write(&mut encoded_offer).unwrap();
+		// An odd experimental type no record is defined for.
+		BigSize(EXPERIMENTAL_OFFER_TYPES.start + 101).write(&mut encoded_offer).unwrap();
 		BigSize(32).write(&mut encoded_offer).unwrap();
 		[42u8; 32].write(&mut encoded_offer).unwrap();
 

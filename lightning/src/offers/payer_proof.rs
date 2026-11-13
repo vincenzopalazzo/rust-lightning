@@ -996,7 +996,8 @@ mod tests {
 	use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 	use core::time::Duration;
 
-	const EXPERIMENTAL_TEST_TLV_TYPE: u64 = 1_000_000_001;
+	// An odd experimental offer type no record is defined for.
+	const EXPERIMENTAL_TEST_TLV_TYPE: u64 = 1_000_000_101;
 
 	fn write_tlv_record<T: Writeable>(bytes: &mut Vec<u8>, tlv_type: u64, value: &T) {
 		let mut value_bytes = Vec::new();
@@ -1014,7 +1015,7 @@ mod tests {
 	}
 
 	/// Builds a proof whose underlying invoice carries a synthetic experimental TLV
-	/// at type [`EXPERIMENTAL_TEST_TLV_TYPE`] (`1_000_000_001`). Constructed by
+	/// at type [`EXPERIMENTAL_TEST_TLV_TYPE`] (`1_000_000_101`). Constructed by
 	/// hand because the public `RefundBuilder` API doesn't expose a way to write
 	/// arbitrary experimental TLV types — the existing `experimental_foo` family
 	/// of methods uses fixed type numbers that wouldn't exercise the same code

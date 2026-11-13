@@ -22,18 +22,25 @@ use super::messenger::{
 };
 use super::offers::{OffersMessage, OffersMessageHandler};
 use super::packet::{OnionMessageContents, Packet};
+use super::pos_notification::{
+	NackReason, NotificationAck, NotificationNack, PaymentNotification, PaymentProof,
+	PosNotificationMessage, PosNotificationMessageHandler,
+};
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, DNSResolverContext, MessageContext,
-	MessageForwardNode, NextMessageHop, OffersContext, MESSAGE_PADDING_ROUND_OFF,
+	MessageForwardNode, NextMessageHop, OffersContext, PosNotificationContext,
+	MESSAGE_PADDING_ROUND_OFF,
 };
 use crate::blinded_path::utils::is_padded;
 use crate::blinded_path::NodeIdLookUp;
 use crate::events::{Event, EventsProvider};
 use crate::ln::msgs::{self, BaseMessageHandler, DecodeError, OnionMessageHandler};
+use crate::offers::payment_notification::UnsignedPaymentNotification;
 use crate::routing::gossip::{NetworkGraph, P2PGossipSync};
 use crate::routing::test_utils::{add_channel, add_or_update_node};
 use crate::sign::{NodeSigner, Recipient};
 use crate::types::features::{ChannelFeatures, InitFeatures};
+use crate::types::payment::{PaymentHash, PaymentPreimage};
 use crate::util::ser::{FixedLengthReader, LengthReadable, Writeable, Writer};
 use crate::util::test_utils::{TestChainSource, TestKeysInterface, TestLogger, TestNodeSigner};
 
@@ -65,10 +72,12 @@ struct MessengerNode {
 		Arc<TestOffersMessageHandler>,
 		Arc<TestAsyncPaymentsMessageHandler>,
 		Arc<TestDNSResolverMessageHandler>,
+		Arc<TestPosNotificationMessageHandler>,
 		Arc<TestCustomMessageHandler>,
 	>,
 	node_id_lookup: Arc<TestNodeIdLookUp>,
 	custom_message_handler: Arc<TestCustomMessageHandler>,
+	pos_notification_handler: Arc<TestPosNotificationMessageHandler>,
 	gossip_sync: Arc<P2PGossipSync<Arc<NetGraph>, Arc<TestChainSource>, Arc<TestLogger>>>,
 }
 
@@ -100,6 +109,44 @@ impl Drop for MessengerNode {
 			return;
 		}
 		assert!(release_events(self).is_empty());
+	}
+}
+
+/// Records the point-of-sale messages it receives, and acks every payment notification.
+struct TestPosNotificationMessageHandler {
+	received: Mutex<Vec<(&'static str, PosNotificationContext)>>,
+}
+
+impl TestPosNotificationMessageHandler {
+	fn new() -> Self {
+		Self { received: Mutex::new(Vec::new()) }
+	}
+
+	fn take_received(&self) -> Vec<(&'static str, PosNotificationContext)> {
+		core::mem::take(&mut *self.received.lock().unwrap())
+	}
+}
+
+impl PosNotificationMessageHandler for TestPosNotificationMessageHandler {
+	fn handle_payment_notification(
+		&self, message: PaymentNotification, context: PosNotificationContext,
+		responder: Option<Responder>,
+	) -> Option<(PosNotificationMessage, ResponseInstruction)> {
+		self.received.lock().unwrap().push(("payment_notification", context));
+		let ack = NotificationAck { payment_hash: message.payment_hash() };
+		responder
+			.map(|responder| (PosNotificationMessage::NotificationAck(ack), responder.respond()))
+	}
+	fn handle_notification_ack(&self, _message: NotificationAck, context: PosNotificationContext) {
+		self.received.lock().unwrap().push(("notification_ack", context));
+	}
+	fn handle_notification_nack(
+		&self, _message: NotificationNack, context: PosNotificationContext,
+	) {
+		self.received.lock().unwrap().push(("notification_nack", context));
+	}
+	fn handle_payment_proof(&self, _message: PaymentProof, context: PosNotificationContext) {
+		self.received.lock().unwrap().push(("payment_proof", context));
 	}
 }
 
@@ -343,6 +390,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 		let offers_message_handler = Arc::new(TestOffersMessageHandler {});
 		let async_payments_message_handler = Arc::new(TestAsyncPaymentsMessageHandler {});
 		let dns_resolver_message_handler = Arc::new(TestDNSResolverMessageHandler {});
+		let pos_notification_handler = Arc::new(TestPosNotificationMessageHandler::new());
 		let custom_message_handler = Arc::new(TestCustomMessageHandler::new());
 		let messenger = if cfg.intercept_offline_peer_oms || cfg.intercept_unknown_scid_oms {
 			OnionMessenger::new_with_offline_peer_interception(
@@ -354,6 +402,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 				offers_message_handler,
 				async_payments_message_handler,
 				dns_resolver_message_handler,
+				Arc::clone(&pos_notification_handler),
 				Arc::clone(&custom_message_handler),
 				cfg.intercept_unknown_scid_oms,
 			)
@@ -367,6 +416,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 				offers_message_handler,
 				async_payments_message_handler,
 				dns_resolver_message_handler,
+				Arc::clone(&pos_notification_handler),
 				Arc::clone(&custom_message_handler),
 			)
 		};
@@ -377,6 +427,7 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 			messenger,
 			node_id_lookup,
 			custom_message_handler,
+			pos_notification_handler,
 			gossip_sync: Arc::clone(&gossip_sync),
 		});
 	}
@@ -675,6 +726,139 @@ fn async_response_with_reply_path_fails() {
 		alice.messenger.handle_onion_message_response(msg, instructions),
 		Err(SendError::PathNotFound),
 	);
+}
+
+fn payment_notification() -> PaymentNotification {
+	let secp_ctx = Secp256k1::new();
+	let keys = bitcoin::secp256k1::Keypair::from_seckey_slice(&secp_ctx, &[42; 32]).unwrap();
+	let preimage = PaymentPreimage([4; 32]);
+	let entropy = TestKeysInterface::new(&[3; 32], Network::Testnet);
+	UnsignedPaymentNotification::new(
+		&entropy,
+		bitcoin::hashes::Hash::from_byte_array([2; 32]),
+		preimage.into(),
+		preimage,
+		1_000,
+	)
+	.sign_with_keys(&keys, &secp_ctx)
+}
+
+fn pos_notification_path(
+	node: &MessengerNode, context: PosNotificationContext,
+) -> BlindedMessagePath {
+	let receive_key = node.messenger.node_signer.get_receive_auth_key();
+	BlindedMessagePath::new(
+		&[],
+		node.node_id,
+		receive_key,
+		MessageContext::PosNotification(context),
+		false,
+		&*node.entropy_source,
+		&Secp256k1::new(),
+	)
+}
+
+#[test]
+fn delivers_pos_notification_messages_over_own_paths() {
+	let mut nodes = create_nodes(2);
+	let secp_ctx = Secp256k1::new();
+	add_channel_to_graph(&nodes[0], &nodes[1], &secp_ctx, 24);
+
+	// A merchant sends a notification over the device's notification path, with a reply path of
+	// its own, and the device's answer comes back over it.
+	let order_context = PosNotificationContext::NotificationPath { order_id: [7; 32] };
+	let notification = payment_notification();
+	let reply_context =
+		PosNotificationContext::ReplyPath { payment_hash: notification.payment_hash() };
+	let instructions = MessageSendInstructions::WithSpecifiedReplyPath {
+		destination: Destination::BlindedPath(pos_notification_path(
+			&nodes[1],
+			order_context.clone(),
+		)),
+		reply_path: pos_notification_path(&nodes[0], reply_context.clone()),
+	};
+	let message = PosNotificationMessage::PaymentNotification(notification);
+	nodes[0].messenger.send_onion_message(message, instructions).unwrap();
+	pass_along_path(&nodes);
+	assert_eq!(
+		nodes[1].pos_notification_handler.take_received(),
+		vec![("payment_notification", order_context.clone())],
+	);
+
+	nodes.reverse();
+	pass_along_path(&nodes);
+	nodes.reverse();
+	assert_eq!(
+		nodes[0].pos_notification_handler.take_received(),
+		vec![("notification_ack", reply_context.clone())],
+	);
+
+	// A nack arrives the same way.
+	let nack =
+		NotificationNack { payment_hash: PaymentHash([1; 32]), reason: NackReason::OrderExpired };
+	let destination =
+		Destination::BlindedPath(pos_notification_path(&nodes[0], reply_context.clone()));
+	let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+	let message = PosNotificationMessage::NotificationNack(nack);
+	nodes[1].messenger.send_onion_message(message, instructions).unwrap();
+	nodes.reverse();
+	pass_along_path(&nodes);
+	nodes.reverse();
+	assert_eq!(
+		nodes[0].pos_notification_handler.take_received(),
+		vec![("notification_nack", reply_context)],
+	);
+}
+
+#[test]
+fn drops_pos_notification_messages_not_sent_over_own_paths() {
+	let nodes = create_nodes(2);
+
+	// Sent to the node directly rather than over a blinded path it built.
+	let ack = NotificationAck { payment_hash: PaymentHash([1; 32]) };
+	let destination = Destination::Node(nodes[1].node_id);
+	let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+	let message = PosNotificationMessage::NotificationAck(ack.clone());
+	nodes[0].messenger.send_onion_message(message, instructions).unwrap();
+	pass_along_path(&nodes);
+	assert!(nodes[1].pos_notification_handler.take_received().is_empty());
+
+	// Sent over a blinded path the node built for something else.
+	let receive_key = nodes[1].messenger.node_signer.get_receive_auth_key();
+	let blinded_path = BlindedMessagePath::new(
+		&[],
+		nodes[1].node_id,
+		receive_key,
+		MessageContext::Custom(Vec::new()),
+		false,
+		&*nodes[1].entropy_source,
+		&Secp256k1::new(),
+	);
+	let destination = Destination::BlindedPath(blinded_path);
+	let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+	let message = PosNotificationMessage::PaymentNotification(payment_notification());
+	nodes[0].messenger.send_onion_message(message, instructions).unwrap();
+	pass_along_path(&nodes);
+	assert!(nodes[1].pos_notification_handler.take_received().is_empty());
+
+	// Sent over a blinded path built to the node by someone else, using another receive key.
+	let blinded_path = BlindedMessagePath::new(
+		&[],
+		nodes[1].node_id,
+		nodes[0].messenger.node_signer.get_receive_auth_key(),
+		MessageContext::PosNotification(PosNotificationContext::NotificationPath {
+			order_id: [7; 32],
+		}),
+		false,
+		&*nodes[0].entropy_source,
+		&Secp256k1::new(),
+	);
+	let destination = Destination::BlindedPath(blinded_path);
+	let instructions = MessageSendInstructions::WithoutReplyPath { destination };
+	let message = PosNotificationMessage::PaymentNotification(payment_notification());
+	nodes[0].messenger.send_onion_message(message, instructions).unwrap();
+	pass_along_path(&nodes);
+	assert!(nodes[1].pos_notification_handler.take_received().is_empty());
 }
 
 #[test]
