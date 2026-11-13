@@ -15843,6 +15843,21 @@ impl<
 		Ok(())
 	}
 
+	/// Creates a point-of-sale offer template, as defined by [bLIP 56], to hand to a point-of-sale
+	/// device.
+	///
+	/// The device builds a per-order offer from the template for each order. Invoice requests for
+	/// those offers are checked against the order sealed into them, and once a payment settles, a
+	/// payment notification is sent to the device.
+	///
+	/// The template may be handed out more than once and published, but its blinded path ages like
+	/// that of any other offer, so it should be refreshed periodically.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn create_pos_offer_template(&self) -> Result<Offer, Bolt12SemanticError> {
+		self.flow.create_pos_offer_template(&self.entropy_source, self.get_peers_for_blinded_path())
+	}
+
 	/// Pays for an [`Offer`] using the given parameters by creating an [`InvoiceRequest`] and
 	/// enqueuing it to be sent via an onion message. [`ChannelManager`] will pay the actual
 	/// [`Bolt12Invoice`] once it is received.

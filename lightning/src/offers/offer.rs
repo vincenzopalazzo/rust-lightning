@@ -343,6 +343,15 @@ macro_rules! offer_builder_methods { (
 		$return_value
 	}
 
+	/// Sets the `payment_notifications` feature in [`Offer::offer_features`], for an offer meant
+	/// as a point-of-sale offer template, as defined by [bLIP 56].
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn supports_payment_notifications($($self_mut)* $self: $self_type) -> $return_type {
+		$self.offer.features.set_payment_notifications_optional();
+		$return_value
+	}
+
 	/// Sets the [`Offer::amount`] as an [`Amount::Bitcoin`].
 	///
 	/// Successive calls to this method will override the previous setting.

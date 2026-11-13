@@ -47,6 +47,7 @@ use crate::offers::nonce::Nonce;
 use crate::offers::offer::{Amount, DerivedMetadata, Offer, OfferBuilder};
 use crate::offers::parse::Bolt12SemanticError;
 use crate::offers::refund::{Refund, RefundBuilder};
+use crate::offers::signer;
 use crate::offers::static_invoice::{StaticInvoice, StaticInvoiceBuilder};
 use crate::onion_message::async_payments::{
 	AsyncPaymentsMessage, HeldHtlcAvailable, OfferPaths, OfferPathsRequest, ServeStaticInvoice,
@@ -641,6 +642,37 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				.map_err(|_| Bolt12SemanticError::MissingPaths)
 		})
 		.map(|(builder, _)| builder)
+	}
+
+	/// Creates a point-of-sale offer template, as defined by [bLIP 56], to hand to a point-of-sale
+	/// device that builds per-order offers from it.
+	///
+	/// The template has no amount or description, names an issuer id derived only from a nonce in
+	/// its blinded path, and sets the `payment_notifications` feature. Invoice requests for the
+	/// per-order offers built from it are recognized by [`Self::verify_invoice_request`] even
+	/// though the device changes the offer's records.
+	///
+	/// Uses the [`MessageRouter`] provided at construction to build the template's blinded path.
+	///
+	/// [bLIP 56]: https://github.com/jkczyz/blips/blob/claude/spec-blocking-findings-ca4402/blip-0056.md
+	pub fn create_pos_offer_template<ES: EntropySource>(
+		&self, entropy_source: ES, peers: Vec<MessageForwardNode>,
+	) -> Result<Offer, Bolt12SemanticError> {
+		let nonce = Nonce::from_entropy_source(entropy_source);
+		let keys = signer::derive_pos_template_keys(nonce, &self.inbound_payment_key);
+		let context = MessageContext::Offers(OffersContext::PosTemplateInvoiceRequest { nonce });
+		let path = self
+			.create_blinded_paths(peers, context)
+			.map_err(|_| Bolt12SemanticError::MissingPaths)?
+			.into_iter()
+			.next()
+			.ok_or(Bolt12SemanticError::MissingPaths)?;
+
+		OfferBuilder::new(keys.public_key())
+			.chain_hash(self.chain_hash)
+			.supports_payment_notifications()
+			.path(path)
+			.build()
 	}
 
 	/// Create an offer for receiving async payments as an often-offline recipient.
